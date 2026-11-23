@@ -65,6 +65,11 @@ pub struct SnapHit {
 }
 
 impl SnapHit {
+    /// A pick on an original point shown in a point-cloud preview.
+    pub fn point_cloud(point: Vec2) -> Self {
+        Self { name: "Point cloud point", ..Self::plain(mode::NOD, point) }
+    }
+
     /// The command input a pick at this snap gives: a deferred snap or a plain point.
     pub fn input(&self) -> crate::Input {
         match self.deferred {

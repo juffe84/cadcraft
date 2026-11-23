@@ -786,6 +786,7 @@ dependencies = [
  "image",
  "las",
  "laz",
+ "log",
  "miniz_oxide 0.9.1",
  "serde",
  "serde_json",

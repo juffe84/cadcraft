@@ -1,4 +1,9 @@
 //! CADCraft's import policy on top of the Rust LAS/LAZ decoder.
+#[cfg(not(target_arch = "wasm32"))]
+mod progressive;
+#[cfg(not(target_arch = "wasm32"))]
+pub use progressive::read_progressive;
+
 use super::{IoError, Result};
 use cadcraft_doc::Drawing;
 use cadcraft_doc::point_cloud::{CloudPoint, PointCloud};
@@ -57,7 +62,7 @@ fn decode(mut input: impl Read + Seek + Send + Sync + 'static) -> Result<Drawing
 }
 
 // las allocates metadata before exposing a Reader. Check the regions it may buffer first.
-fn preflight(input: &mut (impl Read + Seek)) -> Result<()> {
+fn preflight(input: &mut (impl Read + Seek)) -> Result<Option<laz::laszip::ChunkTable>> {
     const MAX_METADATA: u64 = 16 << 20;
     let io_error = |e: std::io::Error| IoError::Format(format!("LAS/LAZ: {e}"));
     let invalid = || IoError::Format("LAS/LAZ metadata is invalid or exceeds the supported size".into());
@@ -118,17 +123,20 @@ fn preflight(input: &mut (impl Read + Seek)) -> Result<()> {
             return Err(invalid());
         }
     }
-    if format.is_compressed {
+    let table = if format.is_compressed {
         let vlr = laszip.ok_or_else(invalid)?;
         if vlr.items_size() != u64::from(header.point_data_record_length) {
             return Err(invalid());
         }
-        check_chunks(input, point_offset, file_len, count, &vlr)?;
-    }
-    input.rewind().map_err(io_error)
+        Some(check_chunks(input, point_offset, file_len, count, &vlr)?)
+    } else {
+        None
+    };
+    input.rewind().map_err(io_error)?;
+    Ok(table)
 }
 
-fn check_chunks(input: &mut (impl Read + Seek), start: u64, len: u64, count: u64, vlr: &laz::LazVlr) -> Result<()> {
+fn check_chunks(input: &mut (impl Read + Seek), start: u64, len: u64, count: u64, vlr: &laz::LazVlr) -> Result<laz::laszip::ChunkTable> {
     const CHUNK_LIMIT: u64 = 64 << 20;
     let invalid = || IoError::Format("LAZ chunk table is invalid or exceeds the supported size".into());
     let mut offset = [0; 8];
@@ -170,5 +178,5 @@ fn check_chunks(input: &mut (impl Read + Seek), start: u64, len: u64, count: u64
     if !valid_count || bytes != table - start - 8 {
         return Err(invalid());
     }
-    Ok(())
+    Ok(entries)
 }

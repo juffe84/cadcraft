@@ -1,6 +1,7 @@
 //! In-memory XYZ samples and a spatial index for model-space previews.
 use cadcraft_geom::{Bounds2, Vec3};
 use std::ops::Range;
+use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct CloudPoint {
@@ -14,6 +15,9 @@ pub struct CloudPoint {
 pub struct PointCloud {
     points: Vec<CloudPoint>,
     root: Tile,
+    pub extent: Bounds2,
+    pub z_range: [f64; 2],
+    pub detail: Option<DetailSource>,
     pub source_count: u64,
     pub has_rgb: bool,
     pub rgb_is_8_bit: bool,
@@ -76,7 +80,9 @@ impl Tile {
 impl PointCloud {
     pub fn new(mut points: Vec<CloudPoint>, source_count: u64, has_rgb: bool, rgb_is_8_bit: bool) -> Self {
         let root = Tile::build(&mut points, 0);
-        Self { points, root, source_count, has_rgb, rgb_is_8_bit }
+        let extent = root.bounds;
+        let z_range = points.iter().fold([f64::INFINITY, f64::NEG_INFINITY], |[min, max], p| [min.min(p.position.z), max.max(p.position.z)]);
+        Self { points, root, extent, z_range, detail: None, source_count, has_rgb, rgb_is_8_bit }
     }
 
     pub fn points(&self) -> &[CloudPoint] {
@@ -84,7 +90,7 @@ impl PointCloud {
     }
 
     pub fn bounds(&self) -> Bounds2 {
-        self.root.bounds
+        self.extent
     }
 
     /// Walk only overlapping tiles, then sample their combined population with a fixed budget.
@@ -105,5 +111,29 @@ impl PointCloud {
                 visit(point);
             }
         }
+    }
+}
+
+/// Returned data covers the requested view, or supplies the latest whole-cloud overview.
+#[derive(Default)]
+pub struct CloudView {
+    pub points: Option<Arc<PointCloud>>,
+    pub pending: bool,
+    pub failed: bool,
+}
+
+pub trait CloudDetails: std::fmt::Debug + std::panic::RefUnwindSafe + Send + Sync {
+    /// Request more detail without blocking the caller.
+    fn view(&self, bounds: Bounds2) -> CloudView;
+    /// Current data without changing the worker's request.
+    fn current(&self, bounds: Bounds2) -> CloudView;
+}
+
+#[derive(Debug)]
+pub struct DetailSource(pub Arc<dyn CloudDetails>);
+
+impl PartialEq for DetailSource {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
     }
 }

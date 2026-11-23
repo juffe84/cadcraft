@@ -479,6 +479,7 @@ impl CadApp {
             "paperBackground": color_json(self.options.paper_background),
             "selectionColor": color_json(self.options.selection_color),
             "snapMarkerSize": self.options.snap_marker_size,
+            "pointCloud": { "size": self.session.settings.point_cloud_size, "snap": self.session.settings.point_cloud_snap },
             "timeSensitiveRightClick": self.options.time_sensitive_right_click,
             "rightClickDuration": self.options.right_click_hold_ms,
             "rightClickDefault": self.options.right_click_default.as_str(),
@@ -496,6 +497,9 @@ impl CadApp {
             return;
         }
         let Ok(v) = serde_json::from_str::<Value>(json) else { return };
+        if let Some(cloud) = v.get("pointCloud") {
+            let _ = self.session.execute("pointcloud.settings", cloud);
+        }
         if let Some(vars) = v.get("sysvars") {
             cadcraft_engine::cmd::options::restore(&mut self.session, vars);
         }

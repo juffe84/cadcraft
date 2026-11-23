@@ -27,7 +27,7 @@ pub(super) fn draw_tiles(app: &CadApp, ui: &egui::Ui, tiles: &[(Rect, cadcraft_e
         let xf = tile_xf(*r, tile);
         p.rect_filled(*r, 0.0, t.canvas);
         draw_grid(app, &p, &xf);
-        super::paint_point_cloud(app, &p, &xf, t.canvas_ink);
+        super::point_cloud::paint_plan(app, &p, &xf, false);
         if let Some(list) = &app.canvas.list {
             draw_list(&p, &xf, list, bg, app.session.settings.lwdisplay);
         }

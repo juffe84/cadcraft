@@ -6,6 +6,8 @@ use super::{Deserialize, Serialize, Vec2, snap};
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
     pub osmode: u32,
+    pub point_cloud_size: f32,
+    pub point_cloud_snap: bool,
     pub orthomode: bool,
     pub polarmode: bool,
     /// POLARANG (radians).
@@ -144,6 +146,8 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             osmode: 4133,
+            point_cloud_size: 1.5,
+            point_cloud_snap: true,
             orthomode: false,
             polarmode: true,
             polarang: std::f64::consts::FRAC_PI_2,

@@ -89,3 +89,4 @@ Generated-in-code assets are original and have no file to list:
 | `las` | las-rs contributors | [las 0.11.1](https://crates.io/crates/las/0.11.1) | MIT | Unmodified Rust dependency. |
 | `laz` | laz-rs contributors | [laz 0.13.0](https://crates.io/crates/laz/0.13.0) | Apache-2.0 | Unmodified Rust dependency. |
 | LAS/LAZ integration test inputs | CADCraft contributors | `crates/io/tests/it/las_laz.rs` | MIT OR Apache-2.0 | Generated in memory from synthetic XYZ and color values declared in the test. |
+| Progressive LAZ test input | CADCraft contributors | `crates/io/src/point_cloud/progressive.rs` | MIT OR Apache-2.0 | Generated as a temporary LAZ file from synthetic XYZ values declared in the test. |

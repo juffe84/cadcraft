@@ -372,6 +372,8 @@ pub const NO_FILES: &[&str] = &[
     "pspace",
     "plotwindow",
     "3dorbit",
+    "pointcloud.settings",
+    "pointcloud.snap",
     "properties",
     "properties.set",
     "chprop",

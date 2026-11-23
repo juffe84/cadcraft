@@ -67,13 +67,22 @@ the catalog: each command's id and its parameters.
 
 ## LAS and LAZ point clouds
 
-Use **Open** or drop a `.las` or `.laz` file into CADCraft. The file opens in its own tab as a
-top-down preview with the original coordinates and scan colors, when present. Zoom in to see
-more detail. The desktop reads files in batches in the background and decompresses LAZ
-chunks in parallel. The desktop retains every point up to 25 million. For larger scans it
-keeps a systematic sample of up to five million points, distributed across the file, and
-reports the total and the retained count. The desktop accepts up to one billion input points
-and the browser up to two million. CADCraft does not reproject coordinates.
+Use **Open** or drop a `.las` or `.laz` file into CADCraft. The file opens in its own tab with
+the original coordinates and scan colors, when present. CADCraft does not reproject coordinates.
 
-Use `cadcraft-cli info scan.laz` for point count and XY extents. The preview supports viewing.
-Point snapping, 3D display and saving or exporting the cloud are not supported.
+On desktop, clouds with more than 25 million points first show a sparse preview. CADCraft
+indexes the source blocks in the background. When you zoom in, it reads overlapping blocks
+again and shows more of the original points in view. The source stays on disk, and the preview
+remains bounded in memory. The desktop accepts up to one billion input points. The browser
+accepts up to two million and keeps them in memory.
+
+Use **Point size** to change how large the points appear, and **Snap to cloud points** to attach
+a drawing point to a visible sample in plan view. Object snaps must be enabled (F3). The drawing
+uses the chosen point's XY; the command `pointcloud.snap` can report the original XYZ.
+
+Center the area of interest in plan view, then select **3D Orbit** (or run `3DORBIT`) to inspect
+elevations. Drag or use the arrow keys in the focused view to rotate, and scroll to zoom. Select **3D Orbit** again or press Escape with the
+view focused to return to plan view. Drafting and snapping operate in plan view.
+
+Use `cadcraft-cli info scan.laz` for the source point count and XY extents. The preview supports
+viewing. Saving or exporting the cloud is not supported.

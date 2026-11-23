@@ -1,7 +1,6 @@
 //! Moving drawings in and out: EXPORT (DXF, DWG, SVG, PNG or PDF), IMPORT (the objects of another
 //! DXF/DWG file), PREVIEW (a picture of the plot) and PUBLISH (plot several sheets at once).
-//! ATTACH, SHARE and 3DORBIT are registered so the tool bar and command line say they are not
-//! available yet.
+//! 3DORBIT controls the orthographic point-cloud camera.
 //!
 //! Files go through the host's io hooks ([`super::file::io`]) like OPEN and SAVEAS, so the engine
 //! stays I/O-agnostic; the JSON forms never open dialogs (the UI asks for files when these
@@ -65,11 +64,80 @@ pub fn specs() -> Vec<CommandSpec> {
         })
         .params("not available yet")
         .noundo(),
-        CommandSpec::new("3dorbit", "Orbit", |_, _| Err(EngineError::Other("3DORBIT is not available yet: CADCraft draws in 2D (plan view) only".into())))
+        CommandSpec::new("3dorbit", "Orbit", run_orbit)
             .alias(&["3do", "orbit"])
-            .params("not available yet")
+            .params("{enabled?: bool, yaw?: radians, tilt?: radians, zoom?: factor}; with no arguments toggles the point cloud camera")
+            .noundo(),
+        CommandSpec::new("pointcloud.settings", "Point cloud display", run_cloud_settings)
+            .params("{size?: 1–12 screen points, snap?: bool} → {size, snap}")
+            .noundo(),
+        CommandSpec::new("pointcloud.snap", "Pick point cloud point", run_cloud_snap)
+            .params("{point: [x,y], aperture: drawing units} → {point: [x,y,z] | null}")
             .noundo(),
     ]
+}
+
+fn run_orbit(s: &mut Session, p: &Value) -> Result<Value> {
+    let state = s.state_mut()?;
+    if state.doc.point_cloud.is_none() || state.space != Space::Model || state.block_editor().is_some() {
+        return Err(EngineError::Other("3DORBIT is not available yet for CAD geometry. Open a point cloud in model space.".into()));
+    }
+    let [yaw, tilt, zoom] = state.point_cloud_orbit.unwrap_or([0.0, 0.55, 1.0]);
+    let adjust = p.get("yaw").is_some() || p.get("tilt").is_some() || p.get("zoom").is_some();
+    let enabled = p
+        .get("enabled")
+        .map(|v| v.as_bool().ok_or_else(|| bad("3dorbit", "enabled must be a boolean")))
+        .transpose()?
+        .unwrap_or(adjust || state.point_cloud_orbit.is_none());
+    let angle = |key: &str, fallback| {
+        p.get(key)
+            .map_or(Ok(fallback), |v| v.as_f64().filter(|n| n.is_finite()).ok_or_else(|| bad("3dorbit", format!("{key} must be a finite number"))))
+    };
+    let camera = [
+        angle("yaw", yaw)?.rem_euclid(std::f64::consts::TAU),
+        angle("tilt", tilt)?.clamp(0.0, std::f64::consts::PI),
+        angle("zoom", zoom)?.clamp(0.02, 10_000.0),
+    ];
+    state.point_cloud_orbit = enabled.then_some(camera);
+    Ok(json!({ "enabled": enabled, "yaw": camera[0], "tilt": camera[1], "zoom": camera[2] }))
+}
+
+fn run_cloud_settings(s: &mut Session, p: &Value) -> Result<Value> {
+    let size = p
+        .get("size")
+        .map(|v| v.as_f64().filter(|n| (1.0..=12.0).contains(n)).ok_or_else(|| bad("pointcloud.settings", "size must be between 1 and 12")))
+        .transpose()?;
+    let snap = p.get("snap").map(|v| v.as_bool().ok_or_else(|| bad("pointcloud.settings", "snap must be a boolean"))).transpose()?;
+    if let Some(size) = size {
+        s.settings.point_cloud_size = size as f32;
+    }
+    if let Some(snap) = snap {
+        s.settings.point_cloud_snap = snap;
+    }
+    Ok(json!({ "size": s.settings.point_cloud_size, "snap": s.settings.point_cloud_snap }))
+}
+
+fn run_cloud_snap(s: &mut Session, p: &Value) -> Result<Value> {
+    let point = p.get("point").and_then(point_value).filter(|p| p.is_finite()).ok_or_else(|| bad("pointcloud.snap", "a finite point is required"))?;
+    let aperture = p
+        .get("aperture")
+        .and_then(Value::as_f64)
+        .filter(|n| n.is_finite() && *n > 0.0)
+        .ok_or_else(|| bad("pointcloud.snap", "aperture must be positive and finite"))?;
+    let cloud = s.doc()?.point_cloud.as_ref().ok_or_else(|| bad("pointcloud.snap", "there is no open point cloud"))?;
+    let extent = Bounds2::new(point, point).expand(aperture);
+    let snapshot = cloud.detail.as_ref().map(|source| source.0.view(extent)).unwrap_or_default();
+    let shown = snapshot.points.as_deref().unwrap_or(cloud);
+    let mut nearest = None;
+    let mut distance = aperture;
+    shown.visible(extent, usize::MAX, |sample| {
+        let d = sample.position.xy().dist(point);
+        if d <= distance {
+            distance = d;
+            nearest = Some([sample.position.x, sample.position.y, sample.position.z]);
+        }
+    });
+    Ok(json!({ "point": nearest, "pending": snapshot.pending, "failed": snapshot.failed }))
 }
 
 fn extension(path: &str) -> String {

@@ -20,6 +20,7 @@ mod grid;
 mod grips;
 mod list;
 mod pick;
+mod point_cloud;
 mod press;
 mod viewport;
 mod widgets;
@@ -826,6 +827,13 @@ pub(crate) fn right_click_cancels_placing(app: &CadApp) -> bool {
 /// visible (#1701), and so do the menus painted on the canvas itself (see [`over_canvas_menu`]).
 pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     let t = Tokens::get();
+    if app.session.state().is_ok_and(|state| state.space == cadcraft_doc::Space::Model && state.doc.point_cloud.is_some()) {
+        point_cloud::controls(app, ui);
+        if app.session.state().is_ok_and(|state| state.point_cloud_orbit.is_some()) {
+            point_cloud::orbit(app, ui);
+            return;
+        }
+    }
     let full = ui.available_rect_before_wrap();
     // Tiled model viewports (VPORTS): the current tile is the drawing area below; `draw_tiles`
     // draws the others.
@@ -1109,30 +1117,6 @@ fn press_at(app: &mut CadApp, xf: &Xf, ctx: &egui::Context, pos: Pos2, mods: egu
     !had_window && app.session.pending_window.is_some()
 }
 
-fn paint_point_cloud(app: &CadApp, painter: &egui::Painter, xf: &Xf, fallback: Color32) {
-    let Ok(state) = app.session.state() else { return };
-    if state.space != cadcraft_doc::Space::Model || state.block_editor().is_some() {
-        return;
-    }
-    let Some(cloud) = state.doc.point_cloud.as_ref() else { return };
-    let mut mesh = egui::Mesh::default();
-    let pixels = f64::from(xf.rect.width()) * f64::from(xf.rect.height());
-    let budget = ((pixels / 8.0) as usize).clamp(1, 120_000);
-    cloud.visible(xf.world_bounds(), budget, |point| {
-        let screen = xf.to_screen(point.position.xy());
-        if xf.rect.contains(screen) {
-            let color = if cloud.has_rgb {
-                let [r, g, b] = point.rgb.map(|c| if cloud.rgb_is_8_bit { c as u8 } else { (c >> 8) as u8 });
-                Color32::from_rgb(r, g, b)
-            } else {
-                fallback
-            };
-            mesh.add_colored_rect(Rect::from_center_size(screen, vec2(1.5, 1.5)), color);
-        }
-    });
-    painter.add(egui::Shape::mesh(mesh));
-}
-
 fn paint_canvas(frame: CanvasPaint<'_>) {
     let CanvasPaint {
         app,
@@ -1182,7 +1166,7 @@ fn paint_canvas(frame: CanvasPaint<'_>) {
         None => {
             blockedit::wash(app, painter, rect);
             draw_grid(app, painter, &xf);
-            paint_point_cloud(app, painter, &xf, t.canvas_ink);
+            point_cloud::paint_plan(app, painter, &xf, true);
             (Rgb(t.canvas.r(), t.canvas.g(), t.canvas.b()), None)
         }
     };
