@@ -11,7 +11,7 @@ use std::sync::Arc;
 
 use cadcraft_color::Rgb;
 use cadcraft_doc::{Drawing, Entity, EntityKind, Space};
-use cadcraft_geom::{Bounds2, Mat3, Vec2};
+use cadcraft_geom::{Bounds2, Mat3, Vec2, Vec3};
 use cadcraft_render::paper::{self, Sheet};
 use cadcraft_render::raster::{RasterOptions, View};
 use serde_json::{Value, json};
@@ -66,7 +66,7 @@ pub fn specs() -> Vec<CommandSpec> {
         .noundo(),
         CommandSpec::new("3dorbit", "Orbit", run_orbit)
             .alias(&["3do", "orbit"])
-            .params("{enabled?: bool, yaw?: radians, tilt?: radians, zoom?: factor}; with no arguments toggles the point cloud camera")
+            .params("{enabled?: bool, yaw?: radians, tilt?: radians, zoom?: factor, pivot?: [x,y,z], pan?: [x,y]}; with no arguments toggles the point cloud camera")
             .noundo(),
         CommandSpec::new("pointcloud.settings", "Point cloud display", run_cloud_settings)
             .params("{size?: 1–12 screen points, snap?: bool} → {size, snap}")
@@ -82,8 +82,8 @@ fn run_orbit(s: &mut Session, p: &Value) -> Result<Value> {
     if state.doc.point_cloud.is_none() || state.space != Space::Model || state.block_editor().is_some() {
         return Err(EngineError::Other("3DORBIT is not available yet for CAD geometry. Open a point cloud in model space.".into()));
     }
-    let [yaw, tilt, zoom] = state.point_cloud_orbit.unwrap_or([0.0, 0.55, 1.0]);
-    let adjust = p.get("yaw").is_some() || p.get("tilt").is_some() || p.get("zoom").is_some();
+    let before = state.point_cloud_orbit.unwrap_or_default();
+    let adjust = ["yaw", "tilt", "zoom", "pivot", "pan"].iter().any(|key| p.get(key).is_some());
     let enabled = p
         .get("enabled")
         .map(|v| v.as_bool().ok_or_else(|| bad("3dorbit", "enabled must be a boolean")))
@@ -93,13 +93,36 @@ fn run_orbit(s: &mut Session, p: &Value) -> Result<Value> {
         p.get(key)
             .map_or(Ok(fallback), |v| v.as_f64().filter(|n| n.is_finite()).ok_or_else(|| bad("3dorbit", format!("{key} must be a finite number"))))
     };
-    let camera = [
-        angle("yaw", yaw)?.rem_euclid(std::f64::consts::TAU),
-        angle("tilt", tilt)?.clamp(0.0, std::f64::consts::PI),
-        angle("zoom", zoom)?.clamp(0.02, 10_000.0),
-    ];
+    let pivot = match p.get("pivot") {
+        Some(Value::Null) => None,
+        Some(value) => {
+            let values = value.as_array().filter(|values| values.len() == 3).ok_or_else(|| bad("3dorbit", "pivot must be [x,y,z]"))?;
+            let component = |i: usize| {
+                values[i]
+                    .as_f64()
+                    .filter(|v| v.is_finite() && v.abs() <= 1e12)
+                    .ok_or_else(|| bad("3dorbit", "pivot coordinates must be finite and within the drawing range"))
+            };
+            Some(Vec3::new(component(0)?, component(1)?, component(2)?))
+        }
+        None => before.pivot,
+    };
+    let pan = p.get("pan").map_or(Ok(before.pan), |v| {
+        point_value(v)
+            .filter(|p| p.is_finite() && p.x.abs().max(p.y.abs()) <= 1e12)
+            .ok_or_else(|| bad("3dorbit", "pan must be a finite [x,y] within the drawing range"))
+    })?;
+    let tilt_limit = 179.0_f64.to_radians();
+    let camera = crate::PointCloudOrbit {
+        yaw: angle("yaw", before.yaw)?.rem_euclid(std::f64::consts::TAU),
+        tilt: angle("tilt", before.tilt)?.clamp(-tilt_limit, tilt_limit),
+        zoom: angle("zoom", before.zoom)?.clamp(0.02, 10_000.0),
+        pan,
+        pivot,
+    };
     state.point_cloud_orbit = enabled.then_some(camera);
-    Ok(json!({ "enabled": enabled, "yaw": camera[0], "tilt": camera[1], "zoom": camera[2] }))
+    Ok(json!({ "enabled": enabled, "yaw": camera.yaw, "tilt": camera.tilt, "zoom": camera.zoom,
+        "pan": [pan.x, pan.y], "pivot": pivot.map(|p| [p.x, p.y, p.z]) }))
 }
 
 fn run_cloud_settings(s: &mut Session, p: &Value) -> Result<Value> {

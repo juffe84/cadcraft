@@ -26,6 +26,7 @@ laz = "0.13"
 log = { workspace = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+rayon = { workspace = true }
 las = { version = "=0.11.1", features = ["laz", "laz-parallel"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]

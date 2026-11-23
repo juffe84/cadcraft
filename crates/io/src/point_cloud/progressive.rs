@@ -5,10 +5,13 @@ use cadcraft_doc::point_cloud::{CloudDetails, CloudView, DetailSource};
 use cadcraft_geom::{Bounds2, Vec2, Vec3};
 use las::{Header, PointData, PointDataBuilder};
 use laz::laszip::{ChunkTable, ChunkTableEntry};
+use rayon::prelude::*;
+use std::collections::{BTreeMap, VecDeque};
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::time::{Duration, Instant};
 
 const INITIAL_BLOCKS: usize = 40;
 const OVERVIEW_BUDGET: usize = 1_000_000;
@@ -167,6 +170,34 @@ impl Source {
         self.builder.clone().build_from_bytes(bytes).map_err(format_error)
     }
 
+    /// Read matching blocks as one bounded job even when file order interleaves several scan lines.
+    fn read_selected(&mut self, ids: &[usize]) -> Result<PointData> {
+        let mut encoded = Vec::new();
+        let mut entries = Vec::with_capacity(ids.len());
+        let mut last_offset = None;
+        for &id in ids {
+            let offset = self.offsets[id];
+            if last_offset != Some(offset) {
+                self.file.seek(SeekFrom::Start(offset)).map_err(format_error)?;
+            }
+            let entry = self.entries[id];
+            let start = encoded.len();
+            encoded.resize(start + entry.byte_count as usize, 0);
+            self.file.read_exact(&mut encoded[start..]).map_err(format_error)?;
+            last_offset = Some(self.offsets[id + 1]);
+            entries.push(entry);
+        }
+        let bytes = if let Some(vlr) = &self.vlr {
+            let count = entries.iter().map(|e| e.point_count as usize).sum::<usize>();
+            let mut raw = vec![0; count * self.record_len];
+            laz::par_decompress(&encoded, &mut raw, vlr, &entries).map_err(format_error)?;
+            raw
+        } else {
+            encoded
+        };
+        self.builder.clone().build_from_bytes(bytes).map_err(format_error)
+    }
+
     fn cloud(&self, sample: Sample) -> PointCloud {
         let max = sample.points.iter().flat_map(|p| p.rgb).max().unwrap_or(0);
         PointCloud::new(sample.points, self.count, self.rgb && max != 0, max <= 255)
@@ -234,7 +265,8 @@ impl Request {
 #[derive(Debug, Default)]
 struct State {
     wanted: Option<Request>,
-    detail: Option<(Request, Arc<PointCloud>)>,
+    details: VecDeque<(Request, Arc<PointCloud>)>,
+    partial: Option<(Request, Arc<PointCloud>)>,
     overview: Option<Arc<PointCloud>>,
     failed: bool,
 }
@@ -252,14 +284,16 @@ impl Bridge {
     }
 
     fn snapshot(&self, state: &State, bounds: Bounds2) -> CloudView {
-        let detail = state.detail.as_ref().filter(|(request, _)| request.region.contains_box(&bounds));
-        let completed = state.detail.as_ref().map(|(request, _)| *request);
-        let points = detail.map(|(_, cloud)| cloud.clone()).or_else(|| state.overview.clone());
-        CloudView {
-            points,
-            pending: !state.failed && (state.overview.is_none() || (state.wanted.is_some() && state.wanted != completed)),
-            failed: state.failed,
-        }
+        let detail = state
+            .details
+            .iter()
+            .rev()
+            .find(|(request, _)| request.covers(bounds))
+            .or_else(|| state.details.iter().rev().find(|(request, _)| request.region.contains_box(&bounds)));
+        let complete = state.wanted.is_none_or(|wanted| state.details.iter().any(|(request, _)| *request == wanted));
+        let partial = state.partial.as_ref().filter(|(request, _)| state.wanted == Some(*request) && request.region.contains_box(&bounds));
+        let points = partial.or(detail).map(|(_, cloud)| cloud.clone()).or_else(|| state.overview.clone());
+        CloudView { points, pending: !state.failed && (state.overview.is_none() || !complete), failed: state.failed }
     }
 }
 
@@ -269,10 +303,20 @@ impl CloudDetails for Bridge {
         let close = bounds.intersects(&self.extent) && (bounds.width() < 0.65 * self.extent.width() || bounds.height() < 0.65 * self.extent.height());
         if !close {
             state.wanted = None;
+            state.partial = None;
         } else if !state.failed && !state.wanted.is_some_and(|request| request.covers(bounds)) {
-            let padding = 0.2 * bounds.width().min(bounds.height());
-            state.wanted = Some(Request { region: bounds.expand(padding), width: bounds.width(), height: bounds.height() });
-            let _ = self.wake.try_send(());
+            state.partial = None;
+            let cached = state.details.iter().position(|(request, _)| request.covers(bounds));
+            if let Some(index) = cached
+                && let Some(detail) = state.details.remove(index)
+            {
+                state.wanted = Some(detail.0);
+                state.details.push_back(detail);
+            } else {
+                let padding = 0.2 * bounds.width().min(bounds.height());
+                state.wanted = Some(Request { region: bounds.expand(padding), width: bounds.width(), height: bounds.height() });
+                let _ = self.wake.try_send(());
+            }
         }
         self.snapshot(&state, bounds)
     }
@@ -296,12 +340,19 @@ fn work(mut source: Source, bridge: &Weak<Bridge>, wake: Receiver<()>) -> Result
         // Index every XY point and retain a coarse overview across the entire scan.
         let data = source.read(first..end)?;
         let mut cursor = 0;
-        let mut xy = data.x().zip(data.y());
-        for entry in &source.entries[first..end] {
-            let count = entry.point_count as usize;
-            index.push(Bounds2::from_points(xy.by_ref().take(count).map(|(x, y)| Vec2::new(x, y))));
-            cursor += count;
-        }
+        let ranges: Vec<_> = source.entries[first..end]
+            .iter()
+            .map(|entry| {
+                let start = cursor;
+                cursor += entry.point_count as usize;
+                start..cursor
+            })
+            .collect();
+        let boxes: Vec<_> = ranges
+            .into_par_iter()
+            .map(|range| Bounds2::from_points(data.x().zip(data.y()).skip(range.start).take(range.len()).map(|(x, y)| Vec2::new(x, y))))
+            .collect();
+        index.extend(boxes);
         let start = (stride - seen % stride) % stride;
         seen += cursor;
         if start < cursor {
@@ -313,45 +364,166 @@ fn work(mut source: Source, bridge: &Weak<Bridge>, wake: Receiver<()>) -> Result
     active.state().overview = Some(Arc::new(source.cloud(overview)));
     drop(active);
 
+    let mut cache = BlockCache::default();
     while wake.recv().is_ok() {
         let Some(active) = bridge.upgrade() else { break };
         let request = active.state().wanted;
-        let Some(request) = request.filter(|r| !active.state().detail.as_ref().is_some_and(|(done, _)| done == r)) else { continue };
+        let Some(request) = request.filter(|r| !active.state().details.iter().any(|(done, _)| done == r)) else { continue };
         drop(active);
-        if let Some(detail) = query(&mut source, &index, request, bridge)?
+        if let Some(detail) = query(&mut source, &index, request, bridge, &mut cache)?
             && let Some(active) = bridge.upgrade()
         {
             let mut state = active.state();
             if state.wanted == Some(request) {
-                state.detail = Some((request, Arc::new(detail)));
+                const MAX_DETAIL_VIEWS: usize = 4;
+                if state.details.len() == MAX_DETAIL_VIEWS {
+                    state.details.pop_front();
+                }
+                state.partial = None;
+                state.details.push_back((request, Arc::new(detail)));
             }
         }
     }
     Ok(())
 }
 
-fn query(source: &mut Source, index: &[Bounds2], request: Request, bridge: &Weak<Bridge>) -> Result<Option<PointCloud>> {
+// Keep decoded blocks from nearby views. A block can be larger than the usual budget, so
+// limit the cache by the actual number of retained points, not by a number of blocks.
+const CACHE_POINTS: usize = 3_000_000;
+
+#[derive(Default)]
+struct BlockCache {
+    blocks: BTreeMap<usize, (u64, Vec<CloudPoint>)>,
+    clock: u64,
+    points: usize,
+}
+
+impl BlockCache {
+    fn get(&mut self, id: usize) -> Option<&[CloudPoint]> {
+        let (last, points) = self.blocks.get_mut(&id)?;
+        self.clock += 1;
+        *last = self.clock;
+        Some(points)
+    }
+
+    fn insert(&mut self, id: usize, points: Vec<CloudPoint>) {
+        if points.len() > CACHE_POINTS {
+            return;
+        }
+        while self.points + points.len() > CACHE_POINTS {
+            let Some((&old, _)) = self.blocks.iter().min_by_key(|(_, (last, _))| *last) else { return };
+            if let Some((_, removed)) = self.blocks.remove(&old) {
+                self.points -= removed.len();
+            }
+        }
+        self.clock += 1;
+        self.points += points.len();
+        self.blocks.insert(id, (self.clock, points));
+    }
+}
+
+fn query(source: &mut Source, index: &[Bounds2], request: Request, bridge: &Weak<Bridge>, cache: &mut BlockCache) -> Result<Option<PointCloud>> {
     let mut hits = Sample::new(DETAIL_BUDGET);
-    let mut block = 0;
-    while block < index.len() {
-        if !index[block].intersects(&request.region) {
-            block += 1;
-            continue;
-        }
-        if !bridge.upgrade().is_some_and(|b| b.state().wanted == Some(request)) {
-            return Ok(None);
-        }
-        let run_end = index[block..].iter().take(128).take_while(|b| b.intersects(&request.region)).count() + block;
-        let end = source.end(block, run_end);
-        let data = source.read(block..end)?;
-        visit(&data, 0..data.len(), 1, |point| {
+    let matching = || index.iter().enumerate().filter_map(|(id, bounds)| bounds.intersects(&request.region).then_some(id));
+    let keep_whole_blocks = matching().map(|id| source.entries[id].point_count).sum::<u64>() <= CACHE_POINTS as u64;
+    let mut ids = matching().peekable();
+    let mut last_partial: Option<Instant> = None;
+    let retain = |hits: &mut Sample, points: &[CloudPoint]| {
+        for &point in points {
             if request.region.contains(point.position.xy()) {
                 hits.add(point);
             }
-        })?;
-        block = end;
+        }
+    };
+    while let Some(id) = ids.next() {
+        if !bridge.upgrade().is_some_and(|b| b.state().wanted == Some(request)) {
+            return Ok(None);
+        }
+        if let Some(points) = cache.get(id) {
+            retain(&mut hits, points);
+            publish_partial(source, request, bridge, &hits, &mut last_partial);
+            continue;
+        }
+        let mut group = vec![id];
+        let mut bytes = source.entries[id].byte_count;
+        let mut points = source.entries[id].point_count;
+        while let Some(&next) = ids.peek() {
+            let entry = source.entries[next];
+            if cache.blocks.contains_key(&next)
+                || bytes + entry.byte_count > 32 << 20
+                || (points + entry.point_count) * source.record_len as u64 > 32 << 20
+            {
+                break;
+            }
+            let _ = ids.next();
+            group.push(next);
+            bytes += entry.byte_count;
+            points += entry.point_count;
+        }
+        let data = source.read_selected(&group)?;
+        let mut offset = 0;
+        let ranges: Vec<_> = group
+            .iter()
+            .map(|&id| {
+                let start = offset;
+                offset += source.entries[id].point_count as usize;
+                start..offset
+            })
+            .collect();
+        let decoded: Vec<Vec<CloudPoint>> = ranges
+            .into_par_iter()
+            .map(|range| {
+                let mut points = Vec::new();
+                if keep_whole_blocks {
+                    points.reserve(range.len());
+                }
+                visit(&data, range, 1, |point| {
+                    if keep_whole_blocks || request.region.contains(point.position.xy()) {
+                        points.push(point);
+                    }
+                })?;
+                Ok(points)
+            })
+            .collect::<Result<_>>()?;
+        for (id, points) in group.into_iter().zip(decoded) {
+            retain(&mut hits, &points);
+            if keep_whole_blocks {
+                cache.insert(id, points);
+            }
+        }
+        publish_partial(source, request, bridge, &hits, &mut last_partial);
     }
     Ok(Some(source.cloud(hits)))
+}
+
+/// Reveal points from the first useful batches while the rest are still being read.
+fn publish_partial(source: &Source, request: Request, bridge: &Weak<Bridge>, hits: &Sample, last: &mut Option<Instant>) {
+    if hits.points.is_empty() || last.is_some_and(|t| t.elapsed() < Duration::from_millis(350)) {
+        return;
+    }
+    let Some(active) = bridge.upgrade() else { return };
+    let overview = {
+        let state = active.state();
+        if state.wanted != Some(request) {
+            return;
+        }
+        state.overview.clone()
+    };
+    let mut shown = Sample::new(125_000);
+    // Keep coarse coverage of the whole region while its remaining blocks are in flight.
+    if let Some(overview) = overview {
+        overview.visible(request.region, 25_000, |p| shown.add(*p));
+    }
+    let stride = hits.points.len().div_ceil(100_000).max(1);
+    for point in hits.points.iter().step_by(stride) {
+        shown.add(*point);
+    }
+    let cloud = Arc::new(source.cloud(shown));
+    let mut state = active.state();
+    if state.wanted == Some(request) {
+        state.partial = Some((request, cloud));
+        *last = Some(Instant::now());
+    }
 }
 
 #[cfg(test)]

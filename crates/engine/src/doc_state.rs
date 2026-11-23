@@ -36,7 +36,7 @@ pub struct DocState {
     pub views: Vec<(Space, View)>,
     pub view_history: Vec<View>,
     /// Point-cloud camera (yaw, tilt, and zoom relative to fit), separate from the drawing view.
-    pub point_cloud_orbit: Option<[f64; 3]>,
+    pub point_cloud_orbit: Option<PointCloudOrbit>,
     pub uid: u64,
     /// The drawing is saved as binary DXF (it was opened from one, or last saved as one).
     pub binary_dxf: bool,
@@ -50,6 +50,22 @@ pub struct DocState {
     /// The fonts missing on Windows that a save last named: the next save names them again only
     /// when they change.
     pub(crate) fonts_noted: String,
+}
+
+/// Orbit state in model coordinates. Pan is in the camera plane, in drawing units.
+#[derive(Clone, Copy, Debug)]
+pub struct PointCloudOrbit {
+    pub yaw: f64,
+    pub tilt: f64,
+    pub zoom: f64,
+    pub pivot: Option<cadcraft_geom::Vec3>,
+    pub pan: Vec2,
+}
+
+impl Default for PointCloudOrbit {
+    fn default() -> Self {
+        Self { yaw: 0.0, tilt: 0.55, zoom: 1.0, pivot: None, pan: Vec2::ZERO }
+    }
 }
 
 static NEXT_UID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);

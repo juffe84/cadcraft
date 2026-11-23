@@ -299,6 +299,7 @@ fn window_options(restoring: bool, stencil: u8) -> eframe::NativeOptions {
         // system-font discovery as a hidden fallback.
         system_font_fallback: false,
         // A stencil buffer clips the contents of clipped layout viewports on the GPU.
+        depth_buffer: cloud_depth_bits(stencil),
         stencil_buffer: stencil,
         ..Default::default()
     }
@@ -311,6 +312,10 @@ const WINDOW_KEY: &str = "window";
 
 /// Stencil bits of the window's render pass (see `NativeOptions::stencil_buffer`).
 const STENCIL_BITS: u8 = 8;
+
+fn cloud_depth_bits(stencil: u8) -> u8 {
+    if stencil == 0 { 0 } else { 24 }
+}
 
 /// The stencil bits of the window's render pass: none when `CADCRAFT_STENCIL` is off. Some old
 /// drivers (Mesa on Intel HD 4000, old Intel drivers on Windows) accept a stencil pass without an
@@ -490,7 +495,7 @@ fn main() -> eframe::Result {
                 app.frame_cap = Some(cadcraft_ui_egui::gpu::FrameCap::new(240));
             }
             if let Some(rs) = &cc.wgpu_render_state {
-                app.set_wgpu(rs, eframe::egui_wgpu::depth_format_from_bits(0, stencil));
+                app.set_wgpu(rs, eframe::egui_wgpu::depth_format_from_bits(cloud_depth_bits(stencil), stencil));
             }
             if let Some(port) = control_port {
                 let rx = control_server::start(port, cc.egui_ctx.clone());

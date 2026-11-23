@@ -558,7 +558,13 @@ impl Resources {
                         wgpu::StencilState { front: f, back: f, read_mask: 1, write_mask: 0 }
                     }
                 };
-                wgpu::DepthStencilState { format, depth_write_enabled: None, depth_compare: None, stencil, bias: wgpu::DepthBiasState::default() }
+                wgpu::DepthStencilState {
+                    format,
+                    depth_write_enabled: format.has_depth_aspect().then_some(false),
+                    depth_compare: format.has_depth_aspect().then_some(wgpu::CompareFunction::Always),
+                    stencil,
+                    bias: wgpu::DepthBiasState::default(),
+                }
             })
         };
         let pipeline = |label: &str, vs: &str, topology: wgpu::PrimitiveTopology, buffer: wgpu::VertexBufferLayout<'static>, s: Stencil| {
@@ -693,6 +699,7 @@ pub fn install(rs: &egui_wgpu::RenderState, faults: &Arc<GpuFaults>, stencil: Op
     let target = GpuTarget { format: rs.target_format, stencil: stencil.filter(|s| s.has_stencil_aspect()) };
     let res = Resources::new(&rs.device, target);
     rs.renderer.write().callback_resources.insert(res);
+    crate::cloud_gpu::install(rs, target);
     log::info!("gpu canvas: target {:?}, stencil {:?}", rs.target_format, target.stencil);
     target
 }

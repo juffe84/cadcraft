@@ -49,6 +49,7 @@ pub mod xrefs;
 
 pub mod blocks_palette;
 
+mod cloud_gpu;
 pub mod dyngrips;
 pub mod dyninput;
 pub mod gpu;

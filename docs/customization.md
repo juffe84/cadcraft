@@ -71,9 +71,10 @@ Use **Open** or drop a `.las` or `.laz` file into CADCraft. The file opens in it
 the original coordinates and scan colors, when present. CADCraft does not reproject coordinates.
 
 On desktop, clouds with more than 25 million points first show a sparse preview. CADCraft
-indexes the source blocks in the background. When you zoom in, it reads overlapping blocks
-again and shows more of the original points in view. The source stays on disk, and the preview
-remains bounded in memory. The desktop accepts up to one billion input points. The browser
+indexes the source blocks in the background. When you zoom in, it decompresses overlapping
+blocks in parallel, shows additional points as batches finish, and reuses recent views while
+you move the camera. The native GPU renderer keeps point buffers resident while panning,
+zooming or orbiting. The source stays on disk, and the preview remains bounded in memory. The desktop accepts up to one billion input points. The browser
 accepts up to two million and keeps them in memory.
 
 Use **Point size** to change how large the points appear, and **Snap to cloud points** to attach
@@ -81,8 +82,10 @@ a drawing point to a visible sample in plan view. Object snaps must be enabled (
 uses the chosen point's XY; the command `pointcloud.snap` can report the original XYZ.
 
 Center the area of interest in plan view, then select **3D Orbit** (or run `3DORBIT`) to inspect
-elevations. Drag or use the arrow keys in the focused view to rotate, and scroll to zoom. Select **3D Orbit** again or press Escape with the
-view focused to return to plan view. Drafting and snapping operate in plan view.
+elevations. Drag with the middle button to rotate around the point under the cursor, drag with
+the right button to pan, and scroll to zoom toward the cursor. The focused view also rotates
+with the arrow keys. Select **3D Orbit** again or press Escape with the view focused to return
+to plan view. Drafting and snapping operate in plan view.
 
 Use `cadcraft-cli info scan.laz` for the source point count and XY extents. The preview supports
 viewing. Saving or exporting the cloud is not supported.
