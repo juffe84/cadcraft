@@ -488,7 +488,14 @@ fn query(source: &mut Source, index: &[BlockExtent], request: Request, bridge: &
     let center = request.visible.center();
     let mut matches: Vec<_> =
         index.iter().enumerate().filter_map(|(id, extent)| extent.distance_to(&request.region, center).map(|distance| (id, distance))).collect();
-    matches.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    // Prioritize one parallel wave so a centered preview arrives early. Subsequent
+    // waves preserve file order to avoid random reads over gigabytes of source data.
+    let first_wave = rayon::current_num_threads().min(matches.len());
+    if first_wave < matches.len() {
+        matches.select_nth_unstable_by(first_wave, |a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    }
+    matches[..first_wave].sort_unstable_by_key(|entry| entry.0);
+    matches[first_wave..].sort_unstable_by_key(|entry| entry.0);
     let candidate_points = matches.iter().map(|&(id, _)| source.entries[id].point_count).sum::<u64>();
     let mut cache_budget = if candidate_points <= CACHE_POINTS as u64 { CACHE_POINTS as u64 } else { LARGE_QUERY_CACHE_POINTS };
     log::debug!("point cloud detail: {} candidate blocks, {candidate_points} source points", matches.len());
@@ -565,22 +572,14 @@ fn query(source: &mut Source, index: &[BlockExtent], request: Request, bridge: &
                 let mut points = Vec::new();
                 if keep {
                     points.reserve(range.len());
-                    visit(&data, range, 1, |point| points.push(point))?;
-                } else {
-                    // Chunks still decompress whole, but skip converting attributes in the
-                    // stripes proven to be outside this request.
-                    for (stripe, extent) in index[id].stripes.iter().enumerate() {
-                        if extent.intersects(&request.region) {
-                            let start = range.start + stripe * STRIPE_POINTS;
-                            let end = (start + STRIPE_POINTS).min(range.end);
-                            visit(&data, start..end, 1, |point| {
-                                if request.region.contains(point.position.xy()) {
-                                    points.push(point);
-                                }
-                            })?;
-                        }
-                    }
                 }
+                // Walk each decompressed block once. Starting a new column iterator
+                // for every matching stripe repeats the seek through earlier records.
+                visit(&data, range, 1, |point| {
+                    if keep || request.region.contains(point.position.xy()) {
+                        points.push(point);
+                    }
+                })?;
                 Ok((id, keep, points))
             })
             .collect::<Result<_>>()?;
