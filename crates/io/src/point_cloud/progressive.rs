@@ -258,6 +258,17 @@ struct Request {
 
 impl Request {
     fn new(bounds: Bounds2, options: DetailOptions) -> Self {
+        if options.radius_factor > 0.0 {
+            // A relative load zone must remain useful even at deep zoom. Retain a
+            // little extra area so a small pan can reuse the same request.
+            let factor = options.radius_factor;
+            let center = bounds.center();
+            let half = Vec2::new((bounds.width() / 2.0).max(300.0), (bounds.height() / 2.0).max(300.0)) * factor;
+            let region = Bounds2::new(center - half, center + half);
+            let inner = half * 0.75;
+            let visible = Bounds2::new(center - inner, center + inner);
+            return Self { region, visible, options };
+        }
         let cap = |region: Bounds2| {
             if options.radius > 0.0 {
                 let center = bounds.center();
@@ -274,7 +285,11 @@ impl Request {
 
     fn covers_request(&self, next: Self) -> bool {
         // Radius changes affect where detail may appear. Batch changes only change pending work.
-        self.options.radius == next.options.radius && self.covers(next.visible)
+        self.same_radius(next) && self.covers(next.visible)
+    }
+
+    fn same_radius(&self, other: Self) -> bool {
+        self.options.radius == other.options.radius && self.options.radius_factor == other.options.radius_factor
     }
 
     fn covers(&self, view: Bounds2) -> bool {
@@ -304,19 +319,20 @@ impl Bridge {
     }
 
     fn snapshot(&self, state: &State, bounds: Bounds2) -> CloudView {
-        let details =
-            || state.details.iter().rev().filter(|(request, _)| state.wanted.is_none_or(|wanted| request.options.radius == wanted.options.radius));
+        let details = || state.details.iter().rev().filter(|(request, _)| state.wanted.is_none_or(|wanted| request.same_radius(wanted)));
         let detail = details()
             .find(|(request, _)| state.wanted == Some(*request) && request.region.intersects(&bounds))
             .or_else(|| details().find(|(request, _)| request.covers(bounds)))
             .or_else(|| details().find(|(request, _)| request.region.contains_box(&bounds)))
             .or_else(|| state.wanted.and_then(|_| details().find(|(request, _)| request.region.intersects(&bounds))));
-        let complete = state.wanted.is_none_or(|wanted| state.details.iter().any(|(request, _)| *request == wanted));
+        let detail_count =
+            state.wanted.and_then(|wanted| state.details.iter().find(|(request, _)| *request == wanted).map(|(_, cloud)| cloud.points().len()));
+        let complete = state.wanted.is_none() || detail_count.is_some();
         let partial = state.partial.as_ref().filter(|(request, _)| state.wanted == Some(*request) && request.region.intersects(&bounds));
         let overlay = partial.or(detail).map(|(_, cloud)| cloud.clone());
         let overview = overlay.as_ref().and(state.overview.clone());
         let points = overlay.or_else(|| state.overview.clone());
-        CloudView { points, overview, pending: !state.failed && (state.overview.is_none() || !complete), failed: state.failed }
+        CloudView { points, overview, detail_count, pending: !state.failed && (state.overview.is_none() || !complete), failed: state.failed }
     }
 }
 
@@ -621,6 +637,18 @@ mod tests {
     use super::*;
 
     #[test]
+    fn relative_radius_keeps_a_useful_load_zone_at_deep_zoom() {
+        let center = Vec2::new(550_000.0, 6_700_000.0);
+        let close = Bounds2::new(center, center).expand(0.1);
+        let options = DetailOptions { radius_factor: 0.1, ..Default::default() };
+        let detail = Request::new(close, options);
+        assert!(detail.region.contains(center + Vec2::new(29.0, 29.0)));
+        assert!(!detail.region.contains(center + Vec2::new(31.0, 0.0)));
+        let moved = Bounds2::new(close.min + Vec2::X, close.max + Vec2::X);
+        assert!(detail.covers_request(Request::new(moved, options)));
+    }
+
+    #[test]
     fn stripe_index_rejects_the_gap_and_keeps_the_last_short_range() {
         let points = (0..520).map(|i| {
             let x = if i < 256 {
@@ -679,7 +707,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
         let area = Bounds2::new(area.min, Vec2::new(area.max.x, 6.0));
-        let options = DetailOptions { radius: 2.0, batch_points: 50_000 };
+        let options = DetailOptions { radius: 2.0, batch_points: 50_000, ..Default::default() };
         let mut view = source.view_with(area, options);
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while view.pending && std::time::Instant::now() < deadline {

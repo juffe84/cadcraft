@@ -481,7 +481,8 @@ impl CadApp {
             "snapMarkerSize": self.options.snap_marker_size,
             "pointCloud": {
                 "size": self.session.settings.point_cloud_size, "snap": self.session.settings.point_cloud_snap,
-                "detailRadius": self.session.settings.point_cloud_detail_radius, "batchPoints": self.session.settings.point_cloud_batch_points,
+                "detailRadius": self.session.settings.point_cloud_detail_radius,
+                "detailRadiusFactor": self.session.settings.point_cloud_radius_factor, "batchPoints": self.session.settings.point_cloud_batch_points,
             },
             "timeSensitiveRightClick": self.options.time_sensitive_right_click,
             "rightClickDuration": self.options.right_click_hold_ms,
@@ -501,7 +502,18 @@ impl CadApp {
         }
         let Ok(v) = serde_json::from_str::<Value>(json) else { return };
         if let Some(cloud) = v.get("pointCloud") {
-            let _ = self.session.execute("pointcloud.settings", cloud);
+            let mut cloud = cloud.clone();
+            // Older profiles exposed an absolute radius. Preserve practical absolute
+            // values and rescue sub-unit values that look like the relative control.
+            if cloud.get("detailRadiusFactor").is_none()
+                && let Some(radius) = cloud.get("detailRadius").and_then(Value::as_f64)
+                && radius > 0.0
+                && radius < 1.0
+            {
+                cloud["detailRadius"] = json!(0.0);
+                cloud["detailRadiusFactor"] = json!(radius.max(0.01));
+            }
+            let _ = self.session.execute("pointcloud.settings", &cloud);
         }
         if let Some(vars) = v.get("sysvars") {
             cadcraft_engine::cmd::options::restore(&mut self.session, vars);
@@ -558,6 +570,18 @@ impl CadApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_subunit_point_cloud_radius_migrates_to_the_relative_slider() {
+        let mut app = CadApp::new(cadcraft_engine::Session::empty(), Default::default());
+        app.load_profile(r#"{"pointCloud":{"detailRadius":0.1,"batchPoints":50000}}"#);
+        assert_eq!(app.session.settings.point_cloud_radius_factor, 0.1);
+        assert_eq!(app.session.settings.point_cloud_detail_radius, 0.0);
+        assert_eq!(app.session.settings.point_cloud_batch_points, 50_000);
+        let saved = app.profile_json();
+        app.load_profile(&saved);
+        assert_eq!(app.session.settings.point_cloud_radius_factor, 0.1);
+    }
 
     #[test]
     fn hex_colours_round_trip_and_bad_ones_are_refused() {

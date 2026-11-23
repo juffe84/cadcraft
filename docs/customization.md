@@ -78,12 +78,12 @@ of the view after the camera settles, independent of the overall cloud elevation
 zooming or orbiting. The source stays on disk, and the preview remains bounded in memory. The desktop accepts up to one billion input points. The browser
 accepts up to two million and keeps them in memory.
 
-For large desktop clouds, open **Detail loading** above the drawing. **Detail radius** caps
-how far from the center of the view to load detail, in drawing units. Beyond this area CADCraft
-still draws the overview. **Read batch** sets the target thousands of input points per worker
-for each parallel read round. CADCraft decodes whole source chunks, so the file's own
-chunk size and the memory limit also affect the batch. Zero uses automatic settings.
-**Fast close-up** sets a radius of five drawing units and a target of 50,000 points per worker.
+For large desktop clouds, open **Detail loading** above the drawing. **Load radius (×)**
+scales the detail region around the center of the view. At close zoom, `0.10×` loads at
+least 30 drawing units on each side and keeps the overview visible elsewhere. **Read batch**
+sets the target thousands of input points per worker for each parallel read round. CADCraft
+decodes whole source chunks, so the file's own chunk size and the memory limit also affect the
+batch. Zero uses automatic settings. **Fast close-up** uses `0.02×` with 50,000 points per worker.
 Changes take effect immediately and are saved with the other point-cloud preferences.
 
 Use **Point size** to change how large the points appear, and **Snap to cloud points** to attach

@@ -9,6 +9,7 @@ pub struct Settings {
     pub point_cloud_size: f32,
     pub point_cloud_snap: bool,
     pub point_cloud_detail_radius: f64,
+    pub point_cloud_radius_factor: f64,
     pub point_cloud_batch_points: u32,
     pub orthomode: bool,
     pub polarmode: bool,
@@ -151,6 +152,7 @@ impl Default for Settings {
             point_cloud_size: 1.5,
             point_cloud_snap: true,
             point_cloud_detail_radius: 0.0,
+            point_cloud_radius_factor: 0.0,
             point_cloud_batch_points: 0,
             orthomode: false,
             polarmode: true,
@@ -219,6 +221,10 @@ impl Default for Settings {
 
 impl Settings {
     pub fn cloud_detail_options(&self) -> cadcraft_doc::point_cloud::DetailOptions {
-        cadcraft_doc::point_cloud::DetailOptions { radius: self.point_cloud_detail_radius, batch_points: self.point_cloud_batch_points }
+        cadcraft_doc::point_cloud::DetailOptions {
+            radius: self.point_cloud_detail_radius,
+            radius_factor: self.point_cloud_radius_factor,
+            batch_points: self.point_cloud_batch_points,
+        }
     }
 }

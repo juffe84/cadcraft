@@ -9,6 +9,7 @@ use std::sync::{Arc, Weak};
 
 pub(super) fn controls(app: &mut CadApp, ui: &mut egui::Ui) {
     let orbit = app.session.state().is_ok_and(|state| state.point_cloud_orbit.is_some());
+    let streaming = cloud(app).is_some_and(|cloud| cloud.detail.is_some());
     let status = cloud(app).map(|cloud| view(cloud, cloud.bounds(), app, false)).unwrap_or_default();
     if status.pending {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(125));
@@ -25,15 +26,13 @@ pub(super) fn controls(app: &mut CadApp, ui: &mut egui::Ui) {
         if ui.selectable_label(orbit, crate::i18n::t("3D Orbit")).clicked() {
             let _ = app.run("3dorbit", json!({ "enabled": !orbit }));
         }
-        if cloud(app).is_some_and(|cloud| cloud.detail.is_some()) {
+        if streaming {
             ui.menu_button(crate::i18n::t("Detail loading"), |ui| {
-                let mut radius = app.session.settings.point_cloud_detail_radius;
+                let mut radius = app.session.settings.point_cloud_radius_factor;
                 let mut batch = app.session.settings.point_cloud_batch_points / 1_000;
-                if ui
-                    .add(egui::Slider::new(&mut radius, 0.0..=1000.0).logarithmic(true).text(crate::i18n::t("Detail radius (drawing units)")))
-                    .changed()
+                if ui.add(egui::Slider::new(&mut radius, 0.0..=5.0).logarithmic(true).step_by(0.01).text(crate::i18n::t("Load radius (×)"))).changed()
                 {
-                    let _ = app.run("pointcloud.settings", json!({ "detailRadius": radius }));
+                    let _ = app.run("pointcloud.settings", json!({ "detailRadius": 0.0, "detailRadiusFactor": radius }));
                 }
                 if ui
                     .add(
@@ -46,12 +45,16 @@ pub(super) fn controls(app: &mut CadApp, ui: &mut egui::Ui) {
                 {
                     let _ = app.run("pointcloud.settings", json!({ "batchPoints": batch * 1_000 }));
                 }
-                ui.label(crate::i18n::t("Zero uses automatic loading."));
+                ui.label(crate::i18n::t("Zero uses automatic loading. At close zoom, 0.10× loads at least 30 drawing units on each side."));
+                let absolute = app.session.settings.point_cloud_detail_radius;
+                if absolute > 0.0 {
+                    ui.label(crate::i18n::t("Saved absolute radius: {radius} drawing units").replace("{radius}", &absolute.to_string()));
+                }
                 if ui.button(crate::i18n::t("Fast close-up")).clicked() {
-                    let _ = app.run("pointcloud.settings", json!({ "detailRadius": 5.0, "batchPoints": 50_000 }));
+                    let _ = app.run("pointcloud.settings", json!({ "detailRadius": 0.0, "detailRadiusFactor": 0.02, "batchPoints": 50_000 }));
                 }
                 if ui.button(crate::i18n::t("Automatic")).clicked() {
-                    let _ = app.run("pointcloud.settings", json!({ "detailRadius": 0.0, "batchPoints": 0 }));
+                    let _ = app.run("pointcloud.settings", json!({ "detailRadius": 0.0, "detailRadiusFactor": 0.0, "batchPoints": 0 }));
                 }
             });
         }
@@ -59,6 +62,15 @@ pub(super) fn controls(app: &mut CadApp, ui: &mut egui::Ui) {
             ui.label(crate::i18n::t("Could not load point cloud detail"));
         } else if status.pending {
             ui.label(crate::i18n::t("Loading point cloud detail…"));
+        } else if let Some(count) = status.detail_count {
+            let message = if count == 0 {
+                crate::i18n::t("No detail points in this area").to_string()
+            } else {
+                crate::i18n::t("Detail: {count} points").replace("{count}", &count.to_string())
+            };
+            ui.label(message);
+        } else if streaming {
+            ui.label(crate::i18n::t("Zoom in to load detail"));
         } else if orbit {
             ui.label(crate::i18n::t("Middle drag to orbit. Right drag to pan. Scroll to zoom at cursor."));
         }

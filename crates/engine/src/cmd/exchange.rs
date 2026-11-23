@@ -18,7 +18,7 @@ use cadcraft_render::raster::{RasterOptions, View};
 use serde_json::{Value, json};
 
 use super::file::{base64_decode, base64_encode, io};
-use super::{CommandSpec, bad, point_value, str_param};
+use super::{CommandSpec, always, bad, point_value, str_param};
 
 use crate::{EngineError, Result, Session};
 
@@ -70,7 +70,8 @@ pub fn specs() -> Vec<CommandSpec> {
             .params("{enabled?: bool, yaw?: radians, tilt?: radians, zoom?: factor, pivot?: [x,y,z], pan?: [x,y]}; with no arguments toggles the point cloud camera")
             .noundo(),
         CommandSpec::new("pointcloud.settings", "Point cloud display", run_cloud_settings)
-            .params("{size?: 1–12 screen points, snap?: bool, detailRadius?: 0–1000 drawing units, batchPoints?: 0 or 10000–2000000 per worker}; zero is automatic")
+            .enabled(always)
+            .params("{size?: 1–12 screen points, snap?: bool, detailRadiusFactor?: 0 or 0.01–5, detailRadius?: 0–1000 drawing units, batchPoints?: 0 or 10000–2000000 per worker}; zero is automatic")
             .noundo(),
         CommandSpec::new("pointcloud.snap", "Pick point cloud point", run_cloud_snap)
             .params("{point: [x,y], aperture: drawing units} → {point: [x,y,z] | null}")
@@ -140,6 +141,14 @@ fn run_cloud_settings(s: &mut Session, p: &Value) -> Result<Value> {
                 .ok_or_else(|| bad("pointcloud.settings", "detailRadius must be between 0 and 1000"))
         })
         .transpose()?;
+    let radius_factor = p
+        .get("detailRadiusFactor")
+        .map(|v| {
+            v.as_f64()
+                .filter(|&x| x == 0.0 || (DetailOptions::MIN_RADIUS_FACTOR..=DetailOptions::MAX_RADIUS_FACTOR).contains(&x))
+                .ok_or_else(|| bad("pointcloud.settings", "detailRadiusFactor must be 0 or between 0.01 and 5"))
+        })
+        .transpose()?;
     let batch_points = p
         .get("batchPoints")
         .map(|v| {
@@ -157,12 +166,19 @@ fn run_cloud_settings(s: &mut Session, p: &Value) -> Result<Value> {
     }
     if let Some(radius) = radius {
         s.settings.point_cloud_detail_radius = radius;
+        s.settings.point_cloud_radius_factor = 0.0;
+    }
+    if let Some(factor) = radius_factor {
+        s.settings.point_cloud_radius_factor = factor;
+        if factor != 0.0 {
+            s.settings.point_cloud_detail_radius = 0.0;
+        }
     }
     if let Some(batch_points) = batch_points {
         s.settings.point_cloud_batch_points = batch_points;
     }
     Ok(json!({ "size": s.settings.point_cloud_size, "snap": s.settings.point_cloud_snap,
-        "detailRadius": s.settings.point_cloud_detail_radius, "batchPoints": s.settings.point_cloud_batch_points }))
+        "detailRadius": s.settings.point_cloud_detail_radius, "detailRadiusFactor": s.settings.point_cloud_radius_factor, "batchPoints": s.settings.point_cloud_batch_points }))
 }
 
 fn run_cloud_snap(s: &mut Session, p: &Value) -> Result<Value> {
@@ -174,7 +190,7 @@ fn run_cloud_snap(s: &mut Session, p: &Value) -> Result<Value> {
         .ok_or_else(|| bad("pointcloud.snap", "aperture must be positive and finite"))?;
     let cloud = s.doc()?.point_cloud.as_ref().ok_or_else(|| bad("pointcloud.snap", "there is no open point cloud"))?;
     let extent = Bounds2::new(point, point).expand(aperture);
-    let options = DetailOptions { radius: 0.0, ..s.settings.cloud_detail_options() };
+    let options = DetailOptions { radius: 0.0, radius_factor: 0.0, ..s.settings.cloud_detail_options() };
     let snapshot = cloud.detail.as_ref().map(|source| source.0.view_with(extent, options)).unwrap_or_default();
     let shown = snapshot.points.as_deref().unwrap_or(cloud);
     let mut nearest = None;

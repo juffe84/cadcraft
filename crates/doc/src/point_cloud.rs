@@ -120,6 +120,8 @@ pub struct CloudView {
     pub points: Option<Arc<PointCloud>>,
     /// Stable coarse points drawn underneath a separate detailed layer.
     pub overview: Option<Arc<PointCloud>>,
+    /// Retained detail points once the current request finishes.
+    pub detail_count: Option<usize>,
     pub pending: bool,
     pub failed: bool,
 }
@@ -128,11 +130,14 @@ pub struct CloudView {
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct DetailOptions {
     pub radius: f64,
+    pub radius_factor: f64,
     pub batch_points: u32,
 }
 
 impl DetailOptions {
     pub const MAX_RADIUS: f64 = 1_000.0;
+    pub const MAX_RADIUS_FACTOR: f64 = 5.0;
+    pub const MIN_RADIUS_FACTOR: f64 = 0.01;
     pub const MIN_BATCH_POINTS: u32 = 10_000;
     pub const MAX_BATCH_POINTS: u32 = 2_000_000;
 }
