@@ -23,6 +23,8 @@ pub(crate) fn sub_ctx<'a>(ctx: &Ctx<'a>, e: &Entity, m: Mat3) -> Ctx<'a> {
     Ctx {
         d: ctx.d,
         xf: ctx.xf.then_before(m),
+        z_scale: ctx.z_scale,
+        z_offset: ctx.z_offset,
         block_color: color,
         block_layer: layer,
         block_lw: lw,
@@ -56,7 +58,13 @@ pub(crate) fn insert(b: &mut Builder, ctx: &Ctx, e: &Entity, ins: &cadcraft_doc:
                 }
                 let off = Vec2::new(ins.col_spacing * f64::from(c), ins.row_spacing * f64::from(r)).rotate(ins.rotation);
                 let m = Mat3::translate(off).then_before(ins.transform(blk.base.xy()));
-                let sub = Ctx { block_pstyle: b.named, block_transparency: own, ..sub_ctx(ctx, e, m) };
+                let sub = Ctx {
+                    z_scale: ctx.z_scale * ins.scale.z,
+                    z_offset: ctx.z_offset + ctx.z_scale * (ins.insert.z - blk.base.z * ins.scale.z),
+                    block_pstyle: b.named,
+                    block_transparency: own,
+                    ..sub_ctx(ctx, e, m)
+                };
                 // XCLIP: the copy is drawn on its own, then cut to the boundary.
                 let clip = xclip_region(ins, &sub.xf);
                 let mut part = clip.as_ref().map(|_| b.part());
@@ -165,8 +173,8 @@ fn attributes(b: &mut Builder, ctx: &Ctx, e: &Entity, ins: &cadcraft_doc::Insert
                 b.transparency = t;
                 let lw = if b.opts.lineweights { lw } else { 0.0 };
                 match (&multiline, &sh) {
-                    (Some(m), _) => mtext(b, ctx, m, ink, lw),
-                    (None, Some(sh)) => b.shaped(ctx, ink, lw, sh),
+                    (Some(m), _) => mtext(b, &ctx.at_height(m.insert.z), m, ink, lw),
+                    (None, Some(sh)) => b.shaped(&ctx.at_height(a.text.insert.z), ink, lw, sh),
                     (None, None) => {}
                 }
             }

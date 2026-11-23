@@ -78,6 +78,21 @@ cursor, and panning loads detail around the center of the window. The native GPU
 zooming or orbiting. The source stays on disk, and the preview remains bounded in memory. The desktop accepts up to one billion input points. The browser
 accepts up to two million and keeps them in memory.
 
+### 3D Orbit
+
+Start **3D Orbit** from the View toolbar or run `3DORBIT` on the Model tab. The model and any
+point cloud share one inspection camera. Drag with the middle button to rotate around the
+object under the pointer, drag with the right button to pan, and scroll to zoom at the pointer.
+With focus on the view, use the arrow keys to rotate, Shift+arrows to pan, `+` and `−` to zoom,
+and Home to fit the model. **View** offers standard directions and **Perspective** and
+**Wireframe** change how the model is seen. Esc or **Exit Orbit** returns to the existing plan view.
+
+Orbit shows CADCraft's supported geometry at its model elevation. The graphics backend
+depth-tests model lines, faces and cloud points together. Raster images are drawn as backdrops.
+Imported objects whose geometry CADCraft cannot decode, such as ACIS solids, stay in the drawing
+and are reported in the orbit view. Orbit is an inspection tool for the Model tab. Use the plan
+view for drawing, editing and object snaps.
+
 For large desktop clouds, open **Detail loading** above the drawing. **Load radius (×)**
 scales the detail region around the focus. At close zoom, `0.10×` loads at
 least 30 drawing units on each side and keeps the overview visible elsewhere. **Read batch**

@@ -1,14 +1,15 @@
+use super::orbit_scene::{self, Extent, Model};
 use super::{CadApp, Color32, Rect, Shape, Tokens, Vec2, Xf, pos2, vec2};
 use cadcraft_doc::Space;
 use cadcraft_doc::point_cloud::{CloudPoint, CloudView, PointCloud};
-use cadcraft_engine::PointCloudOrbit;
+use cadcraft_engine::OrbitView;
 use cadcraft_geom::{Bounds2, Vec3};
 use egui::{Key, PointerButton, Sense};
 use serde_json::json;
 use std::sync::{Arc, Weak};
 
 pub(super) fn controls(app: &mut CadApp, ui: &mut egui::Ui) {
-    let orbit = app.session.state().is_ok_and(|state| state.point_cloud_orbit.is_some());
+    let orbit = app.session.state().is_ok_and(|state| state.orbit.is_some());
     let streaming = cloud(app).is_some_and(|cloud| cloud.detail.is_some());
     let status = cloud(app).map(|cloud| view(cloud, cloud.bounds(), app, false)).unwrap_or_default();
     if status.pending {
@@ -125,6 +126,7 @@ pub(super) fn paint_plan(app: &CadApp, painter: &egui::Painter, xf: &Xf, request
             pan: [0.0; 2],
             scale: xf.scale,
             depth: None,
+            eye: None,
             bounds,
         };
         crate::cloud_gpu::paint(
@@ -174,21 +176,22 @@ pub(super) fn snap_visible(app: &CadApp, xf: &Xf, raw: Vec2, aperture: f64) -> O
 }
 
 /// Camera math stays in double precision even for survey coordinates far from the origin.
-struct OrbitFrame {
-    camera: crate::cloud_gpu::Camera,
-    rect: Rect,
+pub(super) struct OrbitFrame {
+    pub camera: crate::cloud_gpu::Camera,
+    pub rect: Rect,
     bounds: Bounds2,
 }
 
 impl OrbitFrame {
-    fn new(orbit: PointCloudOrbit, plan: cadcraft_engine::View, cloud: &PointCloud, rect: Rect) -> Self {
-        let extent = cloud.bounds();
-        let plan_center = if extent.contains(plan.center) { plan.center } else { extent.center() };
-        let z_mid = (cloud.z_range[0] + cloud.z_range[1]) * 0.5;
+    fn new(orbit: OrbitView, plan: cadcraft_engine::View, scene: Extent, rect: Rect) -> Self {
+        let extent = scene.xy;
+        let plan_center = if extent.is_empty() || (!orbit.fit && extent.contains(plan.center)) { plan.center } else { extent.center() };
+        let z_mid = scene.center().z;
         let center = orbit.pivot.unwrap_or(Vec3::new(plan_center.x, plan_center.y, z_mid));
-        let diagonal = extent.width().hypot(extent.height()).hypot(cloud.z_range[1] - cloud.z_range[0]).max(1e-6);
-        let fit = f64::from(rect.width().min(rect.height()).max(1.0)) / (diagonal * 1.05);
-        let scale = (f64::from(rect.height().max(1.0)) / plan.height.max(1e-6)).max(fit) * orbit.zoom;
+        let diagonal = if extent.is_empty() { plan.height } else { scene.span() }.max(1e-6);
+        let fit = f64::from(rect.width().min(rect.height()).max(1.0)) / (diagonal * if orbit.perspective { 1.55 } else { 1.05 });
+        let plan_scale = f64::from(rect.height().max(1.0)) / plan.height.max(1e-6);
+        let scale = if orbit.fit { fit } else { plan_scale.max(fit) } * orbit.zoom;
         let (sy, cy) = orbit.yaw.sin_cos();
         let (sin, cos) = orbit.tilt.sin_cos();
         let axes = [Vec3::new(cy, -sy, 0.0), Vec3::new(sy * cos, cy * cos, sin), Vec3::new(-sy * sin, -cy * sin, cos)];
@@ -199,7 +202,7 @@ impl OrbitFrame {
             (rotated.min.y, rotated.max.y)
         } else {
             let mut limits = Bounds2::EMPTY;
-            for height in cloud.z_range {
+            for height in scene.z {
                 for edge in [-y, y] {
                     limits.add(Vec2::new(0.0, (edge - orbit.pan.y - (height - center.z) * sin) / cos));
                 }
@@ -208,22 +211,43 @@ impl OrbitFrame {
         };
         let min = Vec2::new((-x - orbit.pan.x).max(rotated.min.x), y_min);
         let max = Vec2::new((x - orbit.pan.x).min(rotated.max.x), y_max);
-        let bounds = if min.x <= max.x && min.y <= max.y {
+        let bounds = if orbit.perspective {
+            extent
+        } else if min.x <= max.x && min.y <= max.y {
             Bounds2::from_points(Bounds2::new(min, max).corners().map(|p| center.xy() + p.rotate(-orbit.yaw)))
         } else {
             Bounds2::EMPTY
         };
         let depth = diagonal + (center - Vec3::new(plan_center.x, plan_center.y, z_mid)).len();
-        let camera = crate::cloud_gpu::Camera { center, axes, pan: [orbit.pan.x, orbit.pan.y], scale, depth: Some(depth), bounds };
+        let eye = orbit.perspective.then_some(depth * 1.6);
+        let camera = crate::cloud_gpu::Camera { center, axes, pan: [orbit.pan.x, orbit.pan.y], scale, depth: Some(depth), eye, bounds };
         Self { camera, rect, bounds }
     }
 
-    fn project(&self, point: Vec3) -> (egui::Pos2, f64) {
+    pub(super) fn project(&self, point: Vec3) -> (egui::Pos2, f64) {
         let point = point - self.camera.center;
         let [x, y, z] = self.camera.axes;
         let [px, py] = self.camera.pan;
         let at = self.rect.center();
-        (pos2(at.x + ((x.dot(point) + px) * self.camera.scale) as f32, at.y - ((y.dot(point) + py) * self.camera.scale) as f32), z.dot(point))
+        let depth = z.dot(point);
+        let scale = self.camera.scale / self.camera.weight(depth).max(0.01);
+        (pos2(at.x + ((x.dot(point) + px) * scale) as f32, at.y - ((y.dot(point) + py) * scale) as f32), depth)
+    }
+
+    pub(super) fn interpolate<const N: usize>(&self, points: [Vec3; N], weights: [f64; N]) -> Option<Vec3> {
+        let front = self.camera.axes[2];
+        let mut sum = 0.0;
+        let mut point = Vec3::ZERO;
+        for (p, weight) in points.into_iter().zip(weights) {
+            let w = self.camera.weight(front.dot(p - self.camera.center));
+            if w <= 0.01 {
+                return None;
+            }
+            let weight = weight / w;
+            point = point + p * weight;
+            sum += weight;
+        }
+        (sum > 0.0).then(|| point * (1.0 / sum))
     }
 
     fn ray_origin(&self, at: egui::Pos2) -> Vec3 {
@@ -233,16 +257,23 @@ impl OrbitFrame {
         self.camera.center + right * (f64::from(offset.x) / self.camera.scale - x) - up * (f64::from(offset.y) / self.camera.scale + y)
     }
 
+    fn ray_direction(&self, at: egui::Pos2) -> Vec3 {
+        let [right, up, front] = self.camera.axes;
+        let offset = at - self.rect.center();
+        self.camera.eye.map_or(front, |eye| front - (right * f64::from(offset.x) - up * f64::from(offset.y)) * (1.0 / (eye * self.camera.scale)))
+    }
+
     /// Locate a screen pixel on the plane at the depth of a visible sample.
     fn on_surface(&self, at: egui::Pos2, point: Vec3) -> Vec3 {
         let front = self.camera.axes[2];
-        self.ray_origin(at) + front * front.dot(point - self.camera.center)
+        self.ray_origin(at) + self.ray_direction(at) * front.dot(point - self.camera.center)
     }
 
     fn detail_bounds(&self, focus: Vec3) -> Bounds2 {
         // Loading is centered on the geometry under the view. The wide footprint belonging
         // to the cloud's entire elevation range is only used for render culling.
-        let half = Vec2::new(f64::from(self.rect.width()), f64::from(self.rect.height())) / (2.0 * self.camera.scale);
+        let depth = self.camera.axes[2].dot(focus - self.camera.center);
+        let half = Vec2::new(f64::from(self.rect.width()), f64::from(self.rect.height())) * (self.camera.weight(depth) / (2.0 * self.camera.scale));
         let margin = half.x.max(half.y) * (1.0 - self.camera.axes[2].z.abs());
         let span = half + Vec2::new(margin, margin);
         Bounds2::new(focus.xy() - span, focus.xy() + span)
@@ -257,8 +288,12 @@ impl OrbitFrame {
         let mut bounds = Bounds2::EMPTY;
         for at in [corners.left_top(), corners.right_top(), corners.left_bottom(), corners.right_bottom()] {
             let origin = self.ray_origin(at);
+            let direction = self.ray_direction(at);
+            if direction.z * front.z <= 1e-6 {
+                return self.bounds;
+            }
             for z in cloud.z_range {
-                bounds.add((origin + front * ((z - origin.z) / front.z)).xy());
+                bounds.add((origin + direction * ((z - origin.z) / direction.z)).xy());
             }
         }
         // Leave a margin for roundoff at a pixel or tile edge at survey coordinates.
@@ -341,12 +376,13 @@ const FOCUS_RADIUS: f32 = 48.0;
 fn detail_view(
     app: &mut CadApp,
     ui: &mut egui::Ui,
-    root: &Arc<PointCloud>,
+    scene: (&Arc<PointCloud>, Option<&Model>),
     frame: &OrbitFrame,
     document: u64,
     dragging: bool,
     hint: Option<FocusHint>,
 ) -> CloudView {
+    let (root, model) = scene;
     let snapshot = view(root, frame.bounds, app, false);
     if root.detail.is_none() {
         return snapshot;
@@ -375,8 +411,7 @@ fn detail_view(
     let overview = if snapshot.indexing { root } else { snapshot.overview.as_ref().or(snapshot.points.as_ref()).unwrap_or(root) };
     let samples = Arc::downgrade(overview);
     if state.sample_source.as_ref().is_none_or(|previous| state.surface.is_none() && !Weak::ptr_eq(previous, &samples)) {
-        let size = app.session.settings.point_cloud_size;
-        if let Some(point) = frame.pick(layers(&snapshot, root), state.at, 160_000, FOCUS_RADIUS, size) {
+        if let Some(point) = pick_target(app, Some(root), model, frame, state.at, FOCUS_RADIUS) {
             state.surface = Some(frame.on_surface(state.at, point));
         }
         state.sample_source = Some(samples);
@@ -388,26 +423,127 @@ fn detail_view(
     view(root, frame.bounds, app, false)
 }
 
+fn orbit_controls(app: &mut CadApp, ui: &mut egui::Ui, orbit: OrbitView) {
+    ui.horizontal_wrapped(|ui| {
+        let fit = ui.button(crate::i18n::t("Fit model"));
+        crate::control::record_widget(ui, &fit, "Fit model", "button", None);
+        if fit.clicked() {
+            let _ = app.run("3dorbit", json!({ "fit": true }));
+        }
+        ui.menu_button(crate::i18n::t("View"), |ui| {
+            for (label, view) in [
+                ("Top", "top"),
+                ("Bottom", "bottom"),
+                ("Front", "front"),
+                ("Back", "back"),
+                ("Left", "left"),
+                ("Right", "right"),
+                ("Isometric", "isometric"),
+            ] {
+                if ui.button(crate::i18n::t(label)).clicked() {
+                    let _ = app.run("3dorbit", json!({ "view": view, "perspective": false }));
+                    ui.close();
+                }
+            }
+        });
+        let mut perspective = orbit.perspective;
+        let toggle = ui.checkbox(&mut perspective, crate::i18n::t("Perspective"));
+        crate::control::record_widget(ui, &toggle, "Perspective", "checkbox", Some(perspective));
+        if toggle.changed() {
+            let _ = app.run("3dorbit", json!({ "perspective": perspective }));
+        }
+        let mut wireframe = orbit.wireframe;
+        let toggle = ui.checkbox(&mut wireframe, crate::i18n::t("Wireframe"));
+        crate::control::record_widget(ui, &toggle, "Wireframe", "checkbox", Some(wireframe));
+        if toggle.changed() {
+            let _ = app.run("3dorbit", json!({ "wireframe": wireframe }));
+        }
+        let exit = ui.button(crate::i18n::t("Exit Orbit"));
+        crate::control::record_widget(ui, &exit, "Exit Orbit", "button", None);
+        if exit.clicked() {
+            let _ = app.run("3dorbit", json!({ "enabled": false }));
+        }
+    });
+}
+
+fn pick_target(
+    app: &CadApp,
+    root: Option<&Arc<PointCloud>>,
+    model: Option<&Model>,
+    frame: &OrbitFrame,
+    cursor: egui::Pos2,
+    radius: f32,
+) -> Option<Vec3> {
+    let size = app.session.settings.point_cloud_size;
+    let geometry = model.and_then(|model| model.pick(frame, cursor, radius));
+    let point = root.and_then(|root| {
+        let snapshot = view(root, frame.bounds, app, false);
+        frame.pick(layers(&snapshot, root), cursor, 160_000, radius, size)
+    });
+    match (geometry, point) {
+        (Some(a), Some(b)) => {
+            let (pa, za) = frame.project(a);
+            let (pb, zb) = frame.project(b);
+            let db = pb.distance(cursor);
+            let da = pa.distance(cursor);
+            let offset = (pb - cursor).abs();
+            let cloud_covers = offset.x.max(offset.y) <= 0.5 * size;
+            Some(if da <= 0.5 && cloud_covers && za != zb {
+                if za > zb { a } else { b }
+            } else if da <= db {
+                a
+            } else {
+                b
+            })
+        }
+        _ => geometry.or(point),
+    }
+}
+
 pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     let Ok(state) = app.session.state() else { return };
-    let Some(mut orbit) = state.point_cloud_orbit else { return };
+    let Some(orbit) = state.orbit else { return };
+    orbit_controls(app, ui, orbit);
+    let Ok(state) = app.session.state() else { return };
+    let Some(mut orbit) = state.orbit else { return };
     let plan = state.view();
     let document = state.uid;
-    let Some(root) = cloud(app).cloned() else { return };
+    let root = cloud(app).cloned();
+    let model = orbit_scene::model(app, ui.ctx(), f64::from(ui.available_height().max(1.0)));
+    if let Some(model) = &model {
+        if model.list.truncated {
+            ui.label(crate::i18n::t("The orbit display limit was reached. Some geometry is omitted."));
+        }
+        if model.missing != 0 {
+            ui.label(crate::i18n::t("Some imported objects do not have geometry CADCraft can display."));
+        }
+    }
     let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
-    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Image, true, crate::i18n::t("Point cloud 3D view")));
+    app.canvas.rect = Some(rect);
+    app.canvas.xf = None;
+    app.canvas.cursor = None;
+    app.canvas.snap = None;
+    let label = if model.is_none() && root.is_some() { "Point cloud 3D view" } else { "Model 3D view" };
+    response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Image, true, crate::i18n::t(label)));
+    crate::control::record_widget(ui, &response, label, "image", None);
+    let response = response.on_hover_text(crate::i18n::t(
+        "Middle drag or arrow keys to rotate. Right drag or Shift+arrows to pan. Scroll or +/− to zoom. Home fits the model. Esc exits.",
+    ));
     if response.drag_started() || response.clicked() {
         response.request_focus();
     }
     let focused = response.has_focus();
+    let lost_focus = response.lost_focus();
     let hovered = response.hovered();
-    let (keys, scroll, escape, press, pointer) = ui.input(|input| {
+    let (arrows, keyboard_pan, scroll, escape, fit, press, pointer) = ui.input(|input| {
         let key = |k| f32::from(focused && input.key_pressed(k));
-        let keys = vec2(key(Key::ArrowRight) - key(Key::ArrowLeft), key(Key::ArrowDown) - key(Key::ArrowUp));
+        let arrows = vec2(key(Key::ArrowRight) - key(Key::ArrowLeft), key(Key::ArrowDown) - key(Key::ArrowUp));
         (
-            keys,
+            arrows,
+            input.modifiers.shift,
             if hovered { input.smooth_scroll_delta.y } else { 0.0 },
-            focused && input.key_pressed(Key::Escape),
+            (focused || lost_focus) && input.key_pressed(Key::Escape),
+            focused && input.key_pressed(Key::Home),
             input.pointer.button_pressed(PointerButton::Middle),
             input.pointer.interact_pos(),
         )
@@ -416,48 +552,69 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
         let _ = app.run("3dorbit", json!({ "enabled": false }));
         return;
     }
-    let mut frame = OrbitFrame::new(orbit, plan, &root, rect);
+    if fit {
+        let _ = app.run("3dorbit", json!({ "fit": true }));
+        return;
+    }
+    let key_zoom = ui.input(|input| {
+        if focused {
+            50.0 * (f32::from(input.key_pressed(Key::Plus) || input.key_pressed(Key::Equals)) - f32::from(input.key_pressed(Key::Minus)))
+        } else {
+            0.0
+        }
+    });
+    let extent = model.as_ref().map_or_else(Extent::default, |model| model.extent);
+    let extent = if let Some(root) = &root { extent.union(Extent { xy: root.bounds(), z: root.z_range }) } else { extent };
+    let mut frame = OrbitFrame::new(orbit, plan, extent, rect);
     let mut updated = false;
     let mut hint = None;
-    if press && let Some(cursor) = pointer.filter(|p| rect.contains(*p)) {
-        let snapshot = view(&root, frame.bounds, app, false);
-        let gpu = layers(&snapshot, &root).all(|shown| crate::cloud_gpu::available(app.canvas.gpu, shown));
-        let limit = if gpu { usize::MAX } else { sample_budget(rect) };
-        let size = app.session.settings.point_cloud_size;
-        if let Some(pivot) = frame.pick(layers(&snapshot, &root), cursor, limit, size.max(6.0), size) {
-            let delta = pivot - frame.camera.center;
-            orbit.pan += Vec2::new(frame.camera.axes[0].dot(delta), frame.camera.axes[1].dot(delta));
-            orbit.pivot = Some(pivot);
-            hint = Some(FocusHint { at: cursor, surface: Some(pivot) });
-            updated = true;
-        }
+    if press
+        && let Some(cursor) = pointer.filter(|p| rect.contains(*p))
+        && let Some(pivot) = pick_target(app, root.as_ref(), model.as_ref(), &frame, cursor, 8.0)
+    {
+        // Changing the pivot must leave the picked point at the same pixel.
+        let at = frame.project(pivot).0 - rect.center();
+        orbit.pan = Vec2::new(f64::from(at.x), -f64::from(at.y)) / frame.camera.scale;
+        orbit.pivot = Some(pivot);
+        hint = Some(FocusHint { at: cursor, surface: Some(pivot) });
+        updated = true;
     }
     let motion = response.drag_motion();
-    let rotation = if response.dragged_by(PointerButton::Middle) { vec2(motion.x, -motion.y) } else { egui::Vec2::ZERO } + keys * 10.0;
+    let rotation = if response.dragged_by(PointerButton::Middle) { vec2(motion.x, -motion.y) } else { egui::Vec2::ZERO }
+        + if keyboard_pan { egui::Vec2::ZERO } else { arrows * 10.0 };
     if rotation != egui::Vec2::ZERO {
         orbit.yaw += f64::from(rotation.x / rect.width().max(1.0)) * 220.0_f64.to_radians();
         orbit.tilt += f64::from(rotation.y / rect.height().max(1.0)) * 220.0_f64.to_radians();
         updated = true;
     }
-    if response.dragged_by(PointerButton::Secondary) && motion != egui::Vec2::ZERO {
-        orbit.pan += Vec2::new(f64::from(motion.x), -f64::from(motion.y)) / frame.camera.scale;
+    let pan = (if response.dragged_by(PointerButton::Secondary) { motion } else { egui::Vec2::ZERO })
+        + if keyboard_pan { arrows * 20.0 } else { egui::Vec2::ZERO };
+    if pan != egui::Vec2::ZERO {
+        orbit.pan += Vec2::new(f64::from(pan.x), -f64::from(pan.y)) / frame.camera.scale;
         hint = Some(FocusHint { at: rect.center(), surface: None });
         updated = true;
     }
-    if scroll != 0.0
-        && let Some(pointer) = pointer
-    {
+    let zoom_at = if scroll != 0.0 {
+        pointer.map(|p| (p, scroll))
+    } else if key_zoom != 0.0 {
+        Some((rect.center(), key_zoom))
+    } else {
+        None
+    };
+    if let Some((pointer, steps)) = zoom_at {
         let remembered =
             app.canvas.cloud_orbit_focus.as_ref().filter(|focus| focus.document == document && focus.at == pointer).and_then(|focus| focus.surface);
         let surface = remembered.or_else(|| {
-            let snapshot = view(&root, frame.bounds, app, false);
-            frame.pick(layers(&snapshot, &root), pointer, 160_000, FOCUS_RADIUS, app.session.settings.point_cloud_size)
+            // Orthographic CAD-only zoom is independent of depth. Avoid picking
+            // the entire drawing on every frame of a smooth wheel gesture.
+            if root.is_some() || orbit.perspective { pick_target(app, root.as_ref(), model.as_ref(), &frame, pointer, FOCUS_RADIUS) } else { None }
         });
         hint = Some(FocusHint { at: pointer, surface: surface.map(|point| frame.on_surface(pointer, point)) });
         let at = pointer - rect.center();
         let old = orbit.zoom;
-        orbit.zoom = (old * (f64::from(scroll) * 0.005).exp()).clamp(0.02, 10_000.0);
-        let adjustment = (old / orbit.zoom - 1.0) / frame.camera.scale;
+        orbit.zoom = (old * (f64::from(steps) * 0.005).exp()).clamp(0.02, 10_000.0);
+        let weight = surface.map_or(1.0, |p| frame.camera.weight(frame.project(p).1));
+        let adjustment = (old / orbit.zoom - 1.0) * weight / frame.camera.scale;
         orbit.pan += Vec2::new(f64::from(at.x), -f64::from(at.y)) * adjustment;
         updated = true;
     }
@@ -467,19 +624,23 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
             json!({ "yaw": orbit.yaw, "tilt": orbit.tilt, "zoom": orbit.zoom,
             "pan": [orbit.pan.x, orbit.pan.y], "pivot": orbit.pivot.map(|p| [p.x, p.y, p.z]) }),
         );
-        if let Some(applied) = app.session.state().ok().and_then(|state| state.point_cloud_orbit) {
-            frame = OrbitFrame::new(applied, plan, &root, rect);
+        if let Some(applied) = app.session.state().ok().and_then(|state| state.orbit) {
+            frame = OrbitFrame::new(applied, plan, extent, rect);
         }
     }
+    let painter = ui.painter_at(rect);
+    painter.rect_filled(rect, 0.0, Tokens::get().canvas);
+    if let Some(model) = &model {
+        model.paint(&painter, &frame, crate::orbit_gpu::available(app.canvas.gpu));
+    }
+    let Some(root) = root else { return };
     let dragging = response.dragged_by(PointerButton::Middle) || response.dragged_by(PointerButton::Secondary);
-    let snapshot = detail_view(app, ui, &root, &frame, document, dragging, hint);
+    let snapshot = detail_view(app, ui, (&root, model.as_ref()), &frame, document, dragging, hint);
     if snapshot.pending {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(70));
     }
     let fallback = Tokens::get().canvas_ink;
     let size = app.session.settings.point_cloud_size;
-    let painter = ui.painter_at(rect);
-    painter.rect_filled(rect, 0.0, Tokens::get().canvas);
     if layers(&snapshot, &root).all(|shown| crate::cloud_gpu::available(app.canvas.gpu, shown)) {
         crate::cloud_gpu::paint(&painter, rect, layers(&snapshot, &root).cloned(), &frame.camera, size, fallback);
         return;
@@ -509,8 +670,33 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn model_orbit_opens_without_a_cloud_and_can_exit_from_keyboard() {
+        use cadcraft_doc::{Common, Drawing, EntityKind, Line};
+        let mut drawing = Drawing::new_metric();
+        drawing.add(&Space::Model, Common::default(), EntityKind::Line(Line { a: Vec3::ZERO, b: Vec3::new(0.0, 0.0, 20.0) })).unwrap();
+        let mut session = Session::empty();
+        session.open_drawing(drawing, "Model", None);
+        let plan = session.state().unwrap().view();
+        session.execute("3dorbit", &json!({"view": "front", "fit": true})).unwrap();
+        let app = CadApp::new(session, Default::default());
+        let mut harness =
+            egui_kittest::Harness::builder().with_size(vec2(800.0, 400.0)).build_ui_state(|ui, app: &mut CadApp| super::super::show(app, ui), app);
+        harness.get_by_label("Model 3D view").click();
+        harness.run();
+        let key = |key| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        harness.event(key(Key::ArrowRight));
+        harness.run();
+        assert!(harness.state().session.state().unwrap().orbit.unwrap().yaw > 0.0);
+        harness.event(key(Key::Escape));
+        harness.run();
+        let state = harness.state().session.state().unwrap();
+        assert!(state.orbit.is_none());
+        assert_eq!(state.view(), plan);
+    }
+
+    #[test]
     fn orbit_detail_uses_the_front_surface_at_an_off_center_zoom_anchor() {
-        let pose = PointCloudOrbit { pivot: Some(Vec3::ZERO), yaw: 0.5, tilt: 1.1, ..Default::default() };
+        let pose = OrbitView { pivot: Some(Vec3::ZERO), yaw: 0.5, tilt: 1.1, ..Default::default() };
         let plan = cadcraft_engine::View { center: Vec2::ZERO, height: 80.0, twist: 0.0 };
         let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 500.0));
         let cloud = |points: &[Vec3]| {
@@ -522,7 +708,7 @@ mod tests {
             ))
         };
         let extent = cloud(&[Vec3::new(-500.0, -500.0, -150.0), Vec3::new(500.0, 500.0, 150.0)]);
-        let frame = OrbitFrame::new(pose, plan, &extent, rect);
+        let frame = OrbitFrame::new(pose, plan, Extent { xy: extent.bounds(), z: extent.z_range }, rect);
         let cursor = pos2(620.0, 320.0);
         let front = frame.camera.axes[2];
         let ray = frame.ray_origin(cursor);
@@ -549,12 +735,12 @@ mod tests {
         let cloud = PointCloud::new(points.to_vec(), 2, false, false);
         let plan = cadcraft_engine::View { center: Vec2::ZERO, height: 60.0, twist: 0.0 };
         let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 500.0));
-        let mut orbit = PointCloudOrbit { pivot: Some(Vec3::ZERO), yaw: 0.5, tilt: 1.3, ..Default::default() };
-        let before = OrbitFrame::new(orbit, plan, &cloud, rect);
+        let mut orbit = OrbitView { pivot: Some(Vec3::ZERO), yaw: 0.5, tilt: 1.3, ..Default::default() };
+        let before = OrbitFrame::new(orbit, plan, Extent { xy: cloud.bounds(), z: cloud.z_range }, rect);
         let target = Vec3::new(32.0, -78.0, 75.0);
         let [right, up, _] = before.camera.axes;
         orbit.pan = Vec2::new(-right.dot(target), -up.dot(target));
-        let frame = OrbitFrame::new(orbit, plan, &cloud, rect);
+        let frame = OrbitFrame::new(orbit, plan, Extent { xy: cloud.bounds(), z: cloud.z_range }, rect);
         assert!(frame.project(target).0.distance(rect.center()) < 0.01);
         let focus = frame.on_surface(rect.center(), target);
         assert!((focus - target).len() < 1e-8);
@@ -583,7 +769,7 @@ mod tests {
         assert!(harness.get_by_label("Snap to cloud points").accesskit_node().toggled().is_some());
         harness.get_by_label("3D Orbit").click();
         harness.run();
-        let orbit = |app: &CadApp| app.session.state().unwrap().point_cloud_orbit.unwrap();
+        let orbit = |app: &CadApp| app.session.state().unwrap().orbit.unwrap();
         let before = orbit(harness.state());
         let center = harness.get_by_label("Point cloud 3D view").rect().center();
         let button = |pos, button, pressed| egui::Event::PointerButton { pos, button, pressed, modifiers: egui::Modifiers::NONE };
@@ -611,6 +797,6 @@ mod tests {
         harness.step();
         harness.get_by_label("3D Orbit").click();
         harness.run();
-        assert!(harness.state().session.state().unwrap().point_cloud_orbit.is_none());
+        assert!(harness.state().session.state().unwrap().orbit.is_none());
     }
 }

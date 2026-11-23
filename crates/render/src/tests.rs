@@ -1430,3 +1430,27 @@ fn objects_built_on_all_cores_stop_at_the_point_budget_and_say_so() {
     assert!(l.truncated);
     assert!(points(&l) > 0 && points(&l) <= 10_000, "{}", points(&l));
 }
+#[test]
+fn orbit_heights_survive_block_scaling_and_xclip() {
+    use cadcraft_doc::{Block, ClipBoundary, Common, EntityKind, Insert, Line};
+    use cadcraft_geom::Vec3;
+
+    let mut drawing = Drawing::new_metric();
+    let mut block = Block::new("Slope");
+    block.base = Vec3::new(0.0, 0.0, 2.0);
+    block.entities.push(cadcraft_doc::Entity {
+        handle: Handle(500),
+        common: Common::default(),
+        kind: EntityKind::Line(Line { a: Vec3::new(0.0, 0.0, 2.0), b: Vec3::new(10.0, 0.0, 12.0) }),
+    });
+    drawing.blocks.insert("Slope".into(), std::sync::Arc::new(block));
+    let mut insert = Insert { block: "Slope".into(), insert: Vec3::new(0.0, 0.0, 20.0), scale: Vec3::new(1.0, 1.0, 2.0), ..Default::default() };
+    insert.clip = Some(ClipBoundary::new(vec![Vec2::new(2.0, -2.0), Vec2::new(8.0, 2.0)]));
+    drawing.header.set_i64("XCLIPFRAME", 0);
+    drawing.add(&Space::Model, Common::default(), EntityKind::Insert(insert)).unwrap();
+    let spatial = build(&drawing, &Space::Model, &Options { spatial: true, ..Default::default() });
+    let points: Vec<_> = spatial.prims.iter().flat_map(|p| spatial.spatial_points(p)).collect();
+    assert_eq!(points.len(), 2);
+    assert!(points[0].x > 0.0 && points[1].x < 10.0);
+    assert!(points.iter().all(|v| (v.z - 20.0 - 2.0 * v.x).abs() < 1e-9));
+}

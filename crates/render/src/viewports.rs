@@ -208,7 +208,7 @@ pub fn viewport_clip(d: &Drawing, handle: Handle, vp: &cadcraft_doc::Viewport) -
 /// `list` clipped to `clip` (a clipped viewport's outline in the list's own units), for a list
 /// drawn inside a clipped viewport apart from its contents.
 pub fn clip_list(list: &DisplayList, clip: &clip::PolyClip) -> DisplayList {
-    let mut out = DisplayList::default();
+    let mut out = DisplayList::new(list.heights.is_some());
     append_clipped(&mut out, list, &Clip::Poly(clip));
     out
 }
@@ -264,6 +264,151 @@ pub(crate) fn append_clipped_keep(dst: &mut DisplayList, src: &DisplayList, clip
 
 /// Append primitive `p` of `src` to `dst`, clipped to `clip`.
 fn clip_prim(dst: &mut DisplayList, src: &DisplayList, p: &DPrim, clip: &Clip) {
+    let z = src.elevations(p);
+    if dst.heights.is_none() || z.is_empty() {
+        clip_plan_prim(dst, src, p, clip);
+        return;
+    }
+    let first = dst.prims.len();
+    let xy = src.points(p);
+    if matches!(p.kind, Kind::Image { .. }) {
+        clip_plan_prim(dst, src, p, clip);
+        if dst.prims.len() != first
+            && let Some(heights) = &mut dst.heights
+        {
+            heights.verts.extend_from_slice(z);
+        }
+        return;
+    }
+    let inside = |q: Vec2| match clip {
+        Clip::Rect(rect) => rect.contains(q),
+        Clip::Poly(poly) => poly.contains(q),
+        Clip::Outside(poly) => !poly.contains(q),
+    };
+    let line_height = |q: Vec2, a: Vec2, direction: Vec2, za: f64, dz: f64| {
+        let den = direction.dot(direction);
+        if den == 0.0 { za } else { za + (q - a).dot(direction) * dz / den }
+    };
+    match p.kind {
+        Kind::Infinite { .. } if xy[1] == Vec2::ZERO => {
+            if inside(xy[0]) {
+                push_raw(dst, p, p.kind, xy);
+                if let Some(h) = &mut dst.heights {
+                    h.verts.extend_from_slice(z);
+                }
+            }
+        }
+        Kind::Infinite { .. } => {
+            clip_plan_prim(dst, src, p, clip);
+            extend_heights(dst, first, |q| line_height(q, xy[0], xy[1], z[0], z[1]));
+        }
+        Kind::Polyline if z.iter().any(|v| *v != z[0]) => {
+            for i in 0..xy.len().saturating_sub(1) {
+                let first = dst.prims.len();
+                if xy[i] == xy[i + 1] && inside(xy[i]) {
+                    push_raw(dst, p, p.kind, &xy[i..i + 2]);
+                    if let Some(h) = &mut dst.heights {
+                        h.verts.extend_from_slice(&z[i..i + 2]);
+                    }
+                    continue;
+                }
+                clip_plan_prim(dst, src, &DPrim { start: p.start + i as u32, len: 2, ..*p }, clip);
+                extend_heights(dst, first, |q| line_height(q, xy[i], xy[i + 1] - xy[i], z[i], z[i + 1] - z[i]));
+            }
+        }
+        Kind::Tris | Kind::Mask if z.iter().any(|v| *v != z[0]) => {
+            for i in (0..xy.len()).step_by(3) {
+                let Some((triangle, elevations)) = xy.get(i..i + 3).zip(z.get(i..i + 3)) else { break };
+                let first = dst.prims.len();
+                let (u, v) = (triangle[1] - triangle[0], triangle[2] - triangle[0]);
+                let det = u.cross(v);
+                if det == 0.0 {
+                    clip_vertical_triangle(dst, p, triangle, elevations, clip, &inside);
+                    continue;
+                }
+                clip_plan_prim(dst, src, &DPrim { start: p.start + i as u32, len: 3, ..*p }, clip);
+                extend_heights(dst, first, |q| {
+                    let w = q - triangle[0];
+                    elevations[0] + (w.cross(v) * (elevations[1] - elevations[0]) + u.cross(w) * (elevations[2] - elevations[0])) / det
+                });
+            }
+        }
+        _ => {
+            clip_plan_prim(dst, src, p, clip);
+            extend_heights(dst, first, |_| z[0]);
+        }
+    }
+}
+
+fn extend_heights(dst: &mut DisplayList, first: usize, value: impl Fn(Vec2) -> f64) {
+    let Some(heights) = &mut dst.heights else { return };
+    for p in &dst.prims[first..] {
+        let verts = if matches!(p.kind, Kind::Tris | Kind::Mask) { &dst.tris } else { &dst.verts };
+        if let Some(points) = verts.get(p.start as usize..(p.start + p.len) as usize) {
+            heights.pool_mut(p.kind).extend(points.iter().copied().map(&value));
+        }
+    }
+}
+
+fn clip_vertical_triangle(dst: &mut DisplayList, p: &DPrim, xy: &[Vec2], z: &[f64], clip: &Clip, inside: &impl Fn(Vec2) -> bool) {
+    use cadcraft_geom::Vec3;
+    let points = [Vec3::new(xy[0].x, xy[0].y, z[0]), Vec3::new(xy[1].x, xy[1].y, z[1]), Vec3::new(xy[2].x, xy[2].y, z[2])];
+    let emit = |dst: &mut DisplayList, points: &[Vec3]| {
+        if points.len() < 3 {
+            return;
+        }
+        let first = dst.prims.len();
+        push_raw(dst, p, p.kind, &points.iter().map(|v| v.xy()).collect::<Vec<_>>());
+        if dst.prims.len() != first
+            && let Some(h) = &mut dst.heights
+        {
+            h.tris.extend(points.iter().map(|v| v.z));
+        }
+    };
+    let a = xy[0].min(xy[1]).min(xy[2]);
+    let c = xy[0].max(xy[1]).max(xy[2]);
+    let along_x = c.x - a.x >= c.y - a.y;
+    let axis = |v: Vec2| if along_x { v.x } else { v.y };
+    if a == c {
+        if inside(a) {
+            emit(dst, &points);
+        }
+        return;
+    }
+    let low = xy.iter().copied().min_by(|a, b| axis(*a).total_cmp(&axis(*b))).unwrap_or(a);
+    let high = xy.iter().copied().max_by(|a, b| axis(*a).total_cmp(&axis(*b))).unwrap_or(c);
+    let line = [low, high];
+    let pieces = match clip {
+        Clip::Rect(rect) => clip::clip_polyline(&line, rect),
+        Clip::Poly(poly) => poly.clip_polyline(&line),
+        Clip::Outside(poly) => poly.clip_polyline_outside(&line),
+    };
+    for piece in pieces {
+        let Some((a, c)) = piece.first().zip(piece.last()) else { continue };
+        let mut polygon = points.to_vec();
+        for (edge, side) in [(axis(*a).min(axis(*c)), 1.0), (axis(*a).max(axis(*c)), -1.0)] {
+            let mut next = Vec::new();
+            for (a, c) in polygon.iter().zip(polygon.iter().cycle().skip(1)) {
+                let da = (axis(a.xy()) - edge) * side;
+                let dc = (axis(c.xy()) - edge) * side;
+                if da >= 0.0 {
+                    next.push(*a);
+                }
+                if (da < 0.0) != (dc < 0.0) {
+                    next.push(*a + (*c - *a) * (da / (da - dc)));
+                }
+            }
+            polygon = next;
+        }
+        if let Some(a) = polygon.first().copied() {
+            for edge in polygon[1..].windows(2) {
+                emit(dst, &[a, edge[0], edge[1]]);
+            }
+        }
+    }
+}
+
+fn clip_plan_prim(dst: &mut DisplayList, src: &DisplayList, p: &DPrim, clip: &Clip) {
     {
         let pts = src.points(p);
         match (p.kind, clip) {

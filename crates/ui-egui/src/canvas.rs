@@ -19,6 +19,7 @@ mod dyn_boxes;
 mod grid;
 mod grips;
 mod list;
+mod orbit_scene;
 mod pick;
 mod point_cloud;
 mod press;
@@ -121,6 +122,7 @@ pub struct CanvasState {
     /// The wgpu device, for background rebuilds to create their buffers (see [`rebuild`]).
     pub gpu_device: Option<egui_wgpu::wgpu::Device>,
     cloud_orbit_focus: Option<point_cloud::OrbitFocus>,
+    orbit_scene: orbit_scene::Scene,
     /// The mesh last handed to the GPU (see [`crate::gpu::CanvasCallback::key`]).
     mesh_key: Option<u64>,
     mesh_slot: crate::gpu::MeshSlot,
@@ -830,12 +832,13 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     let t = Tokens::get();
     if app.session.state().is_ok_and(|state| state.space == cadcraft_doc::Space::Model && state.doc.point_cloud.is_some()) {
         point_cloud::controls(app, ui);
-        if app.session.state().is_ok_and(|state| state.point_cloud_orbit.is_some()) {
-            point_cloud::orbit(app, ui);
-            return;
-        }
+    }
+    if app.session.state().is_ok_and(|state| state.space == cadcraft_doc::Space::Model && state.block_editor().is_none() && state.orbit.is_some()) {
+        point_cloud::orbit(app, ui);
+        return;
     }
     app.canvas.cloud_orbit_focus = None;
+    app.canvas.orbit_scene = Default::default();
     let full = ui.available_rect_before_wrap();
     // Tiled model viewports (VPORTS): the current tile is the drawing area below; `draw_tiles`
     // draws the others.

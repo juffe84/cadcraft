@@ -279,6 +279,7 @@ pub fn cmdline_state(app: &CadApp) -> Value {
 pub fn inspect(app: &CadApp, ctx: &egui::Context) -> Value {
     let r = ctx.content_rect();
     let view = app.session.state().map(|s| s.view()).ok();
+    let orbit = app.session.state().ok().filter(|s| s.space == cadcraft_doc::Space::Model && s.block_editor().is_none()).and_then(|s| s.orbit);
     json!({
         "ui": serde_json::to_value(&app.ui).unwrap_or_default(),
         "theme": if app.shown_theme() == egui::Theme::Light { "light" } else { "dark" },
@@ -287,6 +288,8 @@ pub fn inspect(app: &CadApp, ctx: &egui::Context) -> Value {
         "canvasRect": app.canvas.rect.map(|c| json!([c.left(), c.top(), c.width(), c.height()])),
         "window": [r.width(), r.height()],
         "view": view.map(|v| json!({"center": [v.center.x, v.center.y], "height": v.height})),
+        "orbit": orbit.map(|o| json!({"yaw": o.yaw, "tilt": o.tilt, "zoom": o.zoom, "pan": [o.pan.x, o.pan.y],
+            "pivot": o.pivot.map(|p| [p.x, p.y, p.z]), "fit": o.fit, "perspective": o.perspective, "wireframe": o.wireframe})),
         "cursor": app.canvas.cursor.map(|c| [c.x, c.y]),
         "snap": app.canvas.snap.map(|s| json!({"point": [s.point.x, s.point.y], "mode": s.name})),
         "session": app.session.summary(),

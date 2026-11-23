@@ -15,6 +15,7 @@ struct View {
     x: vec4f,
     y: vec4f,
     z: vec4f,
+    w: vec4f,
     marker: vec4f,
 };
 @group(0) @binding(0) var<uniform> view: View;
@@ -26,7 +27,8 @@ struct Output {
     let u = vec4f(position, 1.0);
     let corner = array<vec2f, 4>(vec2f(-1.0,-1.0), vec2f(1.0,-1.0), vec2f(-1.0,1.0), vec2f(1.0,1.0));
     var out: Output;
-    out.pos = vec4f(vec2f(dot(view.x, u), dot(view.y, u)) + corner[vertex] * view.marker.xy, dot(view.z, u), 1.0);
+    let w = dot(view.w, u);
+    out.pos = vec4f(vec2f(dot(view.x, u), dot(view.y, u)) + corner[vertex] * view.marker.xy * w, dot(view.z, u), w);
     out.color = color;
     return out;
 }
@@ -70,7 +72,7 @@ pub fn install(rs: &egui_wgpu::RenderState, target: crate::gpu::GpuTarget) {
     let views = std::array::from_fn(|_| {
         let uniform = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("cloud view"),
-            size: 64,
+            size: 80,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -137,7 +139,33 @@ pub struct Camera {
     pub pan: [f64; 2],
     pub scale: f64,
     pub depth: Option<f64>,
+    pub eye: Option<f64>,
     pub bounds: Bounds2,
+}
+
+impl Camera {
+    pub fn weight(&self, depth: f64) -> f64 {
+        self.eye.map_or(1.0, |eye| 1.0 - depth / eye)
+    }
+
+    pub fn rows(&self, rect: Rect, origin: Vec3) -> [[f32; 4]; 4] {
+        let delta = origin - self.center;
+        let [x, y, z] = self.axes;
+        let row = |axis: Vec3, offset: f64, factor: f64, bias: f64| {
+            [(axis.x * factor) as f32, (axis.y * factor) as f32, (axis.z * factor) as f32, ((axis.dot(delta) + offset) * factor + bias) as f32]
+        };
+        let (depth, w) = if let Some(eye) = self.eye {
+            (row(z, 0.0, -1.0 / eye, 0.99), row(z, 0.0, -1.0 / eye, 1.0))
+        } else {
+            (self.depth.map_or([0.0, 0.0, 0.0, 0.5], |depth| row(z, 0.0, -0.49 / depth, 0.5)), [0.0, 0.0, 0.0, 1.0])
+        };
+        [
+            row(x, self.pan[0], 2.0 * self.scale / f64::from(rect.width().max(1.0)), 0.0),
+            row(y, self.pan[1], 2.0 * self.scale / f64::from(rect.height().max(1.0)), 0.0),
+            depth,
+            w,
+        ]
+    }
 }
 
 pub fn paint(painter: &egui::Painter, rect: Rect, clouds: impl IntoIterator<Item = Arc<PointCloud>>, camera: &Camera, size: f32, fallback: Color32) {
@@ -147,24 +175,15 @@ pub fn paint(painter: &egui::Painter, rect: Rect, clouds: impl IntoIterator<Item
 
 struct Layer {
     cloud: Arc<PointCloud>,
-    rows: [[f32; 4]; 4],
+    rows: [[f32; 4]; 5],
 }
 
 impl Layer {
     fn new(rect: Rect, cloud: Arc<PointCloud>, camera: &Camera, size: f32) -> Self {
-        let delta = origin(&cloud) - camera.center;
-        let [x, y, z] = camera.axes;
-        let row = |axis: Vec3, offset: f64, factor: f64, bias: f64| {
-            [(axis.x * factor) as f32, (axis.y * factor) as f32, (axis.z * factor) as f32, ((axis.dot(delta) + offset) * factor + bias) as f32]
-        };
         let w = rect.width().max(1.0);
         let h = rect.height().max(1.0);
-        let rows = [
-            row(x, camera.pan[0], 2.0 * camera.scale / f64::from(w), 0.0),
-            row(y, camera.pan[1], 2.0 * camera.scale / f64::from(h), 0.0),
-            camera.depth.map_or([0.0, 0.0, 0.0, 0.5], |depth| row(z, 0.0, -0.49 / depth, 0.5)),
-            [size / w, size / h, 0.0, 0.0],
-        ];
+        let [x, y, z, weight] = camera.rows(rect, origin(&cloud));
+        let rows = [x, y, z, weight, [size / w, size / h, 0.0, 0.0]];
         Self { cloud, rows }
     }
 }
@@ -232,7 +251,7 @@ impl egui_wgpu::CallbackTrait for Callback {
                 res.resident.push_back(Resident { cloud: weak, color: self.fallback, buffer, blocks });
             }
             let mut rows = layer.rows;
-            rows[3][2] = f32::from(res.linear);
+            rows[4][2] = f32::from(res.linear);
             let bytes: Vec<_> = rows.into_iter().flatten().flat_map(f32::to_le_bytes).collect();
             queue.write_buffer(uniform, 0, &bytes);
         }
@@ -276,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn orbit_depth_keeps_the_front_point_visible_when_a_farther_point_is_drawn_after_it() {
+    fn orbit_uses_the_same_depth_for_model_faces_and_cloud_points() {
         use super::*;
         use cadcraft_doc::point_cloud::CloudPoint;
         use egui_wgpu::{CallbackTrait, ScreenDescriptor};
@@ -290,13 +309,39 @@ mod tests {
         let near = cloud(points(1.0, [255; 3]));
         let far = cloud(points(-1.0, [0; 3]));
         let bounds = near.bounds();
-        let rows = |depth| [[0.02, 0.0, 0.0, 0.0], [0.0, 0.02, 0.0, 0.0], [0.0, 0.0, -0.1, depth], [0.1, 0.1, 0.0, 0.0]];
+        let rows = |depth| [[0.02, 0.0, 0.0, 0.0], [0.0, 0.02, 0.0, 0.0], [0.0, 0.0, -0.1, depth], [0.0, 0.0, 0.0, 1.0], [0.1, 0.1, 0.0, 0.0]];
         let callback = Callback {
             layers: vec![Layer { cloud: near, rows: rows(0.4) }, Layer { cloud: far, rows: rows(0.6) }],
             fallback: Color32::WHITE,
             orbit: true,
             bounds,
         };
+        let rect = Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::splat(SIZE as f32));
+        let camera = Camera {
+            center: Vec3::ZERO,
+            axes: [Vec3::new(1.0, 0.0, 0.0), Vec3::new(0.0, 1.0, 0.0), Vec3::Z],
+            pan: [0.0; 2],
+            scale: 1.0,
+            depth: Some(5.0),
+            eye: None,
+            bounds,
+        };
+        let mut drawing = cadcraft_doc::Drawing::new_metric();
+        let points = [Vec3::new(-25.0, -25.0, 0.0), Vec3::new(25.0, -25.0, 0.0), Vec3::new(0.0, 25.0, 0.0), Vec3::new(0.0, 25.0, 0.0)];
+        let color = cadcraft_color::Color::True(cadcraft_color::Rgb(0, 255, 0));
+        drawing
+            .add(
+                &cadcraft_doc::Space::Model,
+                cadcraft_doc::Common { color, ..Default::default() },
+                cadcraft_doc::EntityKind::Face3d(cadcraft_doc::Face3d { corners: points, hidden_edges: 15 }),
+            )
+            .unwrap();
+        let list = Arc::new(cadcraft_render::build(
+            &drawing,
+            &cadcraft_doc::Space::Model,
+            &cadcraft_render::Options { spatial: true, ..Default::default() },
+        ));
+        let model = crate::orbit_gpu::callback(rect, list, &camera, Vec3::ZERO, 50.0, cadcraft_color::Rgb(0, 0, 0));
         let device = &rs.device;
         let dimensions = wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 };
         let texture = |format, usage| {
@@ -318,6 +363,7 @@ mod tests {
         let mut renderer = rs.renderer.write();
         let screen = ScreenDescriptor { size_in_pixels: [SIZE, SIZE], pixels_per_point: 1.0 };
         let _ = callback.prepare(device, &rs.queue, &screen, &mut encoder, &mut renderer.callback_resources);
+        let _ = model.prepare(device, &rs.queue, &screen, &mut encoder, &mut renderer.callback_resources);
         {
             let mut pass = encoder
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -335,9 +381,9 @@ mod tests {
                     ..Default::default()
                 })
                 .forget_lifetime();
-            let rect = Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::splat(SIZE as f32));
-            let info = egui::PaintCallbackInfo { viewport: rect, clip_rect: rect, pixels_per_point: 1.0, screen_size_px: [SIZE, SIZE] };
-            callback.paint(info, &mut pass, &renderer.callback_resources);
+            let info = || egui::PaintCallbackInfo { viewport: rect, clip_rect: rect, pixels_per_point: 1.0, screen_size_px: [SIZE, SIZE] };
+            callback.paint(info(), &mut pass, &renderer.callback_resources);
+            model.paint(info(), &mut pass, &renderer.callback_resources);
         }
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
             label: None,
@@ -359,6 +405,8 @@ mod tests {
         let pixels = readback.slice(..).get_mapped_range().unwrap();
         let center = (SIZE as usize / 2) * (SIZE as usize + 1) * 4;
         assert!(pixels[center..center + 3].iter().all(|c| *c > 200));
+        let side = center + 8 * 4;
+        assert!(pixels[side + 1] > 200 && pixels[side] < 10 && pixels[side + 2] < 10);
         assert!(pixels[0..3].iter().all(|c| *c < 10));
     }
 }

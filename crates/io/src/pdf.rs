@@ -568,6 +568,7 @@ fn sheet(d: &Drawing, space: &Space, o: &PdfOptions, links_to: &[(Handle, String
         on_screen: false,
         skip_viewport: None,
         cancel: None,
+        spatial: false,
     };
     let k = unit_mm * PT_PER_MM;
     let window = o.window.filter(|w| !w.is_empty());

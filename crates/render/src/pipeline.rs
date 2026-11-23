@@ -47,6 +47,8 @@ pub struct Options {
     /// rebuild the view no longer needs). A cancelled build returns a partial list, which the
     /// caller must discard; see [`Options::cancelled`].
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
+    /// Retain model heights for the orbit camera.
+    pub spatial: bool,
 }
 
 impl Options {
@@ -72,6 +74,7 @@ impl Default for Options {
             transparency: false,
             on_screen: false,
             cancel: None,
+            spatial: false,
         }
     }
 }
@@ -91,6 +94,8 @@ pub(crate) fn top_ctx<'a>(d: &'a Drawing, xf: Mat3, top: Handle, frozen: &'a [St
     Ctx {
         d,
         xf,
+        z_scale: 1.0,
+        z_offset: 0.0,
         block_color: Color::Index(7),
         block_layer: None,
         block_lw: Lineweight::Default,
@@ -106,7 +111,10 @@ pub(crate) fn top_ctx<'a>(d: &'a Drawing, xf: Mat3, top: Handle, frozen: &'a [St
 }
 
 fn build_space(d: &Drawing, space: &Space, opts: &Options, plotting: bool) -> DisplayList {
-    build_space_within(d, space, opts, plotting, MAX_DISPLAY_POINTS)
+    // Orbit retains heights and also uploads the list to the GPU, including both
+    // endpoints of every line segment. Keep working memory bounded on large drawings.
+    let budget = if opts.spatial { 4_000_000 } else { MAX_DISPLAY_POINTS };
+    build_space_within(d, space, opts, plotting, budget)
 }
 
 /// [`build_space`] holding at most `max_points` points.
@@ -115,7 +123,7 @@ pub(crate) fn build_space_within(d: &Drawing, space: &Space, opts: &Options, plo
     let styler = style_table(d, space, opts, plotting).map(|t| plotstyle::Styler::new(d, t));
     let points = std::sync::atomic::AtomicUsize::new(0);
     let mut b = Builder {
-        list: DisplayList::default(),
+        list: DisplayList::new(opts.spatial),
         opts,
         plotting,
         styles: styler.as_ref(),
@@ -176,7 +184,7 @@ fn build_parallel(b: &mut Builder, d: &Drawing, store: &cadcraft_doc::EntityStor
         .par_chunks(PARALLEL_CHUNK)
         .map(|chunk| {
             let mut part = Builder {
-                list: DisplayList::default(),
+                list: DisplayList::new(opts.spatial),
                 opts,
                 plotting,
                 styles: None,
@@ -239,7 +247,7 @@ pub fn build_entities<'a, I: IntoIterator<Item = &'a Entity>>(d: &Drawing, ents:
     };
     let points = std::sync::atomic::AtomicUsize::new(0);
     let mut b = Builder {
-        list: DisplayList::default(),
+        list: DisplayList::new(opts.spatial),
         opts,
         plotting: false,
         styles: None,

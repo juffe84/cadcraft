@@ -1,4 +1,5 @@
 use super::{Bounds2, Handle, Pen, Rgb, Sheet, Vec2, outline};
+use cadcraft_geom::Vec3;
 
 /// Handle carried by model-space geometry drawn inside a paper-space viewport (it belongs to no
 /// single paper-space entity, so selection highlighting never matches it).
@@ -92,6 +93,8 @@ pub struct DisplayList {
     pub prims: Vec<DPrim>,
     pub verts: Vec<Vec2>,
     pub tris: Vec<Vec2>,
+    /// Model-space Z coordinates for orbit lists, parallel to the planar arrays.
+    pub heights: Option<Heights>,
     /// The raster images drawn by [`Kind::Image`] primitives.
     pub images: Vec<DImage>,
     /// Plots ([`build_plot`]): for each primitive, the index in [`Drawing::layers`] of the layer
@@ -115,6 +118,21 @@ pub struct DisplayList {
     /// Plot style end, join and fill style per primitive (parallel to `prims`; missing entries
     /// are "use object"), turned into geometry by [`pen::apply`].
     pub pens: Vec<Pen>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct Heights {
+    pub verts: Vec<f64>,
+    pub tris: Vec<f64>,
+}
+
+impl Heights {
+    pub fn pool(&self, kind: Kind) -> &[f64] {
+        if matches!(kind, Kind::Tris | Kind::Mask) { &self.tris } else { &self.verts }
+    }
+    pub fn pool_mut(&mut self, kind: Kind) -> &mut Vec<f64> {
+        if matches!(kind, Kind::Tris | Kind::Mask) { &mut self.tris } else { &mut self.verts }
+    }
 }
 
 /// A glyph of plotted text: the font glyph and, in world coordinates, where it sits. It is
@@ -160,6 +178,10 @@ pub fn alpha(transparency: u8) -> u8 {
 pub const MAX_TRANSPARENCY: u8 = 90;
 
 impl DisplayList {
+    pub(crate) fn new(spatial: bool) -> Self {
+        Self { heights: spatial.then(Heights::default), ..Self::default() }
+    }
+
     pub fn segment_count(&self) -> usize {
         self.prims.iter().filter(|p| p.kind == Kind::Polyline).map(|p| p.len.saturating_sub(1) as usize).sum()
     }
@@ -169,6 +191,15 @@ impl DisplayList {
             Kind::Tris | Kind::Mask => self.tris.get(p.start as usize..(p.start + p.len) as usize).unwrap_or(&[]),
             _ => self.verts.get(p.start as usize..(p.start + p.len) as usize).unwrap_or(&[]),
         }
+    }
+    pub(crate) fn elevations(&self, p: &DPrim) -> &[f64] {
+        self.heights.as_ref().and_then(|h| h.pool(p.kind).get(p.start as usize..(p.start + p.len) as usize)).unwrap_or(&[])
+    }
+
+    /// Vertices in model coordinates. A regular plan list lies on Z=0.
+    pub fn spatial_points<'a>(&'a self, p: &DPrim) -> impl Iterator<Item = Vec3> + 'a {
+        let elevations = self.elevations(p);
+        self.points(p).iter().enumerate().map(move |(i, &xy)| Vec3::new(xy.x, xy.y, elevations.get(i).copied().unwrap_or_default()))
     }
     /// The boundary of a filled primitive ([`Kind::Tris`], [`Kind::Mask`]) as closed polylines,
     /// for highlighting it; empty for other kinds.
@@ -199,6 +230,10 @@ pub(crate) fn append(dst: &mut DisplayList, src: DisplayList) {
     dst.images.extend(src.images);
     dst.verts.extend(src.verts);
     dst.tris.extend(src.tris);
+    if let (Some(dst), Some(src)) = (&mut dst.heights, src.heights) {
+        dst.verts.extend(src.verts);
+        dst.tris.extend(src.tris);
+    }
     dst.prim_layers.extend(src.prim_layers);
     dst.texts.extend(src.texts.into_iter().map(|mut t| {
         if t.prim < PlotText::CLIPPED {

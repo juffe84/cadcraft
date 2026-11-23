@@ -67,7 +67,7 @@ pub fn specs() -> Vec<CommandSpec> {
         .noundo(),
         CommandSpec::new("3dorbit", "Orbit", run_orbit)
             .alias(&["3do", "orbit"])
-            .params("{enabled?: bool, yaw?: radians, tilt?: radians, zoom?: factor, pivot?: [x,y,z], pan?: [x,y]}; with no arguments toggles the point cloud camera")
+            .params("{enabled?: bool, yaw?: radians, tilt?: radians, zoom?: factor, pivot?: [x,y,z], pan?: [x,y], fit?: bool, perspective?: bool, wireframe?: bool, view?: top|bottom|front|back|left|right|isometric}; with no arguments toggles the model orbit camera")
             .noundo(),
         CommandSpec::new("pointcloud.settings", "Point cloud display", run_cloud_settings)
             .enabled(always)
@@ -81,16 +81,31 @@ pub fn specs() -> Vec<CommandSpec> {
 
 fn run_orbit(s: &mut Session, p: &Value) -> Result<Value> {
     let state = s.state_mut()?;
-    if state.doc.point_cloud.is_none() || state.space != Space::Model || state.block_editor().is_some() {
-        return Err(EngineError::Other("3DORBIT is not available yet for CAD geometry. Open a point cloud in model space.".into()));
+    if state.space != Space::Model || state.block_editor().is_some() {
+        return Err(EngineError::Other("3DORBIT requires the Model tab outside the Block Editor.".into()));
     }
-    let before = state.point_cloud_orbit.unwrap_or_default();
-    let adjust = ["yaw", "tilt", "zoom", "pivot", "pan"].iter().any(|key| p.get(key).is_some());
+    let before = state.orbit.unwrap_or_default();
+    let adjust = ["yaw", "tilt", "zoom", "pivot", "pan", "fit", "perspective", "wireframe", "view"].iter().any(|key| p.get(key).is_some());
+    let flag =
+        |key: &str, fallback| p.get(key).map_or(Ok(fallback), |v| v.as_bool().ok_or_else(|| bad("3dorbit", format!("{key} must be a boolean"))));
+    let fit_requested = flag("fit", false)?;
+    let quarter = std::f64::consts::FRAC_PI_2;
+    let (yaw, tilt) = match p.get("view").map(Value::as_str) {
+        None => (before.yaw, before.tilt),
+        Some(Some("top")) => (0.0, 0.0),
+        Some(Some("bottom")) => (0.0, std::f64::consts::PI),
+        Some(Some("front")) => (0.0, quarter),
+        Some(Some("back")) => (2.0 * quarter, quarter),
+        Some(Some("left")) => (quarter, quarter),
+        Some(Some("right")) => (-quarter, quarter),
+        Some(Some("isometric")) => (quarter / 2.0, 2.0_f64.sqrt().atan()),
+        _ => return Err(bad("3dorbit", "view must be top, bottom, front, back, left, right, or isometric")),
+    };
     let enabled = p
         .get("enabled")
         .map(|v| v.as_bool().ok_or_else(|| bad("3dorbit", "enabled must be a boolean")))
         .transpose()?
-        .unwrap_or(adjust || state.point_cloud_orbit.is_none());
+        .unwrap_or(adjust || state.orbit.is_none());
     let angle = |key: &str, fallback| {
         p.get(key)
             .map_or(Ok(fallback), |v| v.as_f64().filter(|n| n.is_finite()).ok_or_else(|| bad("3dorbit", format!("{key} must be a finite number"))))
@@ -107,24 +122,29 @@ fn run_orbit(s: &mut Session, p: &Value) -> Result<Value> {
             };
             Some(Vec3::new(component(0)?, component(1)?, component(2)?))
         }
+        None if fit_requested => None,
         None => before.pivot,
     };
-    let pan = p.get("pan").map_or(Ok(before.pan), |v| {
+    let pan = p.get("pan").map_or(Ok(if fit_requested { Vec2::ZERO } else { before.pan }), |v| {
         point_value(v)
             .filter(|p| p.is_finite() && p.x.abs().max(p.y.abs()) <= 1e12)
             .ok_or_else(|| bad("3dorbit", "pan must be a finite [x,y] within the drawing range"))
     })?;
-    let tilt_limit = 179.0_f64.to_radians();
-    let camera = crate::PointCloudOrbit {
-        yaw: angle("yaw", before.yaw)?.rem_euclid(std::f64::consts::TAU),
-        tilt: angle("tilt", before.tilt)?.clamp(-tilt_limit, tilt_limit),
-        zoom: angle("zoom", before.zoom)?.clamp(0.02, 10_000.0),
+    let tilt_limit = std::f64::consts::PI;
+    let camera = crate::OrbitView {
+        yaw: angle("yaw", yaw)?.rem_euclid(std::f64::consts::TAU),
+        tilt: angle("tilt", tilt)?.clamp(-tilt_limit, tilt_limit),
+        zoom: angle("zoom", if fit_requested { 1.0 } else { before.zoom })?.clamp(0.02, 10_000.0),
         pan,
         pivot,
+        fit: flag("fit", before.fit)?,
+        perspective: flag("perspective", before.perspective)?,
+        wireframe: flag("wireframe", before.wireframe)?,
     };
-    state.point_cloud_orbit = enabled.then_some(camera);
+    state.orbit = enabled.then_some(camera);
     Ok(json!({ "enabled": enabled, "yaw": camera.yaw, "tilt": camera.tilt, "zoom": camera.zoom,
-        "pan": [pan.x, pan.y], "pivot": pivot.map(|p| [p.x, p.y, p.z]) }))
+        "pan": [pan.x, pan.y], "pivot": pivot.map(|p| [p.x, p.y, p.z]),
+        "fit": camera.fit, "perspective": camera.perspective, "wireframe": camera.wireframe }))
 }
 
 fn run_cloud_settings(s: &mut Session, p: &Value) -> Result<Value> {
@@ -1056,11 +1076,28 @@ mod tests {
     }
 
     #[test]
-    fn attach_share_and_orbit_say_they_are_not_available_yet() {
+    fn attach_and_share_say_they_are_not_available_yet() {
         let mut s = session();
-        for c in ["attach", "share", "3dorbit", "orbit"] {
+        for c in ["attach", "share"] {
             let e = s.execute(&resolve_alias(c), &Value::Null).unwrap_err().to_string();
             assert!(e.contains("not available yet"), "{c}: {e}");
         }
+    }
+
+    #[test]
+    fn orbit_navigates_the_model_without_changing_its_plan_view_or_document() {
+        let mut s = session();
+        let plan = s.state().unwrap().view();
+        let revision = s.state().unwrap().revision;
+        let result = s.execute(&resolve_alias("orbit"), &json!({ "view": "front", "perspective": true, "fit": true })).unwrap();
+        assert!(result["enabled"].as_bool().unwrap());
+        assert!(s.state().unwrap().orbit.unwrap().tilt.cos().abs() < 1e-12);
+        assert!(s.execute("3dorbit", &json!({ "fit": "later" })).is_err());
+        assert!(s.state().unwrap().orbit.unwrap().perspective);
+        s.execute("3dorbit", &Value::Null).unwrap();
+        let state = s.state().unwrap();
+        assert!(state.orbit.is_none());
+        assert_eq!(state.view(), plan);
+        assert_eq!(state.revision, revision);
     }
 }

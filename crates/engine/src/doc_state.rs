@@ -35,8 +35,8 @@ pub struct DocState {
     pub mspace: Option<Handle>,
     pub views: Vec<(Space, View)>,
     pub view_history: Vec<View>,
-    /// Point-cloud camera (yaw, tilt, and zoom relative to fit), separate from the drawing view.
-    pub point_cloud_orbit: Option<PointCloudOrbit>,
+    /// Model-space inspection camera, separate from the drawing view.
+    pub orbit: Option<OrbitView>,
     pub uid: u64,
     /// The drawing is saved as binary DXF (it was opened from one, or last saved as one).
     pub binary_dxf: bool,
@@ -54,17 +54,20 @@ pub struct DocState {
 
 /// Orbit state in model coordinates. Pan is in the camera plane, in drawing units.
 #[derive(Clone, Copy, Debug)]
-pub struct PointCloudOrbit {
+pub struct OrbitView {
     pub yaw: f64,
     pub tilt: f64,
     pub zoom: f64,
     pub pivot: Option<cadcraft_geom::Vec3>,
     pub pan: Vec2,
+    pub fit: bool,
+    pub perspective: bool,
+    pub wireframe: bool,
 }
 
-impl Default for PointCloudOrbit {
+impl Default for OrbitView {
     fn default() -> Self {
-        Self { yaw: 0.0, tilt: 0.55, zoom: 1.0, pivot: None, pan: Vec2::ZERO }
+        Self { yaw: 0.0, tilt: 0.55, zoom: 1.0, pivot: None, pan: Vec2::ZERO, fit: false, perspective: false, wireframe: false }
     }
 }
 
@@ -89,7 +92,7 @@ impl DocState {
             mspace: None,
             views: Vec::new(),
             view_history: Vec::new(),
-            point_cloud_orbit: None,
+            orbit: None,
             uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             binary_dxf: false,
             block_edit: None,

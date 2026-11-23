@@ -185,9 +185,17 @@ fn textures(ctx: &egui::Context) -> Textures {
 /// Draw one image as textured meshes, one per tile on screen: its rectangle, or the outline it is
 /// clipped to.
 fn draw_one(p: &egui::Painter, xf: &Xf, img: &DImage, alpha: u8) {
+    draw_projected(p, img, alpha, xf.scale, cut(img, xf, p.clip_rect()), |q| xf.to_screen(q));
+}
+
+pub(super) fn draw_orbit(p: &egui::Painter, img: &DImage, alpha: u8, scale: f64, project: impl Fn(Vec2) -> egui::Pos2) {
+    let cut = Cut { rect: p.clip_rect(), outline: img.clips.first().map(Vec::as_slice) };
+    draw_projected(p, img, alpha, scale, cut, project);
+}
+
+fn draw_projected(p: &egui::Painter, img: &DImage, alpha: u8, scale: f64, cut: Cut<'_>, project: impl Fn(Vec2) -> egui::Pos2) {
     let ctx = p.ctx();
     let raster = &img.raster;
-    let cut = cut(img, xf, p.clip_rect());
     if !cut.rect.is_positive() {
         return;
     }
@@ -204,7 +212,7 @@ fn draw_one(p: &egui::Painter, xf: &Xf, img: &DImage, alpha: u8) {
             e.insert(new)
         }
     };
-    let index = pyramid.reach(raster, level_for(img, xf.scale * f64::from(ctx.pixels_per_point())));
+    let index = pyramid.reach(raster, level_for(img, scale * f64::from(ctx.pixels_per_point())));
     let Some(level) = pyramid.levels.get_mut(index) else { return };
     let side = ctx.input(|i| i.max_texture_side).clamp(1, MAX_TILE_SIDE);
     // Raster pixels per pixel of this level (not quite 2^index for an odd size).
@@ -216,7 +224,7 @@ fn draw_one(p: &egui::Painter, xf: &Xf, img: &DImage, alpha: u8) {
             let min = Vec2::new((col * side) as f64 * kx, (row * side) as f64 * ky);
             let max = Vec2::new(((col * side + tw) as f64) * kx, ((row * side + th) as f64) * ky);
             let corners = [img.at(min.x, min.y), img.at(max.x, min.y), img.at(max.x, max.y), img.at(min.x, max.y)];
-            let on_screen = Rect::from_points(&corners.map(|q| xf.to_screen(q)));
+            let on_screen = Rect::from_points(&corners.map(&project));
             if !on_screen.intersects(cut.rect) {
                 continue;
             }
@@ -230,7 +238,7 @@ fn draw_one(p: &egui::Painter, xf: &Xf, img: &DImage, alpha: u8) {
                         let uv =
                             pos2(((q.x - min.x) / (max.x - min.x)).clamp(0.0, 1.0) as f32, ((q.y - min.y) / (max.y - min.y)).clamp(0.0, 1.0) as f32);
                         mesh.indices.push(mesh.vertices.len() as u32);
-                        mesh.vertices.push(Vertex { pos: xf.to_screen(at), uv, color });
+                        mesh.vertices.push(Vertex { pos: project(at), uv, color });
                     }
                 }
             }

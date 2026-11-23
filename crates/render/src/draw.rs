@@ -89,6 +89,16 @@ fn entity_parts(b: &mut Builder, ctx: &Ctx, e: &Entity) {
     };
     let tol = b.opts.tolerance / ctx.xf.scale_factor().max(1e-12);
     let lw = if b.opts.lineweights { lw } else { 0.0 };
+    let elevation;
+    let ctx = if b.opts.spatial {
+        if super::spatial::draw(b, ctx, e, rgb, lw, tol) {
+            return;
+        }
+        elevation = ctx.at_height(super::spatial::elevation(&e.kind));
+        &elevation
+    } else {
+        ctx
+    };
     // Stroke a polyline with the entity's linetype.
     let stroke = |b: &mut Builder, pts: &[Vec2]| match lt.as_ref().filter(|_| b.opts.linetypes) {
         Some(lt) => {
@@ -209,24 +219,7 @@ fn entity_parts(b: &mut Builder, ctx: &Ctx, e: &Entity) {
         EntityKind::Image(i) => draw_image(b, ctx, i, rgb, lw),
         EntityKind::Table(t) => table(b, ctx, t, rgb, lw),
         EntityKind::Tolerance(t) => tolerance::draw(b, ctx, e, t, lw, tol),
-        EntityKind::Leader(l) => {
-            let pts: Vec<Vec2> = l.vertices.iter().map(|v| v.xy()).collect();
-            stroke(b, &pts);
-            if l.arrow
-                && let (Some(a), Some(n)) = (pts.first(), pts.get(1))
-            {
-                let st = ctx.d.dim_style(&l.style);
-                // DIMASZ × DIMSCALE of the leader's style (the drawing's DIMSCALE when it is 0).
-                let size = st.map(|s| s.arrow_size).unwrap_or(0.18) * leader_scale(ctx.d, st);
-                // DIMLDRBLK ("" = closed filled).
-                let kind = dim::Arrowhead::parse(st.map(|s| s.leader_arrow_block.as_str()).unwrap_or(""));
-                let g = dim::arrowhead(kind, *a, (*a - *n).normalized(), size);
-                for l in &g.lines {
-                    b.polyline(ctx, rgb, lw, l);
-                }
-                b.tris(ctx, rgb, &g.tris);
-            }
-        }
+        EntityKind::Leader(l) => draw_leader(b, ctx, l, rgb, lw, stroke),
         EntityKind::MLeader(m) => draw_mleader(b, ctx, e, m, rgb, lw, own),
         EntityKind::Point(p) => {
             // Relative sizes follow the view: undo the block / viewport scale.
@@ -277,26 +270,58 @@ fn entity_parts(b: &mut Builder, ctx: &Ctx, e: &Entity) {
     }
 }
 
+fn draw_leader(b: &mut Builder, ctx: &Ctx, l: &cadcraft_doc::Leader, rgb: Ink, lw: f32, stroke: impl FnOnce(&mut Builder, &[Vec2])) {
+    let pts: Vec<Vec2> = l.vertices.iter().map(|v| v.xy()).collect();
+    if b.opts.spatial {
+        b.polyline3(ctx, rgb, lw, &l.vertices);
+    } else {
+        stroke(b, &pts);
+    }
+    if l.arrow
+        && let (Some(a), Some(n)) = (pts.first(), pts.get(1))
+    {
+        let st = ctx.d.dim_style(&l.style);
+        // DIMASZ × DIMSCALE of the leader's style (the drawing's DIMSCALE when it is 0).
+        let size = st.map(|s| s.arrow_size).unwrap_or(0.18) * leader_scale(ctx.d, st);
+        // DIMLDRBLK ("" = closed filled).
+        let kind = dim::Arrowhead::parse(st.map(|s| s.leader_arrow_block.as_str()).unwrap_or(""));
+        let g = dim::arrowhead(kind, *a, (*a - *n).normalized(), size);
+        let tip = ctx.at_height(l.vertices.first().map_or(0.0, |p| p.z));
+        for l in &g.lines {
+            b.polyline(&tip, rgb, lw, l);
+        }
+        b.tris(&tip, rgb, &g.tris);
+    }
+}
+
 /// `own`: the leader's transparency without its locked-layer fade, for its block content.
 fn draw_mleader(b: &mut Builder, ctx: &Ctx, e: &Entity, m: &cadcraft_doc::MLeader, rgb: Ink, lw: f32, own: u8) {
     // Straight or spline leader lines; block content draws like a block reference.
-    for pts in m.leader_paths() {
-        b.polyline(ctx, rgb, lw, &pts);
+    let landing = ctx.at_height(m.landing.z);
+    for (pts, original) in m.leader_paths().into_iter().zip(&m.leaders) {
+        if b.opts.spatial && original.iter().any(|p| p.z != m.landing.z) {
+            let mut points = original.clone();
+            points.push(m.landing);
+            b.polyline3(ctx, rgb, lw, &points);
+        } else {
+            b.polyline(&landing, rgb, lw, &pts);
+        }
         if let (Some(a), Some(n)) = (pts.first(), pts.get(1)) {
-            b.tris(ctx, rgb, &dim::arrow(*a, (*a - *n).normalized(), m.arrow_size));
+            let tip = ctx.at_height(original.first().map_or(m.landing.z, |p| p.z));
+            b.tris(&tip, rgb, &dim::arrow(*a, (*a - *n).normalized(), m.arrow_size));
         }
     }
     if let Some(t) = &m.text {
         let land = m.landing.xy();
         let dir = if t.insert.x >= land.x { 1.0 } else { -1.0 };
-        b.polyline(ctx, rgb, lw, &[land, land + Vec2::new(m.dogleg * dir, 0.0)]);
-        mtext(b, ctx, t, rgb, lw);
+        b.polyline(&landing, rgb, lw, &[land, land + Vec2::new(m.dogleg * dir, 0.0)]);
+        mtext(b, &ctx.at_height(t.insert.z), t, rgb, lw);
     }
     if let Some(ins) = &m.block {
         if m.dogleg > 0.0 && !m.leaders.is_empty() {
             let land = m.landing.xy();
             let dir = if ins.insert.x >= land.x { 1.0 } else { -1.0 };
-            b.polyline(ctx, rgb, lw, &[land, land + Vec2::new(m.dogleg * dir, 0.0)]);
+            b.polyline(&landing, rgb, lw, &[land, land + Vec2::new(m.dogleg * dir, 0.0)]);
         }
         insert(b, ctx, e, ins, rgb, own);
     }
@@ -311,6 +336,15 @@ fn draw_image(b: &mut Builder, ctx: &Ctx, i: &cadcraft_doc::Image, rgb: Ink, lw:
     let raster = if i.display & 1 != 0 { ctx.d.rasters.get(&i.path) } else { None };
     if let Some(r) = raster {
         b.image(ctx, rgb, i, r);
+    }
+    if b.opts.spatial {
+        let (o, u, v) = (i.insert, i.u * i.size.x, i.v * i.size.y);
+        b.polyline3(ctx, rgb, lw, &[o, o + u, o + u + v, o + v, o]);
+        if raster.is_none() {
+            b.polyline3(ctx, rgb, lw, &[o, o + u + v]);
+            b.polyline3(ctx, rgb, lw, &[o + u, o + v]);
+        }
+        return;
     }
     b.polyline(ctx, rgb, lw, &[o, o + u, o + u + v, o + v, o]);
     if raster.is_none() {
@@ -357,7 +391,7 @@ fn draw_dimension(
         // DXF group 12: a moved dimension keeps its `*D` block where it was and the offset in
         // the insertion point, so the block draws translated by it (#2634).
         let off = dm.insertion_point.xy();
-        let sub = Ctx { block_pstyle: b.named, block_transparency: own, ..sub_ctx(ctx, e, Mat3::translate(off)) };
+        let sub = Ctx { block_pstyle: b.named, block_transparency: own, ..sub_ctx(ctx, e, Mat3::translate(off)).at_height(dm.insertion_point.z) };
         // DIMTFILL: the block's MTEXT carries no background mask here, so a background
         // around each of the block's texts is drawn before the block's first text or first
         // line of the text's marks, except for a text that a SOLID of the block covers.

@@ -700,6 +700,7 @@ pub fn install(rs: &egui_wgpu::RenderState, faults: &Arc<GpuFaults>, stencil: Op
     let res = Resources::new(&rs.device, target);
     rs.renderer.write().callback_resources.insert(res);
     crate::cloud_gpu::install(rs, target);
+    crate::orbit_gpu::install(rs, target);
     let adapter = rs.adapter.get_info();
     log::info!("gpu canvas: {} ({:?}), target {:?}, stencil {:?}", adapter.name, adapter.backend, rs.target_format, target.stencil);
     target

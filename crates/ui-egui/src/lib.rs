@@ -63,6 +63,7 @@ pub mod menus;
 pub mod modal;
 pub mod opening;
 pub mod options;
+mod orbit_gpu;
 pub mod palettes;
 pub mod parametric;
 pub mod plotstyles;

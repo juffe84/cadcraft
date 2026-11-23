@@ -153,6 +153,7 @@ pub(super) fn ensure_list(app: &mut CadApp, xf: &Xf, views: &[(Bounds2, f64)], c
         on_screen: true,
         skip_viewport: split,
         cancel: None,
+        spatial: false,
     };
     if view_only {
         let t = Tokens::get();

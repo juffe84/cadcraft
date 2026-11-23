@@ -20,6 +20,7 @@ pub mod pen;
 mod plotstyle;
 mod point;
 pub mod raster;
+mod spatial;
 mod text;
 mod tolerance;
 pub mod units;
@@ -27,7 +28,7 @@ mod wide;
 
 use cadcraft_color::{Color, Rgb};
 use cadcraft_doc::{Drawing, Entity, EntityKind, Handle, Lineweight, Prim, Space};
-use cadcraft_geom::{Bounds2, Mat3, Polyline, Vec2};
+use cadcraft_geom::{Bounds2, Mat3, Polyline, Vec2, Vec3};
 use pen::Pen;
 
 pub use dim::{ArrowGeom, Arrowhead, DimGeometry, DimText, LineRole, arrowhead, dimension_geometry, dimension_geometry_with, format_linear_value};
@@ -83,6 +84,8 @@ fn max_scale(m: &Mat3) -> f64 {
 struct Ctx<'a> {
     d: &'a Drawing,
     xf: Mat3,
+    z_scale: f64,
+    z_offset: f64,
     block_color: Color,
     block_layer: Option<String>,
     block_lw: Lineweight,
@@ -103,6 +106,10 @@ struct Ctx<'a> {
 }
 
 impl Ctx<'_> {
+    fn at_height(&self, z: f64) -> Self {
+        Self { z_offset: self.z_offset + self.z_scale * z, ..self.clone() }
+    }
+
     /// A layer's colour, honouring the viewport's override.
     fn layer_color(&self, name: &str) -> Option<Color> {
         if let Some((_, c)) = self.vp_colors.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
@@ -149,6 +156,40 @@ pub const MAX_BLOCK_EXPANSION: usize = 2_000_000;
 pub const MAX_DISPLAY_POINTS: usize = 64_000_000;
 
 impl<'a> Builder<'a> {
+    fn record_heights(&mut self, kind: Kind, ctx: &Ctx, len: usize) {
+        if let Some(heights) = &mut self.list.heights {
+            let pool = heights.pool_mut(kind);
+            pool.resize(pool.len() + len, ctx.z_offset);
+        }
+    }
+
+    fn replace_heights(&mut self, ctx: &Ctx, heights: impl ExactSizeIterator<Item = f64>) {
+        if let (Some(list), Some(prim)) = (&mut self.list.heights, self.list.prims.last())
+            && let Some(target) = list.pool_mut(prim.kind).get_mut(prim.start as usize..(prim.start + prim.len) as usize)
+            && target.len() == heights.len()
+        {
+            for (z, local) in target.iter_mut().zip(heights) {
+                *z = ctx.z_offset + ctx.z_scale * local;
+            }
+        }
+    }
+
+    fn polyline3(&mut self, ctx: &Ctx, ink: Ink, lw: f32, points: &[Vec3]) {
+        let start = self.list.prims.len();
+        self.polyline(ctx, ink, lw, &points.iter().map(|p| p.xy()).collect::<Vec<_>>());
+        if start < self.list.prims.len() {
+            self.replace_heights(ctx, points.iter().map(|p| p.z));
+        }
+    }
+
+    fn tris3(&mut self, ctx: &Ctx, ink: Ink, points: &[Vec3]) {
+        let start = self.list.prims.len();
+        self.tris(ctx, ink, &points.iter().map(|p| p.xy()).collect::<Vec<_>>());
+        if start < self.list.prims.len() {
+            self.replace_heights(ctx, points.iter().map(|p| p.z));
+        }
+    }
+
     /// `color` and `lw` as the plot style table prints them.
     fn styled(&self, color: Ink, lw: f32) -> (Ink, f32) {
         match self.styles {
@@ -191,6 +232,7 @@ impl<'a> Builder<'a> {
             self.list.bounds.add(q);
             self.list.verts.push(q);
         }
+        self.record_heights(Kind::Polyline, ctx, pts.len());
         self.list.prims.push(DPrim {
             handle: ctx.top,
             color: color.rgb,
@@ -243,6 +285,12 @@ impl<'a> Builder<'a> {
             start,
             len: 4,
         });
+        if self.opts.spatial {
+            let z = i.insert.z;
+            let (u, v) = (i.u.z * i.size.x, i.v.z * i.size.y);
+            self.record_heights(Kind::Image { index }, ctx, 4);
+            self.replace_heights(ctx, [z + v, z + v + u, z + u, z].into_iter());
+        }
     }
     fn tris(&mut self, ctx: &Ctx, color: Ink, tris: &[Vec2]) {
         self.tris_at(ctx, color, tris, ctx.xf);
@@ -262,6 +310,7 @@ impl<'a> Builder<'a> {
             self.list.bounds.add(q);
             self.list.tris.push(q);
         }
+        self.record_heights(Kind::Tris, ctx, tris.len());
         self.list.prims.push(DPrim {
             handle: ctx.top,
             color: color.rgb,
@@ -325,6 +374,7 @@ impl<'a> Builder<'a> {
         let q = ctx.xf.apply(p);
         self.list.bounds.add(q);
         self.list.verts.push(q);
+        self.record_heights(Kind::Point, ctx, 1);
         self.list.prims.push(DPrim {
             handle: ctx.top,
             color: color.rgb,
@@ -337,13 +387,18 @@ impl<'a> Builder<'a> {
         });
     }
     fn infinite(&mut self, ctx: &Ctx, color: Ink, base: Vec2, dir: Vec2, ray: bool) {
+        self.infinite3(ctx, color, Vec3::new(base.x, base.y, 0.0), Vec3::new(dir.x, dir.y, 0.0), ray);
+    }
+
+    fn infinite3(&mut self, ctx: &Ctx, color: Ink, base: Vec3, dir: Vec3, ray: bool) {
         let Ok(start) = u32::try_from(self.list.verts.len()) else { return };
         if !self.charge(2) {
             return;
         }
         let (color, _) = self.styled(color, 0.0);
-        self.list.verts.push(ctx.xf.apply(base));
-        self.list.verts.push(ctx.xf.apply_vec(dir).normalized());
+        self.list.verts.push(ctx.xf.apply(base.xy()));
+        let xy = ctx.xf.apply_vec(dir.xy());
+        self.list.verts.push(if self.opts.spatial { xy } else { xy.normalized() });
         self.list.prims.push(DPrim {
             handle: ctx.top,
             color: color.rgb,
@@ -354,11 +409,14 @@ impl<'a> Builder<'a> {
             start,
             len: 2,
         });
+        if let Some(h) = &mut self.list.heights {
+            h.verts.extend([ctx.z_offset + ctx.z_scale * base.z, ctx.z_scale * dir.z]);
+        }
     }
     /// An empty builder drawing like this one (for contents cut afterwards, an XCLIP), with the
     /// block-expansion count carried over.
     fn part(&self) -> Builder<'a> {
-        let mut list = DisplayList::default();
+        let mut list = DisplayList::new(self.opts.spatial);
         list.expanded = self.list.expanded;
         Builder {
             list,
@@ -434,7 +492,7 @@ mod text_entity;
 mod viewports;
 
 pub use dim_draw::{dim_text, dimension_in};
-pub use display::{DImage, DPrim, DisplayList, Kind, MAX_TRANSPARENCY, NO_LAYER, PlotText, VIEWPORT_CONTENT, alpha};
+pub use display::{DImage, DPrim, DisplayList, Heights, Kind, MAX_TRANSPARENCY, NO_LAYER, PlotText, VIEWPORT_CONTENT, alpha};
 pub use pipeline::{Options, build, build_entities, build_plot};
 use props::{default_lineweight, resolve_common};
 use text_entity::text_style;
