@@ -32,10 +32,27 @@ fn read_preview(mut file: BufReader<File>, full_limit: u64, preview_blocks: usiz
     let mut source = Source::new(file, &header, table)?;
     let mut quick = Sample::new(preview_blocks * 8_000);
     let blocks = preview_blocks.min(source.entries.len());
-    for i in 0..blocks {
-        let index = if blocks < 2 { 0 } else { i * (source.entries.len() - 1) / (blocks - 1) };
-        let data = source.read(index..index + 1)?;
-        visit(&data, 0..data.len(), 8, |point| quick.add(point))?;
+    let preview_ids: Vec<_> = (0..blocks).map(|i| if blocks < 2 { 0 } else { i * (source.entries.len() - 1) / (blocks - 1) }).collect();
+    let mut preview_index = Vec::with_capacity(blocks);
+    let mut preview = preview_ids.iter().copied().peekable();
+    while let Some(first) = preview.next() {
+        let ids = source.batch(first, &mut preview, 0);
+        let data = source.read_blocks(&ids)?;
+        let sampled: Vec<_> = ids
+            .into_par_iter()
+            .zip(data)
+            .map(|(id, data)| {
+                let mut points = Vec::new();
+                visit(&data, 0, 8, |_| true, |point| points.push(point))?;
+                Ok((id, BlockExtent::new(&data), points))
+            })
+            .collect::<Result<_>>()?;
+        for (id, extent, points) in sampled {
+            preview_index.push((id, extent));
+            for point in points {
+                quick.add(point);
+            }
+        }
     }
     let bounds = header.bounds();
     let (min, max) = (Vec2::new(bounds.min.x, bounds.min.y), Vec2::new(bounds.max.x, bounds.max.y));
@@ -62,7 +79,7 @@ fn read_preview(mut file: BufReader<File>, full_limit: u64, preview_blocks: usiz
     std::thread::Builder::new()
         .name("cadcraft-point-cloud".into())
         .spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(source, &weak, rx)));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(source, &preview_index, &weak, rx)));
             if !matches!(result, Ok(Ok(())))
                 && let Some(bridge) = weak.upgrade()
             {
@@ -140,62 +157,58 @@ impl Source {
         })
     }
 
-    fn end(&self, start: usize, end: usize) -> usize {
-        let mut next = start + 1;
-        let mut points = self.entries[start].point_count;
-        while next < end
-            && self.offsets[next + 1] - self.offsets[start] <= 32 << 20
-            && (points + self.entries[next].point_count) * self.record_len as u64 <= 32 << 20
-        {
-            points += self.entries[next].point_count;
-            next += 1;
+    fn batch(&self, first: usize, ids: &mut std::iter::Peekable<impl Iterator<Item = usize>>, batch_points: u32) -> Vec<usize> {
+        let workers = rayon::current_num_threads();
+        let points_per_round = u64::from(batch_points) * workers as u64;
+        let mut batch = vec![first];
+        let mut bytes = self.entries[first].byte_count;
+        let mut points = self.entries[first].point_count;
+        while let Some(&id) = ids.peek() {
+            let entry = self.entries[id];
+            if (batch_points != 0 && batch.len() >= workers && points + entry.point_count > points_per_round)
+                || bytes + entry.byte_count > 32 << 20
+                || (points + entry.point_count) * self.record_len as u64 > 32 << 20
+            {
+                break;
+            }
+            let _ = ids.next();
+            batch.push(id);
+            bytes += entry.byte_count;
+            points += entry.point_count;
         }
-        next
+        batch
     }
 
-    fn read(&mut self, range: std::ops::Range<usize>) -> Result<PointData> {
-        let offset = self.offsets[range.start];
-        let mut encoded = vec![0; (self.offsets[range.end] - offset) as usize];
-        self.file.seek(SeekFrom::Start(offset)).map_err(format_error)?;
-        self.file.read_exact(&mut encoded).map_err(format_error)?;
-        let bytes = if let Some(vlr) = &self.vlr {
-            let entries = &self.entries[range];
-            let count = entries.iter().map(|e| e.point_count).sum::<u64>();
-            let mut raw = vec![0; count as usize * self.record_len];
-            laz::par_decompress(&encoded, &mut raw, vlr, entries).map_err(format_error)?;
-            raw
-        } else {
-            encoded
-        };
-        self.builder.clone().build_from_bytes(bytes).map_err(format_error)
-    }
-
-    /// Read matching blocks as one bounded job even when file order interleaves several scan lines.
-    fn read_selected(&mut self, ids: &[usize]) -> Result<PointData> {
-        let mut encoded = Vec::new();
-        let mut entries = Vec::with_capacity(ids.len());
+    /// Keep each decoded block separate. Column iterators advance one record at a time,
+    /// so indexing or filtering a shared slab would walk its earlier blocks repeatedly.
+    fn read_blocks(&mut self, ids: &[usize]) -> Result<Vec<PointData>> {
+        let mut encoded = Vec::with_capacity(ids.len());
         let mut last_offset = None;
         for &id in ids {
             let offset = self.offsets[id];
             if last_offset != Some(offset) {
                 self.file.seek(SeekFrom::Start(offset)).map_err(format_error)?;
             }
-            let entry = self.entries[id];
-            let start = encoded.len();
-            encoded.resize(start + entry.byte_count as usize, 0);
-            self.file.read_exact(&mut encoded[start..]).map_err(format_error)?;
+            let mut block = vec![0; self.entries[id].byte_count as usize];
+            self.file.read_exact(&mut block).map_err(format_error)?;
+            encoded.push(block);
             last_offset = Some(self.offsets[id + 1]);
-            entries.push(entry);
         }
-        let bytes = if let Some(vlr) = &self.vlr {
-            let count = entries.iter().map(|e| e.point_count as usize).sum::<usize>();
-            let mut raw = vec![0; count * self.record_len];
-            laz::par_decompress(&encoded, &mut raw, vlr, &entries).map_err(format_error)?;
-            raw
-        } else {
-            encoded
-        };
-        self.builder.clone().build_from_bytes(bytes).map_err(format_error)
+        let selection = laz::DecompressionSelection::base().decompress_z().decompress_rgb().decompress_classification().decompress_intensity();
+        ids.par_iter()
+            .zip(encoded)
+            .map(|(&id, encoded)| {
+                let bytes = if let Some(vlr) = &self.vlr {
+                    let entry = self.entries[id];
+                    let mut raw = vec![0; entry.point_count as usize * self.record_len];
+                    laz::par_decompress_selective(&encoded, &mut raw, vlr, &[entry], selection).map_err(format_error)?;
+                    raw
+                } else {
+                    encoded
+                };
+                self.builder.clone().build_from_bytes(bytes).map_err(format_error)
+            })
+            .collect()
     }
 
     fn cloud(&self, sample: Sample) -> PointCloud {
@@ -234,17 +247,25 @@ impl Sample {
     }
 }
 
-fn visit(data: &PointData, range: std::ops::Range<usize>, stride: usize, mut visit: impl FnMut(CloudPoint)) -> Result<()> {
-    let (start, count) = (range.start, range.len());
-    let position = data.x().zip(data.y()).zip(data.z()).skip(start).take(count).step_by(stride);
-    let attributes = data.intensity().zip(data.classification()).skip(start).take(count).step_by(stride);
-    let mut rgb = data.rgb().map(|c| c.skip(start).take(count).step_by(stride));
-    for (((x, y), z), (intensity, classification)) in position.zip(attributes) {
+fn visit(data: &PointData, start: usize, stride: usize, contains: impl Fn(Vec2) -> bool, mut visit: impl FnMut(CloudPoint)) -> Result<()> {
+    let xy = data.x().zip(data.y()).skip(start).step_by(stride);
+    let mut attributes = data.z().zip(data.intensity()).zip(data.classification()).skip(start).step_by(stride);
+    let mut rgb = data.rgb().map(|colors| colors.skip(start).step_by(stride));
+    let mut skipped = 0;
+    for (x, y) in xy {
+        if !contains(Vec2::new(x, y)) {
+            skipped += 1;
+            continue;
+        }
+        let Some(((z, intensity), classification)) = attributes.nth(skipped) else {
+            return Err(format_error("incomplete point record"));
+        };
         if [x, y, z].iter().any(|v| !v.is_finite() || v.abs() > super::super::MAX_WINDOW_COORD) {
             return Err(format_error("point coordinates outside the supported range"));
         }
-        let (r, g, b) = rgb.as_mut().and_then(Iterator::next).unwrap_or_default();
+        let (r, g, b) = rgb.as_mut().and_then(|colors| colors.nth(skipped)).unwrap_or_default();
         visit(CloudPoint { position: Vec3::new(x, y, z), rgb: [r, g, b], intensity, classification });
+        skipped = 0;
     }
     Ok(())
 }
@@ -253,6 +274,7 @@ fn visit(data: &PointData, range: std::ops::Range<usize>, stride: usize, mut vis
 struct Request {
     region: Bounds2,
     visible: Bounds2,
+    priority: Bounds2,
     options: DetailOptions,
 }
 
@@ -267,7 +289,8 @@ impl Request {
             let region = Bounds2::new(center - half, center + half);
             let inner = half * 0.75;
             let visible = Bounds2::new(center - inner, center + inner);
-            return Self { region, visible, options };
+            let priority = Bounds2 { min: bounds.min.max(region.min), max: bounds.max.min(region.max) };
+            return Self { region, visible, priority, options };
         }
         let cap = |region: Bounds2| {
             if options.radius > 0.0 {
@@ -280,7 +303,7 @@ impl Request {
         };
         let visible = cap(bounds);
         let padding = 0.2 * visible.width().min(visible.height());
-        Self { region: cap(visible.expand(padding)), visible, options }
+        Self { region: cap(visible.expand(padding)), visible, priority: visible, options }
     }
 
     fn covers_request(&self, next: Self) -> bool {
@@ -332,7 +355,8 @@ impl Bridge {
         let overlay = partial.or(detail).map(|(_, cloud)| cloud.clone());
         let overview = overlay.as_ref().and(state.overview.clone());
         let points = overlay.or_else(|| state.overview.clone());
-        CloudView { points, overview, detail_count, pending: !state.failed && (state.overview.is_none() || !complete), failed: state.failed }
+        let indexing = state.overview.is_none();
+        CloudView { points, overview, detail_count, indexing, pending: !state.failed && (indexing || !complete), failed: state.failed }
     }
 }
 
@@ -378,10 +402,12 @@ struct BlockExtent {
 }
 
 impl BlockExtent {
-    fn new(data: &PointData, range: std::ops::Range<usize>) -> Self {
-        let mut xy = data.x().zip(data.y()).skip(range.start).take(range.len());
-        let stripes: Vec<_> =
-            range.step_by(STRIPE_POINTS).map(|_| Bounds2::from_points(xy.by_ref().take(STRIPE_POINTS).map(|(x, y)| Vec2::new(x, y)))).collect();
+    fn new(data: &PointData) -> Self {
+        let mut xy = data.x().zip(data.y());
+        let stripes: Vec<_> = (0..data.len())
+            .step_by(STRIPE_POINTS)
+            .map(|_| Bounds2::from_points(xy.by_ref().take(STRIPE_POINTS).map(|(x, y)| Vec2::new(x, y))))
+            .collect();
         let bounds = stripes.iter().fold(Bounds2::EMPTY, |extent, stripe| extent.union(stripe));
         Self { bounds, stripes }
     }
@@ -402,37 +428,99 @@ impl BlockExtent {
     }
 }
 
-fn work(mut source: Source, bridge: &Weak<Bridge>, wake: Receiver<()>) -> Result<()> {
+struct DetailJob {
+    request: Request,
+    indexed_before_request: usize,
+    seeded: Vec<usize>,
+    hits: Sample,
+    published: Option<(Instant, usize)>,
+}
+
+impl DetailJob {
+    fn new(request: Request, indexed_before_request: usize) -> Self {
+        Self { request, indexed_before_request, seeded: Vec::new(), hits: Sample::new(DETAIL_BUDGET), published: None }
+    }
+
+    fn seed(&mut self, source: &mut Source, preview: &[(usize, BlockExtent)], bridge: &Weak<Bridge>) -> Result<()> {
+        let region = self.request.region;
+        let priority = self.request.priority;
+        let mut matches = preview
+            .iter()
+            .filter(|(_, extent)| extent.distance_to(&priority, priority.center()).is_some())
+            .map(|(id, _)| *id)
+            .take(rayon::current_num_threads())
+            .peekable();
+        if let Some(id) = matches.next() {
+            // The already sampled chunks give us nearby source points while the
+            // sequential scan is still reading its way toward the requested area.
+            self.seeded = source.batch(id, &mut matches, 0);
+            let blocks = source.read_blocks(&self.seeded)?;
+            for data in blocks {
+                visit(&data, 0, 1, |xy| region.contains(xy), |point| self.hits.add(point))?;
+            }
+            publish_partial(source, bridge, self);
+        }
+        Ok(())
+    }
+}
+
+fn work(mut source: Source, preview: &[(usize, BlockExtent)], bridge: &Weak<Bridge>, wake: Receiver<()>) -> Result<()> {
     log::info!("point cloud indexing: {} Rayon workers", rayon::current_num_threads());
     let mut index = Vec::with_capacity(source.entries.len());
     let mut overview = Sample::new(OVERVIEW_BUDGET);
     let stride = source.count.div_ceil(OVERVIEW_BUDGET as u64) as usize;
-    let mut first = 0;
+    let mut ids = (0..source.entries.len()).peekable();
     let mut seen = 0usize;
-    while first < source.entries.len() {
-        if bridge.strong_count() == 0 {
-            return Ok(());
+    let mut live: Option<DetailJob> = None;
+    while let Some(first) = ids.next() {
+        let Some(active) = bridge.upgrade() else { return Ok(()) };
+        let request = active.state().wanted;
+        drop(active);
+        if live.as_ref().map(|job| job.request) != request {
+            live = request.map(|request| DetailJob::new(request, first));
+            if let Some(job) = &mut live {
+                job.seed(&mut source, preview, bridge)?;
+            }
         }
-        let end = source.end(first, source.entries.len());
-        // Index every XY point and retain a coarse overview across the entire scan.
-        let data = source.read(first..end)?;
-        let mut cursor = 0;
-        let ranges: Vec<_> = source.entries[first..end]
-            .iter()
-            .map(|entry| {
-                let start = cursor;
-                cursor += entry.point_count as usize;
-                start..cursor
+        let batch = source.batch(first, &mut ids, 0);
+        let data = source.read_blocks(&batch)?;
+        let mut starts = Vec::with_capacity(data.len());
+        for block in &data {
+            starts.push((stride - seen % stride) % stride);
+            seen += block.len();
+        }
+        let seeded = live.as_ref().map_or(&[][..], |job| job.seeded.as_slice());
+        let blocks: Vec<_> = data
+            .par_iter()
+            .zip(starts)
+            .zip(batch)
+            .map(|((data, start), id)| {
+                let extent = BlockExtent::new(data);
+                let mut coarse = Vec::new();
+                visit(data, start, stride, |_| true, |point| coarse.push(point))?;
+                let mut hits = Vec::new();
+                if let Some(request) =
+                    request.filter(|request| !seeded.contains(&id) && extent.distance_to(&request.region, request.region.center()).is_some())
+                {
+                    visit(data, 0, 1, |xy| request.region.contains(xy), |point| hits.push(point))?;
+                }
+                Ok((extent, coarse, hits))
             })
-            .collect();
-        let boxes: Vec<_> = ranges.into_par_iter().map(|range| BlockExtent::new(&data, range)).collect();
-        index.extend(boxes);
-        let start = (stride - seen % stride) % stride;
-        seen += cursor;
-        if start < cursor {
-            visit(&data, start..cursor, stride, |point| overview.add(point))?;
+            .collect::<Result<_>>()?;
+        for (extent, coarse, hits) in blocks {
+            index.push(extent);
+            for point in coarse {
+                overview.add(point);
+            }
+            if let Some(job) = &mut live {
+                for point in hits {
+                    job.hits.add(point);
+                }
+            }
         }
-        first = end;
+        if let Some(job) = &mut live {
+            publish_partial(&source, bridge, job);
+        }
     }
     let Some(active) = bridge.upgrade() else { return Ok(()) };
     active.state().overview = Some(Arc::new(source.cloud(overview)));
@@ -444,7 +532,8 @@ fn work(mut source: Source, bridge: &Weak<Bridge>, wake: Receiver<()>) -> Result
         let request = active.state().wanted;
         let Some(request) = request.filter(|r| !active.state().details.iter().any(|(done, _)| done == r)) else { continue };
         drop(active);
-        if let Some(detail) = query(&mut source, &index, request, bridge, &mut cache)?
+        let job = live.take().filter(|job| job.request == request).unwrap_or_else(|| DetailJob::new(request, index.len()));
+        if let Some(detail) = query(&mut source, &index[..job.indexed_before_request], job, bridge, &mut cache)?
             && let Some(active) = bridge.upgrade()
         {
             let mut state = active.state();
@@ -499,27 +588,38 @@ impl BlockCache {
     }
 }
 
-fn query(source: &mut Source, index: &[BlockExtent], request: Request, bridge: &Weak<Bridge>, cache: &mut BlockCache) -> Result<Option<PointCloud>> {
-    let mut hits = Sample::new(DETAIL_BUDGET);
-    let center = request.visible.center();
-    let mut matches: Vec<_> =
-        index.iter().enumerate().filter_map(|(id, extent)| extent.distance_to(&request.region, center).map(|distance| (id, distance))).collect();
-    // Prioritize one parallel wave so a centered preview arrives early. Subsequent
-    // waves preserve file order to avoid random reads over gigabytes of source data.
+fn query(
+    source: &mut Source,
+    index: &[BlockExtent],
+    mut job: DetailJob,
+    bridge: &Weak<Bridge>,
+    cache: &mut BlockCache,
+) -> Result<Option<PointCloud>> {
+    let request = job.request;
+    let center = request.priority.center();
+    let mut matches: Vec<_> = index
+        .iter()
+        .enumerate()
+        .filter(|(id, _)| !job.seeded.contains(id))
+        .filter_map(|(id, extent)| {
+            if let Some(distance) = extent.distance_to(&request.priority, center) {
+                Some((id, false, distance))
+            } else {
+                extent.distance_to(&request.region, center).map(|distance| (id, true, distance))
+            }
+        })
+        .collect();
+    // Give the actual view priority over the surrounding radius. Within each group
+    // preserve file order after the first wave to avoid unnecessary disk seeks.
     let first_wave = rayon::current_num_threads().min(matches.len());
     if first_wave < matches.len() {
-        matches.select_nth_unstable_by(first_wave, |a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        matches.select_nth_unstable_by(first_wave, |a, b| a.1.cmp(&b.1).then_with(|| a.2.total_cmp(&b.2)).then_with(|| a.0.cmp(&b.0)));
     }
     matches[..first_wave].sort_unstable_by_key(|entry| entry.0);
-    matches[first_wave..].sort_unstable_by_key(|entry| entry.0);
-    let candidate_points = matches.iter().map(|&(id, _)| source.entries[id].point_count).sum::<u64>();
+    matches[first_wave..].sort_unstable_by_key(|&(id, padding, _)| (padding, id));
+    let candidate_points = matches.iter().map(|&(id, _, _)| source.entries[id].point_count).sum::<u64>();
     let mut cache_budget = if candidate_points <= CACHE_POINTS as u64 { CACHE_POINTS as u64 } else { LARGE_QUERY_CACHE_POINTS };
     log::debug!("point cloud detail: {} candidate blocks, {candidate_points} source points", matches.len());
-    let mut last_partial: Option<Instant> = None;
-    // Keep enough complete source chunks per round to feed the Rayon pool even when the
-    // configured batch for each worker is smaller than a source chunk.
-    let points_per_round = u64::from(request.options.batch_points) * rayon::current_num_threads() as u64;
-    let workers = rayon::current_num_threads();
     let retain = |hits: &mut Sample, points: &[CloudPoint]| {
         for &point in points {
             if request.region.contains(point.position.xy()) {
@@ -529,94 +629,69 @@ fn query(source: &mut Source, index: &[BlockExtent], request: Request, bridge: &
     };
     // Reuse all matching cached data before admitting new blocks that could evict it.
     let mut unread = Vec::with_capacity(matches.len());
-    for (id, _) in matches {
+    for (id, _, _) in matches {
         if let Some(points) = cache.get(id) {
-            retain(&mut hits, points);
+            retain(&mut job.hits, points);
         } else {
             unread.push(id);
         }
     }
-    publish_partial(source, request, bridge, &hits, &mut last_partial);
+    publish_partial(source, bridge, &mut job);
     let mut ids = unread.into_iter().peekable();
     while let Some(id) = ids.next() {
         if !bridge.upgrade().is_some_and(|b| b.state().wanted == Some(request)) {
             return Ok(None);
         }
-        let mut group = vec![id];
-        let mut bytes = source.entries[id].byte_count;
-        let mut points = source.entries[id].point_count;
-        while let Some(&next) = ids.peek() {
-            let entry = source.entries[next];
-            if (points_per_round != 0 && group.len() >= workers && points + entry.point_count > points_per_round)
-                || bytes + entry.byte_count > 32 << 20
-                || (points + entry.point_count) * source.record_len as u64 > 32 << 20
-            {
-                break;
-            }
-            let _ = ids.next();
-            group.push(next);
-            bytes += entry.byte_count;
-            points += entry.point_count;
-        }
-        let mut group: Vec<_> = group
-            .into_iter()
-            .map(|id| {
+        let mut group = source.batch(id, &mut ids, request.options.batch_points);
+        group.sort_unstable();
+        let data = source.read_blocks(&group)?;
+        let keep: Vec<_> = group
+            .iter()
+            .map(|&id| {
                 let count = source.entries[id].point_count;
                 let keep = cache_budget >= count;
                 if keep {
                     cache_budget -= count;
                 }
-                (id, keep)
+                keep
             })
             .collect();
-        // Pick batches by screen proximity, but fetch their bytes in file order.
-        group.sort_unstable_by_key(|&(id, _)| id);
-        let blocks: Vec<_> = group.iter().map(|&(id, _)| id).collect();
-        let data = source.read_selected(&blocks)?;
-        let mut offset = 0;
-        let ranges: Vec<_> = group
-            .iter()
-            .map(|&(id, keep)| {
-                let start = offset;
-                offset += source.entries[id].point_count as usize;
-                (id, keep, start..offset)
-            })
-            .collect();
-        let decoded: Vec<_> = ranges
+        let decoded: Vec<_> = group
             .into_par_iter()
-            .map(|(id, keep, range)| {
+            .zip(keep)
+            .zip(data)
+            .map(|((id, keep), data)| {
                 let mut points = Vec::new();
                 if keep {
-                    points.reserve(range.len());
+                    points.reserve(data.len());
                 }
-                // Walk each decompressed block once. Starting a new column iterator
-                // for every matching stripe repeats the seek through earlier records.
-                visit(&data, range, 1, |point| {
-                    if keep || request.region.contains(point.position.xy()) {
-                        points.push(point);
-                    }
-                })?;
+                visit(&data, 0, 1, |xy| keep || request.region.contains(xy), |point| points.push(point))?;
                 Ok((id, keep, points))
             })
             .collect::<Result<_>>()?;
         for (id, keep, points) in decoded {
-            retain(&mut hits, &points);
             if keep {
+                retain(&mut job.hits, &points);
                 cache.insert(id, points);
+            } else {
+                for point in points {
+                    job.hits.add(point);
+                }
             }
         }
-        publish_partial(source, request, bridge, &hits, &mut last_partial);
+        publish_partial(source, bridge, &mut job);
     }
-    Ok(Some(source.cloud(hits)))
+    Ok(Some(source.cloud(job.hits)))
 }
 
 /// Reveal points from the first useful batches while the rest are still being read.
-fn publish_partial(source: &Source, request: Request, bridge: &Weak<Bridge>, hits: &Sample, last: &mut Option<Instant>) {
-    if hits.points.is_empty() || last.is_some_and(|t| t.elapsed() < Duration::from_millis(350)) {
+fn publish_partial(source: &Source, bridge: &Weak<Bridge>, job: &mut DetailJob) {
+    let DetailJob { request, hits, published, .. } = job;
+    if hits.points.is_empty() || published.is_some_and(|(t, seen)| seen == hits.seen || t.elapsed() < Duration::from_millis(350)) {
         return;
     }
     let Some(active) = bridge.upgrade() else { return };
-    if active.state().wanted != Some(request) {
+    if active.state().wanted != Some(*request) {
         return;
     }
     let mut shown = Sample::new(100_000);
@@ -626,9 +701,9 @@ fn publish_partial(source: &Source, request: Request, bridge: &Weak<Bridge>, hit
     }
     let cloud = Arc::new(source.cloud(shown));
     let mut state = active.state();
-    if state.wanted == Some(request) {
-        state.partial = Some((request, cloud));
-        *last = Some(Instant::now());
+    if state.wanted == Some(*request) {
+        state.partial = Some((*request, cloud));
+        *published = Some((Instant::now(), hits.seen));
     }
 }
 
@@ -660,8 +735,8 @@ mod tests {
             };
             las::Point { x, y: f64::from(i % 10), ..Default::default() }
         });
-        let data = PointDataBuilder::new().build_from_points(points).unwrap();
-        let extent = BlockExtent::new(&data, 0..513);
+        let data = PointDataBuilder::new().build_from_points(points.take(513)).unwrap();
+        let extent = BlockExtent::new(&data);
         let square = |x| Bounds2::new(Vec2::new(x, 0.0), Vec2::new(x, 0.0)).expand(20.0);
         assert!(extent.bounds.intersects(&square(450.0)));
         assert!(extent.distance_to(&square(450.0), Vec2::new(450.0, 0.0)).is_none());
@@ -681,6 +756,40 @@ mod tests {
                 writer.write_point(las::Point { x: f64::from(i), y: f64::from(i % 10), z: 12.5, ..Default::default() }).unwrap();
             }
         }
+
+        // The preview can seed real detail even before the full index exists.
+        let mut file = BufReader::new(File::open(&path).unwrap());
+        let table = preflight(&mut file).unwrap();
+        let header = Header::new(&mut file).unwrap();
+        let mut source = Source::new(file, &header, table).unwrap();
+        let first = source.read_blocks(&[0]).unwrap().pop().unwrap();
+        let preview = [(0, BlockExtent::new(&first))];
+        let (wake, rx) = sync_channel(1);
+        let bridge = Arc::new(Bridge { state: Mutex::new(State::default()), wake, extent: Bounds2::new(Vec2::ZERO, Vec2::new(100_099.0, 9.0)) });
+        let seed_area = Bounds2::new(Vec2::new(11.0, 1.0), Vec2::new(15.0, 5.0));
+        let options = DetailOptions { radius: 2.0, ..Default::default() };
+        let _ = bridge.view_with(seed_area, options);
+        let request = bridge.state().wanted.unwrap();
+        let worker = Arc::downgrade(&bridge);
+        let mut job = DetailJob::new(request, 0);
+        job.seed(&mut source, &preview, &worker).unwrap();
+        let early = bridge.current(seed_area);
+        assert!(early.indexing && early.pending);
+        let early_points = early.points.unwrap();
+        assert!(early_points.points().iter().any(|p| p.position.x == 13.0));
+        let thread = std::thread::spawn(move || work(source, &preview, &worker, rx).unwrap());
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let view = bridge.current(seed_area);
+            if !view.pending {
+                assert_eq!(view.detail_count, Some(early_points.points().len()), "the index must not add the seeded points a second time");
+                break;
+            }
+            assert!(Instant::now() < deadline, "the seeded view never finished");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(bridge);
+        thread.join().unwrap();
 
         let file = BufReader::new(File::open(&path).unwrap());
         let d = read_preview(file, 10, 1).unwrap();

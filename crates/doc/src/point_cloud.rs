@@ -122,6 +122,8 @@ pub struct CloudView {
     pub overview: Option<Arc<PointCloud>>,
     /// Retained detail points once the current request finishes.
     pub detail_count: Option<usize>,
+    /// The coarse preview is still being refined. Detail may already be available.
+    pub indexing: bool,
     pub pending: bool,
     pub failed: bool,
 }

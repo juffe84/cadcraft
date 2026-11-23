@@ -106,7 +106,8 @@ fn view(cloud: &PointCloud, bounds: Bounds2, app: &CadApp, request: bool) -> Clo
 }
 
 fn layers<'a>(snapshot: &'a CloudView, root: &'a Arc<PointCloud>) -> impl Iterator<Item = &'a Arc<PointCloud>> {
-    snapshot.overview.iter().chain(std::iter::once(snapshot.points.as_ref().unwrap_or(root))).filter(|cloud| !cloud.points().is_empty())
+    let overview = snapshot.overview.as_ref().or_else(|| (snapshot.indexing && snapshot.points.is_some()).then_some(root));
+    overview.into_iter().chain(std::iter::once(snapshot.points.as_ref().unwrap_or(root))).filter(|cloud| !cloud.points().is_empty())
 }
 
 pub(super) fn paint_plan(app: &CadApp, painter: &egui::Painter, xf: &Xf, request: bool) {
@@ -225,12 +226,17 @@ impl OrbitFrame {
         (pos2(at.x + ((x.dot(point) + px) * self.camera.scale) as f32, at.y - ((y.dot(point) + py) * self.camera.scale) as f32), z.dot(point))
     }
 
-    /// The ray through the center of the window, at the depth of a known surface point.
-    /// This also tracks a screen-space pan when the exact point is between rendered samples.
-    fn center_on_surface(&self, point: Vec3) -> Vec3 {
-        let [right, up, front] = self.camera.axes;
+    fn ray_origin(&self, at: egui::Pos2) -> Vec3 {
+        let [right, up, _] = self.camera.axes;
+        let offset = at - self.rect.center();
         let [x, y] = self.camera.pan;
-        self.camera.center - right * x - up * y + front * front.dot(point - self.camera.center)
+        self.camera.center + right * (f64::from(offset.x) / self.camera.scale - x) - up * (f64::from(offset.y) / self.camera.scale + y)
+    }
+
+    /// Locate a screen pixel on the plane at the depth of a visible sample.
+    fn on_surface(&self, at: egui::Pos2, point: Vec3) -> Vec3 {
+        let front = self.camera.axes[2];
+        self.ray_origin(at) + front * front.dot(point - self.camera.center)
     }
 
     fn detail_bounds(&self, focus: Vec3) -> Bounds2 {
@@ -242,20 +248,62 @@ impl OrbitFrame {
         Bounds2::new(focus.xy() - span, focus.xy() + span)
     }
 
-    fn pick(&self, shown: &PointCloud, cursor: egui::Pos2, limit: usize, radius: f32) -> Option<Vec3> {
-        // Only run when picking a pivot or when the camera settles. Screen distance chooses the pixel, and depth breaks
-        // ties so overlapping points turn around the front of the cloud.
-        let mut best = (radius * radius, f64::NEG_INFINITY);
-        let mut pivot = None;
-        shown.visible(self.bounds, limit, |p| {
-            let (at, depth) = self.project(p.position);
-            let d = at.distance_sq(cursor);
-            if self.rect.contains(at) && (d < best.0 || (d == best.0 && depth > best.1)) {
-                pivot = Some(p.position);
-                best = (d, depth);
+    fn pick_bounds(&self, cloud: &PointCloud, cursor: egui::Pos2, radius: f32) -> Bounds2 {
+        let front = self.camera.axes[2];
+        if front.z.abs() < 0.001 {
+            return self.bounds;
+        }
+        let corners = Rect::from_center_size(cursor, egui::Vec2::splat(radius * 2.0)).intersect(self.rect);
+        let mut bounds = Bounds2::EMPTY;
+        for at in [corners.left_top(), corners.right_top(), corners.left_bottom(), corners.right_bottom()] {
+            let origin = self.ray_origin(at);
+            for z in cloud.z_range {
+                bounds.add((origin + front * ((z - origin.z) / front.z)).xy());
             }
-        });
-        pivot
+        }
+        // Leave a margin for roundoff at a pixel or tile edge at survey coordinates.
+        bounds.expand(0.001)
+    }
+
+    fn pick<'a>(&self, clouds: impl Iterator<Item = &'a Arc<PointCloud>>, cursor: egui::Pos2, limit: usize, radius: f32, size: f32) -> Option<Vec3> {
+        let mut best: Option<SurfaceHit> = None;
+        for cloud in clouds {
+            cloud.visible(self.pick_bounds(cloud, cursor, radius), limit, |p| {
+                let (at, depth) = self.project(p.position);
+                let delta = (at - cursor).abs();
+                if !self.rect.contains(at) || delta.length_sq() > radius * radius {
+                    return;
+                }
+                let hit = SurfaceHit { point: p.position, distance: delta.length_sq(), depth, covers: delta.x.max(delta.y) <= 0.5 * size };
+                if best.is_none_or(|previous| hit.nearer(previous)) {
+                    best = Some(hit);
+                }
+            });
+        }
+        best.map(|hit| hit.point)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SurfaceHit {
+    point: Vec3,
+    distance: f32,
+    depth: f64,
+    covers: bool,
+}
+
+impl SurfaceHit {
+    fn nearer(self, other: Self) -> bool {
+        // Match the depth test when both point markers cover the actual pixel.
+        if self.covers && other.covers {
+            self.depth > other.depth
+        } else {
+            self.covers
+                .cmp(&other.covers)
+                .then_with(|| other.distance.total_cmp(&self.distance))
+                .then_with(|| self.depth.total_cmp(&other.depth))
+                .is_gt()
+        }
     }
 }
 
@@ -278,13 +326,27 @@ pub(super) struct OrbitFocus {
     document: u64,
     pose: FocusPose,
     changed_at: f64,
-    surface: Vec3,
-    sample_source: Weak<PointCloud>,
+    at: egui::Pos2,
+    surface: Option<Vec3>,
+    sample_source: Option<Weak<PointCloud>>,
 }
 
-/// Use coarse visible geometry to find the center of interest. Never read the GPU depth buffer
-/// back into the CPU or restart a streaming request for every drag event.
-fn detail_view(app: &mut CadApp, ui: &egui::Ui, root: &Arc<PointCloud>, frame: &OrbitFrame, document: u64, dragging: bool) -> CloudView {
+struct FocusHint {
+    at: egui::Pos2,
+    surface: Option<Vec3>,
+}
+
+const FOCUS_RADIUS: f32 = 48.0;
+
+fn detail_view(
+    app: &mut CadApp,
+    ui: &mut egui::Ui,
+    root: &Arc<PointCloud>,
+    frame: &OrbitFrame,
+    document: u64,
+    dragging: bool,
+    hint: Option<FocusHint>,
+) -> CloudView {
     let snapshot = view(root, frame.bounds, app, false);
     if root.detail.is_none() {
         return snapshot;
@@ -292,9 +354,17 @@ fn detail_view(app: &mut CadApp, ui: &egui::Ui, root: &Arc<PointCloud>, frame: &
     let now = ui.input(|input| input.time);
     let pose = FocusPose::from(frame);
     let mut state = app.canvas.cloud_orbit_focus.take().filter(|state| state.document == document);
-    if state.as_ref().is_none_or(|state| state.pose != pose) {
-        let surface = state.as_ref().map_or(frame.camera.center, |state| state.surface);
-        state = Some(OrbitFocus { document, pose, changed_at: now, surface, sample_source: Weak::new() });
+    if hint.is_some() || state.as_ref().is_none_or(|state| state.pose != pose) {
+        let at = hint
+            .as_ref()
+            .map(|hint| hint.at)
+            .or_else(|| state.as_ref().map(|state| state.at))
+            .filter(|at| frame.rect.contains(*at))
+            .unwrap_or_else(|| frame.rect.center());
+        let surface = hint
+            .and_then(|hint| hint.surface)
+            .or_else(|| state.as_ref().and_then(|state| state.surface).filter(|point| frame.project(*point).0.distance(at) <= FOCUS_RADIUS));
+        state = Some(OrbitFocus { document, pose, changed_at: now, at, surface, sample_source: None });
     }
     let Some(mut state) = state else { return snapshot };
     if dragging || now - state.changed_at < 0.12 {
@@ -302,18 +372,16 @@ fn detail_view(app: &mut CadApp, ui: &egui::Ui, root: &Arc<PointCloud>, frame: &
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
         return snapshot;
     }
-    let overview = snapshot.overview.as_ref().or(snapshot.points.as_ref()).unwrap_or(root);
+    let overview = if snapshot.indexing { root } else { snapshot.overview.as_ref().or(snapshot.points.as_ref()).unwrap_or(root) };
     let samples = Arc::downgrade(overview);
-    if !Weak::ptr_eq(&state.sample_source, &samples) {
-        // The shader draws all resident vertices. Keep the CPU pick bounded when the
-        // camera is looking at a large area and points are densely packed.
-        if let Some(point) = frame.pick(overview, frame.rect.center(), 160_000, 24.0) {
-            state.surface = point;
+    if state.sample_source.as_ref().is_none_or(|previous| state.surface.is_none() && !Weak::ptr_eq(previous, &samples)) {
+        let size = app.session.settings.point_cloud_size;
+        if let Some(point) = frame.pick(layers(&snapshot, root), state.at, 160_000, FOCUS_RADIUS, size) {
+            state.surface = Some(frame.on_surface(state.at, point));
         }
-        state.sample_source = samples;
+        state.sample_source = Some(samples);
     }
-    let center = frame.center_on_surface(state.surface);
-    let bounds = frame.detail_bounds(center);
+    let bounds = state.surface.map_or(Bounds2::EMPTY, |point| frame.detail_bounds(frame.on_surface(state.at, point)));
     app.canvas.cloud_orbit_focus = Some(state);
     let _ = view(root, bounds, app, true);
     // Fetch the composed layers against the actual render footprint, not the load zone.
@@ -350,21 +418,17 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     }
     let mut frame = OrbitFrame::new(orbit, plan, &root, rect);
     let mut updated = false;
+    let mut hint = None;
     if press && let Some(cursor) = pointer.filter(|p| rect.contains(*p)) {
         let snapshot = view(&root, frame.bounds, app, false);
         let gpu = layers(&snapshot, &root).all(|shown| crate::cloud_gpu::available(app.canvas.gpu, shown));
         let limit = if gpu { usize::MAX } else { sample_budget(rect) };
-        if let Some(pivot) = layers(&snapshot, &root)
-            .filter_map(|cloud| frame.pick(cloud, cursor, limit, app.session.settings.point_cloud_size.max(6.0)))
-            .min_by(|a, b| {
-                let a = frame.project(*a);
-                let b = frame.project(*b);
-                a.0.distance_sq(cursor).total_cmp(&b.0.distance_sq(cursor)).then_with(|| b.1.total_cmp(&a.1))
-            })
-        {
+        let size = app.session.settings.point_cloud_size;
+        if let Some(pivot) = frame.pick(layers(&snapshot, &root), cursor, limit, size.max(6.0), size) {
             let delta = pivot - frame.camera.center;
             orbit.pan += Vec2::new(frame.camera.axes[0].dot(delta), frame.camera.axes[1].dot(delta));
             orbit.pivot = Some(pivot);
+            hint = Some(FocusHint { at: cursor, surface: Some(pivot) });
             updated = true;
         }
     }
@@ -377,11 +441,19 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     }
     if response.dragged_by(PointerButton::Secondary) && motion != egui::Vec2::ZERO {
         orbit.pan += Vec2::new(f64::from(motion.x), -f64::from(motion.y)) / frame.camera.scale;
+        hint = Some(FocusHint { at: rect.center(), surface: None });
         updated = true;
     }
     if scroll != 0.0
         && let Some(pointer) = pointer
     {
+        let remembered =
+            app.canvas.cloud_orbit_focus.as_ref().filter(|focus| focus.document == document && focus.at == pointer).and_then(|focus| focus.surface);
+        let surface = remembered.or_else(|| {
+            let snapshot = view(&root, frame.bounds, app, false);
+            frame.pick(layers(&snapshot, &root), pointer, 160_000, FOCUS_RADIUS, app.session.settings.point_cloud_size)
+        });
+        hint = Some(FocusHint { at: pointer, surface: surface.map(|point| frame.on_surface(pointer, point)) });
         let at = pointer - rect.center();
         let old = orbit.zoom;
         orbit.zoom = (old * (f64::from(scroll) * 0.005).exp()).clamp(0.02, 10_000.0);
@@ -400,7 +472,7 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
         }
     }
     let dragging = response.dragged_by(PointerButton::Middle) || response.dragged_by(PointerButton::Secondary);
-    let snapshot = detail_view(app, ui, &root, &frame, document, dragging);
+    let snapshot = detail_view(app, ui, &root, &frame, document, dragging, hint);
     if snapshot.pending {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(70));
     }
@@ -437,6 +509,36 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
+    fn orbit_detail_uses_the_front_surface_at_an_off_center_zoom_anchor() {
+        let pose = PointCloudOrbit { pivot: Some(Vec3::ZERO), yaw: 0.5, tilt: 1.1, ..Default::default() };
+        let plan = cadcraft_engine::View { center: Vec2::ZERO, height: 80.0, twist: 0.0 };
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 500.0));
+        let cloud = |points: &[Vec3]| {
+            Arc::new(PointCloud::new(
+                points.iter().map(|&position| CloudPoint { position, rgb: [0; 3], intensity: 0, classification: 0 }).collect(),
+                points.len() as u64,
+                false,
+                false,
+            ))
+        };
+        let extent = cloud(&[Vec3::new(-500.0, -500.0, -150.0), Vec3::new(500.0, 500.0, 150.0)]);
+        let frame = OrbitFrame::new(pose, plan, &extent, rect);
+        let cursor = pos2(620.0, 320.0);
+        let front = frame.camera.axes[2];
+        let ray = frame.ray_origin(cursor);
+        let back = ray - front * 70.0;
+        let nearer = ray + front * 70.0 + frame.camera.axes[0] * (1.0 / frame.camera.scale);
+        let overview = cloud(&[back]);
+        let detail = cloud(&[nearer]);
+
+        let surface = frame.pick([&overview, &detail].into_iter(), cursor, usize::MAX, FOCUS_RADIUS, 4.0).unwrap();
+        let focus = frame.on_surface(cursor, surface);
+        assert!((focus - nearer).len() < 1.0);
+        assert!(frame.detail_bounds(focus).center().dist(back.xy()) > 50.0);
+        assert!(frame.project(focus).0.distance(cursor) < 0.01);
+    }
+
+    #[test]
     fn orbit_detail_follows_the_panned_surface_instead_of_the_whole_cloud_height() {
         let points = [Vec3::new(-500.0, -900.0, -800.0), Vec3::new(100.0, 700.0, 400.0)].map(|position| CloudPoint {
             position,
@@ -454,7 +556,7 @@ mod tests {
         orbit.pan = Vec2::new(-right.dot(target), -up.dot(target));
         let frame = OrbitFrame::new(orbit, plan, &cloud, rect);
         assert!(frame.project(target).0.distance(rect.center()) < 0.01);
-        let focus = frame.center_on_surface(target);
+        let focus = frame.on_surface(rect.center(), target);
         assert!((focus - target).len() < 1e-8);
         assert!(frame.detail_bounds(focus).center().near(target.xy(), 1e-8));
         assert!(frame.bounds.center().dist(target.xy()) > frame.detail_bounds(focus).height());
