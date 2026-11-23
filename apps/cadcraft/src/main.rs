@@ -158,6 +158,7 @@ impl eframe::App for App {
 
 /// File format hooks for the engine (it stays I/O-agnostic).
 pub fn install_io() {
+    cadcraft_engine::cmd::file::set_point_cloud_reader(|file| cadcraft_io::point_cloud::read(file).map_err(|e| e.to_string()));
     cadcraft_engine::cmd::file::set_io(cadcraft_engine::cmd::file::IoHooks {
         read: |b, name| cadcraft_io::read(b, name).map_err(|e| e.to_string()),
         write: |d, name| cadcraft_io::write(d, name).map_err(|e| e.to_string()),
@@ -200,6 +201,7 @@ fn filters(pick: &Pick) -> Vec<(&'static str, Vec<&'static str>)> {
         Pick::Open => vec![
             (i18n::t("Drawings (DWG, DXF)"), vec!["dwg", "dxf", "dwt"]),
             (i18n::t("SVG drawings (SVG, SVGZ)"), vec!["svg", "svgz"]),
+            (i18n::t("Point clouds (LAS, LAZ)"), vec!["las", "laz"]),
             (i18n::t("All files"), vec!["*"]),
         ],
         Pick::Save(name) => filters_for_save(name).iter().map(|(label, ext)| (i18n::t(label), vec![*ext])).collect(),

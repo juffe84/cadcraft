@@ -81,3 +81,11 @@ Generated-in-code assets are original and have no file to list:
 | `crates/ui-egui/src/i18n/el.tsv` | @Camthalion77 with ChatGPT (AI-assisted); 46 later rows: @V1dalTheAbidal with Claude Code (AI-assisted) | Original Greek translations of CADCraft English strings | MIT OR Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`) | No proprietary localization resources copied; the 46 later rows were read by their contributor, a native Greek speaker; independent native proofreading of the whole file pending |
 | `crates/ui-egui/src/i18n/vi.tsv` | @2ez4gcx with Claude Code (AI-assisted) | Original Vietnamese translations of CADCraft English strings | MIT OR Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`) | No proprietary localization resources copied; terminology chosen with a native speaker, full proofreading pending |
 | `crates/ui-egui/src/i18n/ka.tsv` | Davit Matchakhelidze (@devius), native speaker, with Claude Code | Original Georgian translations of CADCraft English strings | MIT OR Apache-2.0 (`LICENSE-MIT`, `LICENSE-APACHE`) | No proprietary localization resources copied; written from the English strings, no other catalog used as a source; terminology and doubtful strings decided by a native Georgian speaker; no font assets added (the Georgian face comes from craft-fonts) |
+
+## Point-cloud import
+
+| Component | Author | Source | Licence | Notes |
+|---|---|---|---|---|
+| `las` | las-rs contributors | [las 0.11.1](https://crates.io/crates/las/0.11.1) | MIT | Unmodified Rust dependency. |
+| `laz` | laz-rs contributors | [laz 0.13.0](https://crates.io/crates/laz/0.13.0) | Apache-2.0 | Unmodified Rust dependency. |
+| LAS/LAZ integration test inputs | CADCraft contributors | `crates/io/tests/it/las_laz.rs` | MIT OR Apache-2.0 | Generated in memory from synthetic XYZ and color values declared in the test. |

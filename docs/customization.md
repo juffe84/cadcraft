@@ -64,3 +64,14 @@ the catalog: each command's id and its parameters.
   ```
 
 - **AI agents:** `cadcraft-cli mcp`, headless or connected to the app. See [mcp.md](mcp.md).
+
+## LAS and LAZ point clouds
+
+Use **Open** or drop a `.las` or `.laz` file into CADCraft. The file opens in its own tab as a
+top-down preview with the original coordinates and scan colors, when present. Zoom in to see
+more detail. The desktop reads files in batches in the background and decompresses LAZ
+chunks in parallel. The decoded cloud stays in memory (up to 25 million points on desktop,
+2 million in the browser). CADCraft does not reproject coordinates.
+
+Use `cadcraft-cli info scan.laz` for point count and XY extents. The preview supports viewing.
+Point snapping, 3D display and saving or exporting the cloud are not supported.

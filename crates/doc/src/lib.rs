@@ -16,6 +16,7 @@ mod header;
 pub mod library;
 mod plotstyle;
 mod plotter;
+pub mod point_cloud;
 mod raster;
 mod refedit;
 mod store;
@@ -158,6 +159,8 @@ pub struct Drawing {
     pub portable_fonts: bool,
     /// The pixels of the raster images that are loaded (IMAGE). Never written to a file.
     pub rasters: Rasters,
+    /// A point cloud opened for viewing in model space. Shared across undo snapshots.
+    pub point_cloud: Option<std::sync::Arc<point_cloud::PointCloud>>,
 }
 
 impl Default for Drawing {
@@ -217,6 +220,7 @@ impl Drawing {
             hidden_objects: BTreeSet::new(),
             ucs_previous: Vec::new(),
             read_notes: Vec::new(),
+            point_cloud: None,
             refedit: None,
             skipped_records: BTreeMap::new(),
             portable_fonts: false,
@@ -472,9 +476,13 @@ impl Drawing {
         e.common.visible && self.layer(&e.common.layer).is_none_or(|l| !l.frozen) && !self.is_hidden_object(e.handle)
     }
 
-    /// Bounds of the entities in a space that count in its extents ([`Drawing::in_extents`]).
+    /// Bounds of the entities in a space that count in its extents ([`Drawing::in_extents`]),
+    /// including an open point cloud in model space.
     pub fn extents(&self, space: &Space) -> cadcraft_geom::Bounds2 {
-        let mut b = cadcraft_geom::Bounds2::EMPTY;
+        let mut b = match space {
+            Space::Model => self.point_cloud.as_ref().map_or(cadcraft_geom::Bounds2::EMPTY, |cloud| cloud.bounds()),
+            Space::Paper(_) => cadcraft_geom::Bounds2::EMPTY,
+        };
         // One block-bounds cache for the whole space: every reference to a block reuses its
         // measured contents instead of measuring the definition again.
         let mut cache = BlockBoundsCache::default();

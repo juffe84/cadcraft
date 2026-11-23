@@ -621,6 +621,9 @@ fn run_inspect(s: &mut Session, p: &Value) -> Result<Value> {
         // What reading the file left out, in words (a damaged DWG's unreadable object records).
         "readNotes": d.read_notes,
     });
+    if let Some(cloud) = &d.point_cloud {
+        out["pointCloud"] = json!({ "points": cloud.points().len(), "rgb": cloud.has_rgb });
+    }
     if bool_or(p, "entities", true)
         && let (Some(o), Some(store)) = (out.as_object_mut(), d.space(&space))
     {

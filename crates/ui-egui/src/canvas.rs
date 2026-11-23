@@ -840,6 +840,9 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         let _ = app.session.zoom_extents();
     }
     let Ok(st) = app.session.state() else { return };
+    if st.doc.point_cloud.is_some() && st.space == cadcraft_doc::Space::Model {
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Image, true, crate::i18n::t("Point cloud preview")));
+    }
     let view = st.view();
     let scale = f64::from(rect.height()) / view.height.max(1e-12);
     let xf = Xf { rect, center: view.center, scale, twist: view.twist };
@@ -1106,6 +1109,30 @@ fn press_at(app: &mut CadApp, xf: &Xf, ctx: &egui::Context, pos: Pos2, mods: egu
     !had_window && app.session.pending_window.is_some()
 }
 
+fn paint_point_cloud(app: &CadApp, painter: &egui::Painter, xf: &Xf, fallback: Color32) {
+    let Ok(state) = app.session.state() else { return };
+    if state.space != cadcraft_doc::Space::Model || state.block_editor().is_some() {
+        return;
+    }
+    let Some(cloud) = state.doc.point_cloud.as_ref() else { return };
+    let mut mesh = egui::Mesh::default();
+    let pixels = f64::from(xf.rect.width()) * f64::from(xf.rect.height());
+    let budget = ((pixels / 8.0) as usize).clamp(1, 120_000);
+    cloud.visible(xf.world_bounds(), budget, |point| {
+        let screen = xf.to_screen(point.position.xy());
+        if xf.rect.contains(screen) {
+            let color = if cloud.has_rgb {
+                let [r, g, b] = point.rgb.map(|c| if cloud.rgb_is_8_bit { c as u8 } else { (c >> 8) as u8 });
+                Color32::from_rgb(r, g, b)
+            } else {
+                fallback
+            };
+            mesh.add_colored_rect(Rect::from_center_size(screen, vec2(1.5, 1.5)), color);
+        }
+    });
+    painter.add(egui::Shape::mesh(mesh));
+}
+
 fn paint_canvas(frame: CanvasPaint<'_>) {
     let CanvasPaint {
         app,
@@ -1155,6 +1182,7 @@ fn paint_canvas(frame: CanvasPaint<'_>) {
         None => {
             blockedit::wash(app, painter, rect);
             draw_grid(app, painter, &xf);
+            paint_point_cloud(app, painter, &xf, t.canvas_ink);
             (Rgb(t.canvas.r(), t.canvas.g(), t.canvas.b()), None)
         }
     };

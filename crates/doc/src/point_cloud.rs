@@ -1,0 +1,108 @@
+//! In-memory XYZ samples and a spatial index for model-space previews.
+use cadcraft_geom::{Bounds2, Vec3};
+use std::ops::Range;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CloudPoint {
+    pub position: Vec3,
+    pub rgb: [u16; 3],
+    pub intensity: u16,
+    pub classification: u8,
+}
+
+#[derive(Debug, PartialEq)]
+pub struct PointCloud {
+    points: Vec<CloudPoint>,
+    root: Tile,
+    pub has_rgb: bool,
+    pub rgb_is_8_bit: bool,
+}
+
+#[derive(Debug, PartialEq)]
+struct Tile {
+    bounds: Bounds2,
+    range: Range<usize>,
+    children: Option<Box<[Tile; 2]>>,
+}
+
+impl Tile {
+    fn build(points: &mut [CloudPoint], start: usize) -> Self {
+        let bounds = Bounds2::from_points(points.iter().map(|p| p.position.xy()));
+        let range = start..start + points.len();
+        let children = if points.len() > 512 && bounds.min != bounds.max {
+            let by_x = bounds.max.x - bounds.min.x >= bounds.max.y - bounds.min.y;
+            let mid = points.len() / 2;
+            points.select_nth_unstable_by(mid, |a, b| {
+                let axis = |p: &CloudPoint| if by_x { p.position.x } else { p.position.y };
+                axis(a).total_cmp(&axis(b))
+            });
+            let (left, right) = points.split_at_mut(mid);
+            Some(Box::new([Self::build(left, start), Self::build(right, start + mid)]))
+        } else {
+            None
+        };
+        Self { bounds, range, children }
+    }
+
+    fn visible_ranges(&self, view: &Bounds2, points: &[CloudPoint], out: &mut Vec<Range<usize>>) {
+        if !self.bounds.intersects(view) {
+            return;
+        }
+        if view.contains_box(&self.bounds) {
+            out.push(self.range.clone());
+        } else if let Some(children) = &self.children {
+            for child in children.iter() {
+                child.visible_ranges(view, points, out);
+            }
+        } else {
+            // Boundary leaves can contain fewer visible points than a single sampling stride.
+            // Count just their visible runs, so zooming in never skips the entire leaf.
+            let mut run_start = None;
+            for i in self.range.clone() {
+                if view.contains(points[i].position.xy()) {
+                    run_start.get_or_insert(i);
+                } else if let Some(start) = run_start.take() {
+                    out.push(start..i);
+                }
+            }
+            if let Some(start) = run_start {
+                out.push(start..self.range.end);
+            }
+        }
+    }
+}
+
+impl PointCloud {
+    pub fn new(mut points: Vec<CloudPoint>, has_rgb: bool, rgb_is_8_bit: bool) -> Self {
+        let root = Tile::build(&mut points, 0);
+        Self { points, root, has_rgb, rgb_is_8_bit }
+    }
+
+    pub fn points(&self) -> &[CloudPoint] {
+        &self.points
+    }
+
+    pub fn bounds(&self) -> Bounds2 {
+        self.root.bounds
+    }
+
+    /// Walk only overlapping tiles, then sample their combined population with a fixed budget.
+    /// Zooming into a smaller area reveals more of its original points.
+    pub fn visible(&self, view: Bounds2, limit: usize, mut visit: impl FnMut(&CloudPoint)) {
+        if limit == 0 {
+            return;
+        }
+        let mut ranges = Vec::new();
+        self.root.visible_ranges(&view, &self.points, &mut ranges);
+        let count = ranges.iter().map(Range::len).sum::<usize>();
+        let stride = count.div_ceil(limit).max(1);
+        let mut offset = 0;
+        for range in ranges {
+            let start = (stride - offset) % stride;
+            offset = (offset + range.len()) % stride;
+            for point in self.points[range].iter().skip(start).step_by(stride) {
+                visit(point);
+            }
+        }
+    }
+}

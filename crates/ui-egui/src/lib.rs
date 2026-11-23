@@ -894,6 +894,8 @@ impl CadApp {
                 // the command line.
                 if let Some(w) = v.get("warnings").and_then(Value::as_array).and_then(|w| w.first()).and_then(Value::as_str) {
                     self.set_status(w.to_string());
+                } else if let Some(count) = v.get("pointCount").and_then(Value::as_u64) {
+                    self.set_status(i18n::t("Point cloud preview: {count} points").replace("{count}", &count.to_string()));
                 }
                 // A dynamic block's own drawing: ask whether to open it in the Block Editor.
                 if self.session.state().is_ok_and(|st| cadcraft_engine::blockedit::has_authoring_elements(&st.doc)) {

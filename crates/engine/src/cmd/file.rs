@@ -49,6 +49,18 @@ pub fn io() -> Option<&'static IoHooks> {
     IO.get()
 }
 
+/// A streaming point-cloud reader, installed by native hosts.
+#[cfg(not(target_arch = "wasm32"))]
+type PointCloudReader = fn(std::io::BufReader<std::fs::File>) -> std::result::Result<Drawing, String>;
+
+#[cfg(not(target_arch = "wasm32"))]
+static POINT_CLOUD_READER: OnceLock<PointCloudReader> = OnceLock::new();
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn set_point_cloud_reader(reader: PointCloudReader) {
+    let _ = POINT_CLOUD_READER.set(reader);
+}
+
 /// An entity as DXF groups and back, for AutoLISP's `entget`, `entmake` and `entmod`
 /// (installed by the app with the DXF reader and writer, a lower layer).
 pub struct EntityCodec {
@@ -347,6 +359,13 @@ pub fn read_file(path: &std::path::Path) -> std::result::Result<ReadFile, String
                 return Err(bad("open", format!("{shown}: the file name is not valid Unicode, so CADCraft can't save back to it")));
             };
             crate::file_access::check_read(text_path).map_err(|e| bad("open", e))?;
+            if cadcraft_doc::Format::from_path(path).is_some_and(cadcraft_doc::Format::is_point_cloud)
+                && let Some(read) = POINT_CLOUD_READER.get()
+            {
+                let file = crate::capped_read::open_regular(path).map_err(|e| bad("open", format!("{shown}: {e}")))?;
+                let drawing = read(std::io::BufReader::new(file)).map_err(|e| bad("open", format!("{shown}: {e}")))?;
+                return Ok(ReadFile { drawing, binary_dxf: false, name: text_path.to_string(), path: None });
+            }
             let bytes = crate::capped_read::read_capped(path, MAX_DRAWING_BYTES).map_err(|e| bad("open", format!("{shown}: {e}")))?;
             read_bytes(&bytes, text_path, Some(text_path.to_string()))
         });
@@ -421,11 +440,15 @@ fn opened(s: &Session, i: usize, entities: bool) -> Value {
     let warnings = d.map(|d| d.read_notes.clone()).unwrap_or_default();
     // Opened on the view it was saved at: a viewer keeps it instead of fitting the extents.
     let saved_view = d.is_some_and(|d| crate::view::saved_view(d).is_some());
-    if entities {
+    let mut reply = if entities {
         json!({ "index": i, "entities": d.map(|d| d.entity_count()), "warnings": warnings, "saved_view": saved_view })
     } else {
         json!({ "index": i, "warnings": warnings, "saved_view": saved_view })
+    };
+    if let Some(cloud) = d.and_then(|d| d.point_cloud.as_ref()) {
+        reply["pointCount"] = json!(cloud.points().len());
     }
+    reply
 }
 
 /// Open a drawing from bounded regular-file bytes or base64 data and resolve its external references.
@@ -435,6 +458,10 @@ fn run_open(s: &mut Session, p: &Value) -> Result<Value> {
         let path = _path;
         #[cfg(not(target_arch = "wasm32"))]
         {
+            if cadcraft_doc::Format::from_path(path).is_some_and(cadcraft_doc::Format::is_point_cloud) {
+                let file = read_file(std::path::Path::new(path)).map_err(EngineError::Other)?;
+                return finish_open(s, file);
+            }
             crate::file_access::check_read(path).map_err(|e| bad("open", e))?;
             let bytes =
                 crate::capped_read::read_capped(std::path::Path::new(path), MAX_DRAWING_BYTES).map_err(|e| bad("open", format!("{path}: {e}")))?;

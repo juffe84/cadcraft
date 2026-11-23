@@ -1,4 +1,4 @@
-//! CADCraft file formats: DXF/DWG read, SVG and SVGZ import, SVG/PNG/PDF export (plotting).
+//! CADCraft file formats: DXF/DWG read, SVG/SVGZ and LAS/LAZ import, SVG/PNG/PDF export.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
@@ -19,6 +19,7 @@ mod dxf_write;
 mod dxf_xref;
 pub mod pdf;
 pub mod plotter;
+pub mod point_cloud;
 /// Raster image files (PNG, JPEG, BMP, TIFF) decoded to pixels.
 pub mod raster;
 /// Open → save → reopen comparison and the real-file corpus harness (gaps FF1, FF5).
@@ -90,7 +91,7 @@ fn ext(name: impl AsRef<Path>) -> String {
 }
 
 /// Read a drawing; the format comes from the content (DXF ASCII/binary, DWG) or the name
-/// (SVG and gzip-compressed SVGZ).
+/// (SVG, gzip-compressed SVGZ, and LAS/LAZ point clouds).
 pub fn read(bytes: &[u8], name: impl AsRef<Path>) -> Result<Drawing> {
     read_source(bytes, name.as_ref()).map(|(d, _)| d)
 }
@@ -98,6 +99,9 @@ pub fn read(bytes: &[u8], name: impl AsRef<Path>) -> Result<Drawing> {
 /// [`read`], also returning the DXF rendition a DWG was read through (`None` for other files),
 /// which the round-trip harness counts.
 pub(crate) fn read_source(bytes: &[u8], name: &Path) -> Result<(Drawing, Option<Vec<u8>>)> {
+    if Format::from_path(name).is_some_and(Format::is_point_cloud) {
+        return point_cloud::read(std::io::Cursor::new(bytes.to_vec())).map(|drawing| (drawing, None));
+    }
     if craft_dwg::is_dwg(bytes) {
         let (dxf, notes) = craft_dwg::decode(bytes, craft_dwg::Limits::DEFAULT).map_err(dwg_error)?;
         // The decoder writes an elliptic hatch edge's angles in radians; DXF keeps degrees.
@@ -122,10 +126,18 @@ pub fn write(d: &Drawing, name: impl AsRef<Path>) -> Result<Vec<u8>> {
     write_framed(d, name, None)
 }
 
+fn check_point_cloud_output(d: &Drawing) -> Result<()> {
+    if d.point_cloud.is_some() {
+        return Err(IoError::Format("Saving or exporting a point-cloud preview is not supported".into()));
+    }
+    Ok(())
+}
+
 /// Like [`write`], with the DXF/DWG version and binary DXF chosen by `opts`. Binary applies to
 /// DXF only; asking for it with another format is an error.
 pub fn write_with(d: &Drawing, name: impl AsRef<Path>, opts: &SaveOptions) -> Result<Vec<u8>> {
     let name = name.as_ref();
+    check_point_cloud_output(d)?;
     let version = opts.version.unwrap_or_else(|| save_version(d));
     match Format::from_path(name) {
         Some(Format::Dxf) => {
@@ -164,6 +176,7 @@ pub fn write_noted(d: &Drawing, name: impl AsRef<Path>, opts: &SaveOptions) -> R
 /// file they came from (`Foreign::version`, not `$ACADVER`, which SAVEAS changes), and the bridge
 /// reads them as that version.
 fn write_dwg(d: &Drawing, version: Version) -> Result<(Vec<u8>, craft_dwg::Unwritten)> {
+    check_point_cloud_output(d)?;
     let bridge = dxf_write::dwg_bridge(d, version);
     craft_dwg::encode_kept_noted(bridge.as_bytes(), version.code(), d.foreign.version.as_deref()).map_err(dwg_error)
 }
@@ -173,6 +186,7 @@ fn write_dwg(d: &Drawing, version: Version) -> Result<(Vec<u8>, craft_dwg::Unwri
 /// extents. Formats that are not images (DXF, DWG) ignore the window. The window is checked with
 /// [`check_window`].
 pub fn write_framed(d: &Drawing, name: impl AsRef<Path>, window: Option<Bounds2>) -> Result<Vec<u8>> {
+    check_point_cloud_output(d)?;
     let name = name.as_ref();
     // A drawing template (.dwt) is DWG content.
     let format = Format::from_path(name);
@@ -232,6 +246,7 @@ pub fn png(d: &Drawing, space: &Space, width: u32, height: u32) -> Result<Vec<u8
 /// extents (5% margin) when `window` is `None`. Objects are drawn with their transparency, as on
 /// screen.
 pub fn png_framed(d: &Drawing, space: &Space, width: u32, height: u32, window: Option<Bounds2>) -> Result<Vec<u8>> {
+    check_point_cloud_output(d)?;
     let list = cadcraft_render::build(d, space, &cadcraft_render::Options { transparency: true, ..cadcraft_render::Options::default() });
     let view = png_view(&list.bounds, width, height, window);
     cadcraft_render::raster::render_png(&list, &view, &cadcraft_render::raster::RasterOptions::default())

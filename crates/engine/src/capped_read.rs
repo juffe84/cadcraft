@@ -17,6 +17,20 @@ use std::path::Path;
 /// Returns an error if the path is not a regular file, cannot be opened, or holds more than `max`
 /// bytes. At most `max + 1` bytes are ever buffered, so an endless device cannot exhaust memory.
 pub fn read_capped(path: &Path, max: usize) -> io::Result<Vec<u8>> {
+    let file = open_regular(path)?;
+    // Read one byte past the limit so we can tell "exactly max" from "too big" without trusting
+    // the metadata length (which a device may misreport).
+    let mut buf = Vec::new();
+    let cap = (max as u64).saturating_add(1);
+    let read = file.take(cap).read_to_end(&mut buf)?;
+    if read as u64 > max as u64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("file is larger than the {max}-byte limit")));
+    }
+    Ok(buf)
+}
+
+/// Open once and reject non-regular files before reading or seeking.
+pub(crate) fn open_regular(path: &Path) -> io::Result<std::fs::File> {
     let mut options = OpenOptions::new();
     options.read(true);
     #[cfg(unix)]
@@ -29,15 +43,7 @@ pub fn read_capped(path: &Path, max: usize) -> io::Result<Vec<u8>> {
     if !meta.is_file() {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "not a regular file"));
     }
-    // Read one byte past the limit so we can tell "exactly max" from "too big" without trusting
-    // the metadata length (which a device may misreport).
-    let mut buf = Vec::new();
-    let cap = (max as u64).saturating_add(1);
-    let read = file.take(cap).read_to_end(&mut buf)?;
-    if read as u64 > max as u64 {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("file is larger than the {max}-byte limit")));
-    }
-    Ok(buf)
+    Ok(file)
 }
 
 #[cfg(test)]
