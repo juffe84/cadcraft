@@ -61,6 +61,10 @@ fn view(cloud: &PointCloud, bounds: Bounds2, request: bool) -> CloudView {
     cloud.detail.as_ref().map_or_else(CloudView::default, |details| if request { details.0.view(bounds) } else { details.0.current(bounds) })
 }
 
+fn layers<'a>(snapshot: &'a CloudView, root: &'a Arc<PointCloud>) -> impl Iterator<Item = &'a Arc<PointCloud>> {
+    snapshot.overview.iter().chain(std::iter::once(snapshot.points.as_ref().unwrap_or(root))).filter(|cloud| !cloud.points().is_empty())
+}
+
 pub(super) fn paint_plan(app: &CadApp, painter: &egui::Painter, xf: &Xf, request: bool) {
     let Some(cloud) = cloud(app) else { return };
     let bounds = xf.world_bounds();
@@ -68,8 +72,7 @@ pub(super) fn paint_plan(app: &CadApp, painter: &egui::Painter, xf: &Xf, request
     if request && snapshot.pending {
         painter.ctx().request_repaint_after(std::time::Duration::from_millis(125));
     }
-    let shown = snapshot.points.as_ref().unwrap_or(cloud);
-    if request && crate::cloud_gpu::available(app.canvas.gpu, shown) {
+    if request && layers(&snapshot, cloud).all(|shown| crate::cloud_gpu::available(app.canvas.gpu, shown)) {
         let (sin, cos) = xf.twist.sin_cos();
         let camera = crate::cloud_gpu::Camera {
             center: Vec3::new(xf.center.x, xf.center.y, 0.0),
@@ -79,18 +82,27 @@ pub(super) fn paint_plan(app: &CadApp, painter: &egui::Painter, xf: &Xf, request
             depth: None,
             bounds,
         };
-        crate::cloud_gpu::paint(painter, xf.rect, shown.clone(), &camera, app.session.settings.point_cloud_size, Tokens::get().canvas_ink);
+        crate::cloud_gpu::paint(
+            painter,
+            xf.rect,
+            layers(&snapshot, cloud).cloned(),
+            &camera,
+            app.session.settings.point_cloud_size,
+            Tokens::get().canvas_ink,
+        );
         return;
     }
     let mut mesh = egui::Mesh::default();
     let size = egui::Vec2::splat(app.session.settings.point_cloud_size);
     let fallback = Tokens::get().canvas_ink;
-    shown.visible(bounds, sample_budget(xf.rect), |point| {
-        let screen = xf.to_screen(point.position.xy());
-        if xf.rect.contains(screen) {
-            mesh.add_colored_rect(Rect::from_center_size(screen, size), color(shown, point, fallback));
-        }
-    });
+    for shown in layers(&snapshot, cloud) {
+        shown.visible(bounds, sample_budget(xf.rect), |point| {
+            let screen = xf.to_screen(point.position.xy());
+            if xf.rect.contains(screen) {
+                mesh.add_colored_rect(Rect::from_center_size(screen, size), color(shown, point, fallback));
+            }
+        });
+    }
     painter.add(Shape::mesh(mesh));
 }
 
@@ -98,23 +110,21 @@ pub(super) fn snap_visible(app: &CadApp, xf: &Xf, raw: Vec2, aperture: f64) -> O
     let cloud = cloud(app)?;
     let bounds = xf.world_bounds();
     let snapshot = view(cloud, bounds, false);
-    let shown = snapshot.points.as_ref().unwrap_or(cloud);
     let mut nearest = None;
     let mut distance = aperture.max(f64::from(app.session.settings.point_cloud_size) * 0.5 / xf.scale).powi(2);
-    let (pick, limit) = if crate::cloud_gpu::available(app.canvas.gpu, shown) {
-        (Bounds2::new(raw, raw).expand(distance.sqrt()), usize::MAX)
-    } else {
-        (bounds, sample_budget(xf.rect))
-    };
-    shown.visible(pick, limit, |point| {
-        let xy = point.position.xy();
-        let delta = xy - raw;
-        let d = delta.dot(delta);
-        if d <= distance && xf.rect.contains(xf.to_screen(xy)) {
-            distance = d;
-            nearest = Some(xy);
-        }
-    });
+    let gpu = layers(&snapshot, cloud).all(|shown| crate::cloud_gpu::available(app.canvas.gpu, shown));
+    for shown in layers(&snapshot, cloud) {
+        let (pick, limit) = if gpu { (Bounds2::new(raw, raw).expand(distance.sqrt()), usize::MAX) } else { (bounds, sample_budget(xf.rect)) };
+        shown.visible(pick, limit, |point| {
+            let xy = point.position.xy();
+            let delta = xy - raw;
+            let d = delta.dot(delta);
+            if d <= distance && xf.rect.contains(xf.to_screen(xy)) {
+                distance = d;
+                nearest = Some(xy);
+            }
+        });
+    }
     nearest
 }
 
@@ -219,10 +229,16 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     let mut updated = false;
     if press && let Some(cursor) = pointer.filter(|p| rect.contains(*p)) {
         let snapshot = view(&root, frame.bounds, false);
-        let shown = snapshot.points.as_ref().unwrap_or(&root);
-        let gpu = crate::cloud_gpu::available(app.canvas.gpu, shown);
+        let gpu = layers(&snapshot, &root).all(|shown| crate::cloud_gpu::available(app.canvas.gpu, shown));
         let limit = if gpu { usize::MAX } else { sample_budget(rect) };
-        if let Some(pivot) = frame.pick(shown, cursor, limit, app.session.settings.point_cloud_size.max(6.0)) {
+        if let Some(pivot) = layers(&snapshot, &root)
+            .filter_map(|cloud| frame.pick(cloud, cursor, limit, app.session.settings.point_cloud_size.max(6.0)))
+            .min_by(|a, b| {
+                let a = frame.project(*a);
+                let b = frame.project(*b);
+                a.0.distance_sq(cursor).total_cmp(&b.0.distance_sq(cursor)).then_with(|| b.1.total_cmp(&a.1))
+            })
+        {
             let delta = pivot - frame.camera.center;
             orbit.pan += Vec2::new(frame.camera.axes[0].dot(delta), frame.camera.axes[1].dot(delta));
             orbit.pivot = Some(pivot);
@@ -264,22 +280,23 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     if snapshot.pending {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(70));
     }
-    let shown = snapshot.points.as_ref().unwrap_or(&root);
     let fallback = Tokens::get().canvas_ink;
     let size = app.session.settings.point_cloud_size;
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, Tokens::get().canvas);
-    if crate::cloud_gpu::available(app.canvas.gpu, shown) {
-        crate::cloud_gpu::paint(&painter, rect, shown.clone(), &frame.camera, size, fallback);
+    if layers(&snapshot, &root).all(|shown| crate::cloud_gpu::available(app.canvas.gpu, shown)) {
+        crate::cloud_gpu::paint(&painter, rect, layers(&snapshot, &root).cloned(), &frame.camera, size, fallback);
         return;
     }
     let mut projected = Vec::new();
-    shown.visible(frame.bounds, sample_budget(rect), |point| {
-        let (at, depth) = frame.project(point.position);
-        if rect.contains(at) {
-            projected.push((depth, at, color(shown, point, fallback)));
-        }
-    });
+    for shown in layers(&snapshot, &root) {
+        shown.visible(frame.bounds, sample_budget(rect), |point| {
+            let (at, depth) = frame.project(point.position);
+            if rect.contains(at) {
+                projected.push((depth, at, color(shown, point, fallback)));
+            }
+        });
+    }
     projected.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
     let mut mesh = egui::Mesh::default();
     for (_, position, color) in projected {

@@ -42,8 +42,7 @@ struct Output {
 struct Resources {
     plan: wgpu::RenderPipeline,
     orbit: wgpu::RenderPipeline,
-    bind: wgpu::BindGroup,
-    uniform: wgpu::Buffer,
+    views: [(wgpu::BindGroup, wgpu::Buffer); 2],
     resident: VecDeque<Resident>,
     linear: bool,
 }
@@ -59,12 +58,6 @@ pub fn install(rs: &egui_wgpu::RenderState, target: crate::gpu::GpuTarget) {
     let Some(format) = target.stencil.filter(|format| format.has_depth_aspect()) else { return };
     let device = &rs.device;
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("cloud"), source: wgpu::ShaderSource::Wgsl(SHADER.into()) });
-    let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("cloud view"),
-        size: 64,
-        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
     let bindings = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("cloud"),
         entries: &[wgpu::BindGroupLayoutEntry {
@@ -74,10 +67,19 @@ pub fn install(rs: &egui_wgpu::RenderState, target: crate::gpu::GpuTarget) {
             count: None,
         }],
     });
-    let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-        label: Some("cloud"),
-        layout: &bindings,
-        entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() }],
+    let views = std::array::from_fn(|_| {
+        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("cloud view"),
+            size: 64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cloud"),
+            layout: &bindings,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() }],
+        });
+        (bind, uniform)
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("cloud"),
@@ -117,8 +119,7 @@ pub fn install(rs: &egui_wgpu::RenderState, target: crate::gpu::GpuTarget) {
     rs.renderer.write().callback_resources.insert(Resources {
         plan: pipeline(false),
         orbit: pipeline(true),
-        bind,
-        uniform,
+        views,
         resident: VecDeque::new(),
         linear: target.format.is_srgb(),
     });
@@ -139,22 +140,33 @@ pub struct Camera {
     pub bounds: Bounds2,
 }
 
-pub fn paint(painter: &egui::Painter, rect: Rect, cloud: Arc<PointCloud>, camera: &Camera, size: f32, fallback: Color32) {
-    let delta = origin(&cloud) - camera.center;
-    let [x, y, z] = camera.axes;
-    let row = |axis: Vec3, offset: f64, factor: f64, bias: f64| {
-        [(axis.x * factor) as f32, (axis.y * factor) as f32, (axis.z * factor) as f32, ((axis.dot(delta) + offset) * factor + bias) as f32]
-    };
-    let w = rect.width().max(1.0);
-    let h = rect.height().max(1.0);
-    let rows = [
-        row(x, camera.pan[0], 2.0 * camera.scale / f64::from(w), 0.0),
-        row(y, camera.pan[1], 2.0 * camera.scale / f64::from(h), 0.0),
-        camera.depth.map_or([0.0, 0.0, 0.0, 0.5], |depth| row(z, 0.0, -0.49 / depth, 0.5)),
-        [size / w, size / h, 0.0, 0.0],
-    ];
-    painter
-        .add(egui_wgpu::Callback::new_paint_callback(rect, Callback { cloud, fallback, rows, orbit: camera.depth.is_some(), bounds: camera.bounds }));
+pub fn paint(painter: &egui::Painter, rect: Rect, clouds: impl IntoIterator<Item = Arc<PointCloud>>, camera: &Camera, size: f32, fallback: Color32) {
+    let layers = clouds.into_iter().map(|cloud| Layer::new(rect, cloud, camera, size)).collect();
+    painter.add(egui_wgpu::Callback::new_paint_callback(rect, Callback { layers, fallback, orbit: camera.depth.is_some(), bounds: camera.bounds }));
+}
+
+struct Layer {
+    cloud: Arc<PointCloud>,
+    rows: [[f32; 4]; 4],
+}
+
+impl Layer {
+    fn new(rect: Rect, cloud: Arc<PointCloud>, camera: &Camera, size: f32) -> Self {
+        let delta = origin(&cloud) - camera.center;
+        let [x, y, z] = camera.axes;
+        let row = |axis: Vec3, offset: f64, factor: f64, bias: f64| {
+            [(axis.x * factor) as f32, (axis.y * factor) as f32, (axis.z * factor) as f32, ((axis.dot(delta) + offset) * factor + bias) as f32]
+        };
+        let w = rect.width().max(1.0);
+        let h = rect.height().max(1.0);
+        let rows = [
+            row(x, camera.pan[0], 2.0 * camera.scale / f64::from(w), 0.0),
+            row(y, camera.pan[1], 2.0 * camera.scale / f64::from(h), 0.0),
+            camera.depth.map_or([0.0, 0.0, 0.0, 0.5], |depth| row(z, 0.0, -0.49 / depth, 0.5)),
+            [size / w, size / h, 0.0, 0.0],
+        ];
+        Self { cloud, rows }
+    }
 }
 
 fn origin(cloud: &PointCloud) -> Vec3 {
@@ -163,9 +175,8 @@ fn origin(cloud: &PointCloud) -> Vec3 {
 }
 
 struct Callback {
-    cloud: Arc<PointCloud>,
+    layers: Vec<Layer>,
     fallback: Color32,
-    rows: [[f32; 4]; 4],
     orbit: bool,
     bounds: Bounds2,
 }
@@ -180,72 +191,78 @@ impl egui_wgpu::CallbackTrait for Callback {
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         let Some(res) = resources.get_mut::<Resources>() else { return Vec::new() };
-        let weak = Arc::downgrade(&self.cloud);
-        if let Some(index) = res.resident.iter().position(|old| Weak::ptr_eq(&old.cloud, &weak) && old.color == self.fallback) {
-            if let Some(cached) = res.resident.remove(index) {
-                res.resident.push_back(cached);
-            }
-        } else {
-            let origin = origin(&self.cloud);
-            let mut vertices = Vec::with_capacity(self.cloud.points().len() * 16);
-            let mut blocks = Vec::new();
-            const BLOCK: usize = 8_192;
-            for (index, points) in self.cloud.points().chunks(BLOCK).enumerate() {
-                let bounds = Bounds2::from_points(points.iter().map(|p| p.position.xy()));
-                let first = index * BLOCK;
-                blocks.push((bounds, first as u32..(first + points.len()) as u32));
-                for point in points {
-                    let p = point.position - origin;
-                    for value in [p.x, p.y, p.z] {
-                        vertices.extend_from_slice(&(value as f32).to_le_bytes());
-                    }
-                    let color = if self.cloud.has_rgb {
-                        let [r, g, b] = point.rgb.map(|value| if self.cloud.rgb_is_8_bit { value as u8 } else { (value >> 8) as u8 });
-                        [r, g, b, 255]
-                    } else {
-                        self.fallback.to_array()
-                    };
-                    vertices.extend_from_slice(&color);
+        for (layer, (_, uniform)) in self.layers.iter().zip(&res.views) {
+            let cloud = &layer.cloud;
+            let weak = Arc::downgrade(cloud);
+            if let Some(index) = res.resident.iter().position(|old| Weak::ptr_eq(&old.cloud, &weak) && old.color == self.fallback) {
+                if let Some(cached) = res.resident.remove(index) {
+                    res.resident.push_back(cached);
                 }
+            } else {
+                let origin = origin(cloud);
+                let mut vertices = Vec::with_capacity(cloud.points().len() * 16);
+                let mut blocks = Vec::new();
+                const BLOCK: usize = 8_192;
+                for (index, points) in cloud.points().chunks(BLOCK).enumerate() {
+                    let bounds = Bounds2::from_points(points.iter().map(|p| p.position.xy()));
+                    let first = index * BLOCK;
+                    blocks.push((bounds, first as u32..(first + points.len()) as u32));
+                    for point in points {
+                        let p = point.position - origin;
+                        for value in [p.x, p.y, p.z] {
+                            vertices.extend_from_slice(&(value as f32).to_le_bytes());
+                        }
+                        let color = if cloud.has_rgb {
+                            let [r, g, b] = point.rgb.map(|value| if cloud.rgb_is_8_bit { value as u8 } else { (value >> 8) as u8 });
+                            [r, g, b, 255]
+                        } else {
+                            self.fallback.to_array()
+                        };
+                        vertices.extend_from_slice(&color);
+                    }
+                }
+                let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("cloud points"),
+                    contents: &vertices,
+                    usage: wgpu::BufferUsages::VERTEX,
+                });
+                if res.resident.len() >= 3 {
+                    res.resident.pop_front();
+                }
+                res.resident.push_back(Resident { cloud: weak, color: self.fallback, buffer, blocks });
             }
-            let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("cloud points"),
-                contents: &vertices,
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-            if res.resident.len() >= 3 {
-                res.resident.pop_front();
-            }
-            res.resident.push_back(Resident { cloud: weak, color: self.fallback, buffer, blocks });
+            let mut rows = layer.rows;
+            rows[3][2] = f32::from(res.linear);
+            let bytes: Vec<_> = rows.into_iter().flatten().flat_map(f32::to_le_bytes).collect();
+            queue.write_buffer(uniform, 0, &bytes);
         }
-        let mut rows = self.rows;
-        rows[3][2] = f32::from(res.linear);
-        let bytes: Vec<_> = rows.into_iter().flatten().flat_map(f32::to_le_bytes).collect();
-        queue.write_buffer(&res.uniform, 0, &bytes);
         Vec::new()
     }
 
     fn paint(&self, _: egui::PaintCallbackInfo, pass: &mut wgpu::RenderPass<'static>, resources: &egui_wgpu::CallbackResources) {
         let Some(res) = resources.get::<Resources>() else { return };
-        let Some(points) = res.resident.back() else { return };
         pass.set_pipeline(if self.orbit { &res.orbit } else { &res.plan });
-        pass.set_bind_group(0, &res.bind, &[]);
-        pass.set_vertex_buffer(0, points.buffer.slice(..));
-        let mut span: Option<Range<u32>> = None;
-        for (extent, range) in &points.blocks {
-            if !extent.intersects(&self.bounds) {
-                continue;
+        for (layer, (bind, _)) in self.layers.iter().zip(&res.views) {
+            let weak = Arc::downgrade(&layer.cloud);
+            let Some(points) = res.resident.iter().find(|entry| Weak::ptr_eq(&entry.cloud, &weak) && entry.color == self.fallback) else { continue };
+            pass.set_bind_group(0, bind, &[]);
+            pass.set_vertex_buffer(0, points.buffer.slice(..));
+            let mut span: Option<Range<u32>> = None;
+            for (extent, range) in &points.blocks {
+                if !extent.intersects(&self.bounds) {
+                    continue;
+                }
+                if let Some(old) = &mut span
+                    && old.end == range.start
+                {
+                    old.end = range.end;
+                } else if let Some(old) = span.replace(range.clone()) {
+                    pass.draw(0..4, old);
+                }
             }
-            if let Some(old) = &mut span
-                && old.end == range.start
-            {
-                old.end = range.end;
-            } else if let Some(old) = span.replace(range.clone()) {
-                pass.draw(0..4, old);
+            if let Some(span) = span {
+                pass.draw(0..4, span);
             }
-        }
-        if let Some(span) = span {
-            pass.draw(0..4, span);
         }
     }
 }
@@ -269,12 +286,14 @@ mod tests {
         let faults = Arc::new(crate::gpu::GpuFaults::default());
         crate::gpu::install(&rs, &faults, Some(DEPTH));
         let points = |z, rgb| CloudPoint { position: Vec3::new(0.0, 0.0, z), rgb, intensity: 0, classification: 0 };
-        let cloud = Arc::new(PointCloud::new(vec![points(1.0, [255; 3]), points(-1.0, [0; 3])], 2, true, true));
-        let bounds = cloud.bounds();
+        let cloud = |point| Arc::new(PointCloud::new(vec![point], 1, true, true));
+        let near = cloud(points(1.0, [255; 3]));
+        let far = cloud(points(-1.0, [0; 3]));
+        let bounds = near.bounds();
+        let rows = |depth| [[0.02, 0.0, 0.0, 0.0], [0.0, 0.02, 0.0, 0.0], [0.0, 0.0, -0.1, depth], [0.1, 0.1, 0.0, 0.0]];
         let callback = Callback {
-            cloud,
+            layers: vec![Layer { cloud: near, rows: rows(0.4) }, Layer { cloud: far, rows: rows(0.6) }],
             fallback: Color32::WHITE,
-            rows: [[0.02, 0.0, 0.0, 0.0], [0.0, 0.02, 0.0, 0.0], [0.0, 0.0, -0.1, 0.5], [0.1, 0.1, 0.0, 0.0]],
             orbit: true,
             bounds,
         };

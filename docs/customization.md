@@ -71,9 +71,9 @@ Use **Open** or drop a `.las` or `.laz` file into CADCraft. The file opens in it
 the original coordinates and scan colors, when present. CADCraft does not reproject coordinates.
 
 On desktop, clouds with more than 25 million points first show a sparse preview. CADCraft
-indexes the source blocks in the background. When you zoom in, it decompresses overlapping
-blocks in parallel, shows additional points as batches finish, and reuses recent views while
-you move the camera. The native GPU renderer keeps point buffers resident while panning,
+indexes the source blocks and smaller point ranges in the background. When you zoom in, it decompresses overlapping
+blocks in parallel, draws the completed detail over a separate overview buffer, and reuses
+recent views while you move the camera. The native GPU renderer keeps point buffers resident while panning,
 zooming or orbiting. The source stays on disk, and the preview remains bounded in memory. The desktop accepts up to one billion input points. The browser
 accepts up to two million and keeps them in memory.
 

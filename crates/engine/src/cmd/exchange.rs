@@ -153,13 +153,15 @@ fn run_cloud_snap(s: &mut Session, p: &Value) -> Result<Value> {
     let shown = snapshot.points.as_deref().unwrap_or(cloud);
     let mut nearest = None;
     let mut distance = aperture;
-    shown.visible(extent, usize::MAX, |sample| {
-        let d = sample.position.xy().dist(point);
-        if d <= distance {
-            distance = d;
-            nearest = Some([sample.position.x, sample.position.y, sample.position.z]);
-        }
-    });
+    for layer in snapshot.overview.as_deref().into_iter().chain(std::iter::once(shown)) {
+        layer.visible(extent, usize::MAX, |sample| {
+            let d = sample.position.xy().dist(point);
+            if d <= distance {
+                distance = d;
+                nearest = Some([sample.position.x, sample.position.y, sample.position.z]);
+            }
+        });
+    }
     Ok(json!({ "point": nearest, "pending": snapshot.pending, "failed": snapshot.failed }))
 }
 

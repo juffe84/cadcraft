@@ -118,6 +118,8 @@ impl PointCloud {
 #[derive(Default)]
 pub struct CloudView {
     pub points: Option<Arc<PointCloud>>,
+    /// Stable coarse points drawn underneath a separate detailed layer.
+    pub overview: Option<Arc<PointCloud>>,
     pub pending: bool,
     pub failed: bool,
 }

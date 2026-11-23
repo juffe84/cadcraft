@@ -289,11 +289,14 @@ impl Bridge {
             .iter()
             .rev()
             .find(|(request, _)| request.covers(bounds))
-            .or_else(|| state.details.iter().rev().find(|(request, _)| request.region.contains_box(&bounds)));
+            .or_else(|| state.details.iter().rev().find(|(request, _)| request.region.contains_box(&bounds)))
+            .or_else(|| state.wanted.and_then(|_| state.details.iter().rev().find(|(request, _)| request.region.intersects(&bounds))));
         let complete = state.wanted.is_none_or(|wanted| state.details.iter().any(|(request, _)| *request == wanted));
         let partial = state.partial.as_ref().filter(|(request, _)| state.wanted == Some(*request) && request.region.contains_box(&bounds));
-        let points = partial.or(detail).map(|(_, cloud)| cloud.clone()).or_else(|| state.overview.clone());
-        CloudView { points, pending: !state.failed && (state.overview.is_none() || !complete), failed: state.failed }
+        let overlay = partial.or(detail).map(|(_, cloud)| cloud.clone());
+        let overview = overlay.as_ref().and(state.overview.clone());
+        let points = overlay.or_else(|| state.overview.clone());
+        CloudView { points, overview, pending: !state.failed && (state.overview.is_none() || !complete), failed: state.failed }
     }
 }
 
@@ -326,7 +329,30 @@ impl CloudDetails for Bridge {
     }
 }
 
+/// Flight lines can make a single LAZ block's bounding box much larger than the area
+/// its points occupy. Smaller consecutive ranges reject gaps without missing any point.
+struct BlockExtent {
+    bounds: Bounds2,
+    stripes: Vec<Bounds2>,
+}
+
+impl BlockExtent {
+    fn new(data: &PointData, range: std::ops::Range<usize>) -> Self {
+        const STRIPE_POINTS: usize = 256;
+        let mut xy = data.x().zip(data.y()).skip(range.start).take(range.len());
+        let stripes: Vec<_> =
+            range.step_by(STRIPE_POINTS).map(|_| Bounds2::from_points(xy.by_ref().take(STRIPE_POINTS).map(|(x, y)| Vec2::new(x, y)))).collect();
+        let bounds = stripes.iter().fold(Bounds2::EMPTY, |extent, stripe| extent.union(stripe));
+        Self { bounds, stripes }
+    }
+
+    fn intersects(&self, region: &Bounds2) -> bool {
+        self.bounds.intersects(region) && self.stripes.iter().any(|stripe| stripe.intersects(region))
+    }
+}
+
 fn work(mut source: Source, bridge: &Weak<Bridge>, wake: Receiver<()>) -> Result<()> {
+    log::info!("point cloud indexing: {} Rayon workers", rayon::current_num_threads());
     let mut index = Vec::with_capacity(source.entries.len());
     let mut overview = Sample::new(OVERVIEW_BUDGET);
     let stride = source.count.div_ceil(OVERVIEW_BUDGET as u64) as usize;
@@ -348,10 +374,7 @@ fn work(mut source: Source, bridge: &Weak<Bridge>, wake: Receiver<()>) -> Result
                 start..cursor
             })
             .collect();
-        let boxes: Vec<_> = ranges
-            .into_par_iter()
-            .map(|range| Bounds2::from_points(data.x().zip(data.y()).skip(range.start).take(range.len()).map(|(x, y)| Vec2::new(x, y))))
-            .collect();
+        let boxes: Vec<_> = ranges.into_par_iter().map(|range| BlockExtent::new(&data, range)).collect();
         index.extend(boxes);
         let start = (stride - seen % stride) % stride;
         seen += cursor;
@@ -422,11 +445,13 @@ impl BlockCache {
     }
 }
 
-fn query(source: &mut Source, index: &[Bounds2], request: Request, bridge: &Weak<Bridge>, cache: &mut BlockCache) -> Result<Option<PointCloud>> {
+fn query(source: &mut Source, index: &[BlockExtent], request: Request, bridge: &Weak<Bridge>, cache: &mut BlockCache) -> Result<Option<PointCloud>> {
     let mut hits = Sample::new(DETAIL_BUDGET);
-    let matching = || index.iter().enumerate().filter_map(|(id, bounds)| bounds.intersects(&request.region).then_some(id));
-    let keep_whole_blocks = matching().map(|id| source.entries[id].point_count).sum::<u64>() <= CACHE_POINTS as u64;
-    let mut ids = matching().peekable();
+    let matches: Vec<_> = index.iter().enumerate().filter_map(|(id, extent)| extent.intersects(&request.region).then_some(id)).collect();
+    let candidate_points = matches.iter().map(|&id| source.entries[id].point_count).sum::<u64>();
+    let keep_whole_blocks = candidate_points <= CACHE_POINTS as u64;
+    log::debug!("point cloud detail: {} candidate blocks, {candidate_points} source points", matches.len());
+    let mut ids = matches.into_iter().peekable();
     let mut last_partial: Option<Instant> = None;
     let retain = |hits: &mut Sample, points: &[CloudPoint]| {
         for &point in points {
@@ -502,18 +527,10 @@ fn publish_partial(source: &Source, request: Request, bridge: &Weak<Bridge>, hit
         return;
     }
     let Some(active) = bridge.upgrade() else { return };
-    let overview = {
-        let state = active.state();
-        if state.wanted != Some(request) {
-            return;
-        }
-        state.overview.clone()
-    };
-    let mut shown = Sample::new(125_000);
-    // Keep coarse coverage of the whole region while its remaining blocks are in flight.
-    if let Some(overview) = overview {
-        overview.visible(request.region, 25_000, |p| shown.add(*p));
+    if active.state().wanted != Some(request) {
+        return;
     }
+    let mut shown = Sample::new(100_000);
     let stride = hits.points.len().div_ceil(100_000).max(1);
     for point in hits.points.iter().step_by(stride) {
         shown.add(*point);
@@ -529,6 +546,27 @@ fn publish_partial(source: &Source, request: Request, bridge: &Weak<Bridge>, hit
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stripe_index_rejects_the_gap_and_keeps_the_last_short_range() {
+        let points = (0..520).map(|i| {
+            let x = if i < 256 {
+                0.0
+            } else if i < 513 {
+                900.0
+            } else {
+                1_800.0
+            };
+            las::Point { x, y: f64::from(i % 10), ..Default::default() }
+        });
+        let data = PointDataBuilder::new().build_from_points(points).unwrap();
+        let extent = BlockExtent::new(&data, 0..513);
+        let square = |x| Bounds2::new(Vec2::new(x, 0.0), Vec2::new(x, 0.0)).expand(20.0);
+        assert!(extent.bounds.intersects(&square(450.0)));
+        assert!(!extent.intersects(&square(450.0)));
+        assert!(extent.intersects(&square(0.0)) && extent.intersects(&square(900.0)));
+        assert!(!extent.intersects(&square(1_800.0)));
+    }
 
     #[test]
     fn close_view_recovers_original_points_absent_from_the_first_preview() {
