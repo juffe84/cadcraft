@@ -14,6 +14,7 @@ pub struct CloudPoint {
 pub struct PointCloud {
     points: Vec<CloudPoint>,
     root: Tile,
+    pub source_count: u64,
     pub has_rgb: bool,
     pub rgb_is_8_bit: bool,
 }
@@ -73,9 +74,9 @@ impl Tile {
 }
 
 impl PointCloud {
-    pub fn new(mut points: Vec<CloudPoint>, has_rgb: bool, rgb_is_8_bit: bool) -> Self {
+    pub fn new(mut points: Vec<CloudPoint>, source_count: u64, has_rgb: bool, rgb_is_8_bit: bool) -> Self {
         let root = Tile::build(&mut points, 0);
-        Self { points, root, has_rgb, rgb_is_8_bit }
+        Self { points, root, source_count, has_rgb, rgb_is_8_bit }
     }
 
     pub fn points(&self) -> &[CloudPoint] {

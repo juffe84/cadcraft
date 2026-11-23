@@ -6,7 +6,9 @@ use cadcraft_geom::Vec3;
 use std::io::{Read, Seek, SeekFrom};
 use std::sync::Arc;
 
-const MAX_POINTS: usize = if cfg!(target_arch = "wasm32") { 2_000_000 } else { 25_000_000 };
+const MAX_FULL_POINTS: u64 = if cfg!(target_arch = "wasm32") { 2_000_000 } else { 25_000_000 };
+const LARGE_PREVIEW_POINTS: u64 = 5_000_000;
+const MAX_SOURCE_POINTS: u64 = if cfg!(target_arch = "wasm32") { MAX_FULL_POINTS } else { 1_000_000_000 };
 const BATCH: u64 = 250_000;
 
 pub fn read(input: impl Read + Seek + Send + Sync + 'static) -> Result<Drawing> {
@@ -23,18 +25,24 @@ fn decode(mut input: impl Read + Seek + Send + Sync + 'static) -> Result<Drawing
     let count = reader.header().number_of_points();
     let has_rgb = reader.header().point_format().has_color;
     let mut batch = las::PointDataBuilder::new().for_header(reader.header()).build();
+    let samples = if count > MAX_FULL_POINTS { LARGE_PREVIEW_POINTS } else { count };
+    let stride = count.div_ceil(samples);
+    let sample_count = count.div_ceil(stride);
     let mut points = Vec::new();
-    points.try_reserve_exact(count as usize).map_err(|e| IoError::Format(format!("LAS/LAZ point storage: {e}")))?;
+    points.try_reserve_exact(sample_count as usize).map_err(|e| IoError::Format(format!("LAS/LAZ point storage: {e}")))?;
     let mut max_rgb = 0;
-    while points.len() < count as usize {
-        let n = reader
-            .fill_points((16 * 1024 * 1024 / batch.record_len() as u64).min(BATCH).min(count - points.len() as u64), &mut batch)
-            .map_err(error)?;
-        if n == 0 || n as usize != batch.len() || n > count - points.len() as u64 {
+    let mut consumed = 0;
+    while consumed < count {
+        let n = reader.fill_points((16 * 1024 * 1024 / batch.record_len() as u64).min(BATCH).min(count - consumed), &mut batch).map_err(error)?;
+        if n == 0 || n as usize != batch.len() || n > count - consumed {
             return Err(IoError::Format("LAS/LAZ ended before its declared point count".into()));
         }
-        let mut rgb = batch.rgb();
-        for ((((x, y), z), intensity), classification) in batch.x().zip(batch.y()).zip(batch.z()).zip(batch.intensity()).zip(batch.classification()) {
+        let start = (stride - consumed % stride) % stride;
+        consumed += n;
+        let positions = batch.x().zip(batch.y()).zip(batch.z()).skip(start as usize).step_by(stride as usize);
+        let attributes = batch.intensity().zip(batch.classification()).skip(start as usize).step_by(stride as usize);
+        let mut rgb = batch.rgb().map(|colors| colors.skip(start as usize).step_by(stride as usize));
+        for (((x, y), z), (intensity, classification)) in positions.zip(attributes) {
             if [x, y, z].into_iter().any(|v| !v.is_finite() || v.abs() > super::MAX_WINDOW_COORD) {
                 return Err(IoError::Format("LAS/LAZ contains coordinates outside the supported range".into()));
             }
@@ -44,7 +52,7 @@ fn decode(mut input: impl Read + Seek + Send + Sync + 'static) -> Result<Drawing
         }
     }
     let mut drawing = Drawing::new_metric();
-    drawing.point_cloud = Some(Arc::new(PointCloud::new(points, has_rgb && max_rgb > 0, max_rgb <= 255)));
+    drawing.point_cloud = Some(Arc::new(PointCloud::new(points, count, has_rgb && max_rgb > 0, max_rgb <= 255)));
     Ok(drawing)
 }
 
@@ -60,8 +68,8 @@ fn preflight(input: &mut (impl Read + Seek)) -> Result<()> {
         (0, Some(large)) => large.number_of_point_records,
         (legacy, _) => u64::from(legacy),
     };
-    if count == 0 || count > MAX_POINTS as u64 {
-        return Err(IoError::Format(format!("LAS/LAZ point count {count} is outside the supported range (1–{MAX_POINTS})")));
+    if count == 0 || count > MAX_SOURCE_POINTS {
+        return Err(IoError::Format(format!("LAS/LAZ point count {count} is outside the supported range (1–{MAX_SOURCE_POINTS})")));
     }
     let format = las::point::Format::new(header.point_data_record_format).map_err(|e| IoError::Format(format!("LAS/LAZ: {e}")))?;
     let point_end = header.offset_to_end_of_points();

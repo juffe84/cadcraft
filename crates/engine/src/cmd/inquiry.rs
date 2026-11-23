@@ -622,7 +622,7 @@ fn run_inspect(s: &mut Session, p: &Value) -> Result<Value> {
         "readNotes": d.read_notes,
     });
     if let Some(cloud) = &d.point_cloud {
-        out["pointCloud"] = json!({ "points": cloud.points().len(), "rgb": cloud.has_rgb });
+        out["pointCloud"] = json!({ "points": cloud.source_count, "previewPoints": cloud.points().len(), "rgb": cloud.has_rgb });
     }
     if bool_or(p, "entities", true)
         && let (Some(o), Some(store)) = (out.as_object_mut(), d.space(&space))

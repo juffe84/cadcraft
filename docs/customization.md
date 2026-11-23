@@ -70,8 +70,10 @@ the catalog: each command's id and its parameters.
 Use **Open** or drop a `.las` or `.laz` file into CADCraft. The file opens in its own tab as a
 top-down preview with the original coordinates and scan colors, when present. Zoom in to see
 more detail. The desktop reads files in batches in the background and decompresses LAZ
-chunks in parallel. The decoded cloud stays in memory (up to 25 million points on desktop,
-2 million in the browser). CADCraft does not reproject coordinates.
+chunks in parallel. The desktop retains every point up to 25 million. For larger scans it
+keeps a systematic sample of up to five million points, distributed across the file, and
+reports the total and the retained count. The desktop accepts up to one billion input points
+and the browser up to two million. CADCraft does not reproject coordinates.
 
 Use `cadcraft-cli info scan.laz` for point count and XY extents. The preview supports viewing.
 Point snapping, 3D display and saving or exporting the cloud are not supported.

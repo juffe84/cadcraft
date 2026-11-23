@@ -446,7 +446,8 @@ fn opened(s: &Session, i: usize, entities: bool) -> Value {
         json!({ "index": i, "warnings": warnings, "saved_view": saved_view })
     };
     if let Some(cloud) = d.and_then(|d| d.point_cloud.as_ref()) {
-        reply["pointCount"] = json!(cloud.points().len());
+        reply["pointCount"] = json!(cloud.source_count);
+        reply["previewPointCount"] = json!(cloud.points().len());
     }
     reply
 }
