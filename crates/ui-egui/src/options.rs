@@ -479,7 +479,10 @@ impl CadApp {
             "paperBackground": color_json(self.options.paper_background),
             "selectionColor": color_json(self.options.selection_color),
             "snapMarkerSize": self.options.snap_marker_size,
-            "pointCloud": { "size": self.session.settings.point_cloud_size, "snap": self.session.settings.point_cloud_snap },
+            "pointCloud": {
+                "size": self.session.settings.point_cloud_size, "snap": self.session.settings.point_cloud_snap,
+                "detailRadius": self.session.settings.point_cloud_detail_radius, "batchPoints": self.session.settings.point_cloud_batch_points,
+            },
             "timeSensitiveRightClick": self.options.time_sensitive_right_click,
             "rightClickDuration": self.options.right_click_hold_ms,
             "rightClickDefault": self.options.right_click_default.as_str(),

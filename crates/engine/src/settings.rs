@@ -8,6 +8,8 @@ pub struct Settings {
     pub osmode: u32,
     pub point_cloud_size: f32,
     pub point_cloud_snap: bool,
+    pub point_cloud_detail_radius: f64,
+    pub point_cloud_batch_points: u32,
     pub orthomode: bool,
     pub polarmode: bool,
     /// POLARANG (radians).
@@ -148,6 +150,8 @@ impl Default for Settings {
             osmode: 4133,
             point_cloud_size: 1.5,
             point_cloud_snap: true,
+            point_cloud_detail_radius: 0.0,
+            point_cloud_batch_points: 0,
             orthomode: false,
             polarmode: true,
             polarang: std::f64::consts::FRAC_PI_2,
@@ -210,5 +214,11 @@ impl Default for Settings {
             auditctl: false,
             attreq: true,
         }
+    }
+}
+
+impl Settings {
+    pub fn cloud_detail_options(&self) -> cadcraft_doc::point_cloud::DetailOptions {
+        cadcraft_doc::point_cloud::DetailOptions { radius: self.point_cloud_detail_radius, batch_points: self.point_cloud_batch_points }
     }
 }

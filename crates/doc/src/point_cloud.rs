@@ -124,9 +124,25 @@ pub struct CloudView {
     pub failed: bool,
 }
 
+/// Controls for native streaming. Zero delegates the setting to the reader.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct DetailOptions {
+    pub radius: f64,
+    pub batch_points: u32,
+}
+
+impl DetailOptions {
+    pub const MAX_RADIUS: f64 = 1_000.0;
+    pub const MIN_BATCH_POINTS: u32 = 10_000;
+    pub const MAX_BATCH_POINTS: u32 = 2_000_000;
+}
+
 pub trait CloudDetails: std::fmt::Debug + std::panic::RefUnwindSafe + Send + Sync {
     /// Request more detail without blocking the caller.
-    fn view(&self, bounds: Bounds2) -> CloudView;
+    fn view(&self, bounds: Bounds2) -> CloudView {
+        self.view_with(bounds, DetailOptions::default())
+    }
+    fn view_with(&self, bounds: Bounds2, options: DetailOptions) -> CloudView;
     /// Current data without changing the worker's request.
     fn current(&self, bounds: Bounds2) -> CloudView;
 }

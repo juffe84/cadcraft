@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use cadcraft_color::Rgb;
+use cadcraft_doc::point_cloud::DetailOptions;
 use cadcraft_doc::{Drawing, Entity, EntityKind, Space};
 use cadcraft_geom::{Bounds2, Mat3, Vec2, Vec3};
 use cadcraft_render::paper::{self, Sheet};
@@ -69,7 +70,7 @@ pub fn specs() -> Vec<CommandSpec> {
             .params("{enabled?: bool, yaw?: radians, tilt?: radians, zoom?: factor, pivot?: [x,y,z], pan?: [x,y]}; with no arguments toggles the point cloud camera")
             .noundo(),
         CommandSpec::new("pointcloud.settings", "Point cloud display", run_cloud_settings)
-            .params("{size?: 1–12 screen points, snap?: bool} → {size, snap}")
+            .params("{size?: 1–12 screen points, snap?: bool, detailRadius?: 0–1000 drawing units, batchPoints?: 0 or 10000–2000000 per worker}; zero is automatic")
             .noundo(),
         CommandSpec::new("pointcloud.snap", "Pick point cloud point", run_cloud_snap)
             .params("{point: [x,y], aperture: drawing units} → {point: [x,y,z] | null}")
@@ -131,13 +132,37 @@ fn run_cloud_settings(s: &mut Session, p: &Value) -> Result<Value> {
         .map(|v| v.as_f64().filter(|n| (1.0..=12.0).contains(n)).ok_or_else(|| bad("pointcloud.settings", "size must be between 1 and 12")))
         .transpose()?;
     let snap = p.get("snap").map(|v| v.as_bool().ok_or_else(|| bad("pointcloud.settings", "snap must be a boolean"))).transpose()?;
+    let radius = p
+        .get("detailRadius")
+        .map(|v| {
+            v.as_f64()
+                .filter(|x| (0.0..=DetailOptions::MAX_RADIUS).contains(x))
+                .ok_or_else(|| bad("pointcloud.settings", "detailRadius must be between 0 and 1000"))
+        })
+        .transpose()?;
+    let batch_points = p
+        .get("batchPoints")
+        .map(|v| {
+            v.as_u64()
+                .and_then(|x| u32::try_from(x).ok())
+                .filter(|&x| x == 0 || (DetailOptions::MIN_BATCH_POINTS..=DetailOptions::MAX_BATCH_POINTS).contains(&x))
+                .ok_or_else(|| bad("pointcloud.settings", "batchPoints must be 0 or between 10000 and 2000000"))
+        })
+        .transpose()?;
     if let Some(size) = size {
         s.settings.point_cloud_size = size as f32;
     }
     if let Some(snap) = snap {
         s.settings.point_cloud_snap = snap;
     }
-    Ok(json!({ "size": s.settings.point_cloud_size, "snap": s.settings.point_cloud_snap }))
+    if let Some(radius) = radius {
+        s.settings.point_cloud_detail_radius = radius;
+    }
+    if let Some(batch_points) = batch_points {
+        s.settings.point_cloud_batch_points = batch_points;
+    }
+    Ok(json!({ "size": s.settings.point_cloud_size, "snap": s.settings.point_cloud_snap,
+        "detailRadius": s.settings.point_cloud_detail_radius, "batchPoints": s.settings.point_cloud_batch_points }))
 }
 
 fn run_cloud_snap(s: &mut Session, p: &Value) -> Result<Value> {
@@ -149,7 +174,8 @@ fn run_cloud_snap(s: &mut Session, p: &Value) -> Result<Value> {
         .ok_or_else(|| bad("pointcloud.snap", "aperture must be positive and finite"))?;
     let cloud = s.doc()?.point_cloud.as_ref().ok_or_else(|| bad("pointcloud.snap", "there is no open point cloud"))?;
     let extent = Bounds2::new(point, point).expand(aperture);
-    let snapshot = cloud.detail.as_ref().map(|source| source.0.view(extent)).unwrap_or_default();
+    let options = DetailOptions { radius: 0.0, ..s.settings.cloud_detail_options() };
+    let snapshot = cloud.detail.as_ref().map(|source| source.0.view_with(extent, options)).unwrap_or_default();
     let shown = snapshot.points.as_deref().unwrap_or(cloud);
     let mut nearest = None;
     let mut distance = aperture;

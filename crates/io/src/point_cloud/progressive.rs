@@ -1,7 +1,7 @@
 //! Read sampled blocks first. Index the original blocks in the background and reopen only the
 //! overlapping blocks for a detailed view. The worker retains the already authorized file handle.
 use super::{CloudPoint, Drawing, IoError, MAX_FULL_POINTS, PointCloud, Result, preflight};
-use cadcraft_doc::point_cloud::{CloudDetails, CloudView, DetailSource};
+use cadcraft_doc::point_cloud::{CloudDetails, CloudView, DetailOptions, DetailSource};
 use cadcraft_geom::{Bounds2, Vec2, Vec3};
 use las::{Header, PointData, PointDataBuilder};
 use laz::laszip::{ChunkTable, ChunkTableEntry};
@@ -252,13 +252,33 @@ fn visit(data: &PointData, range: std::ops::Range<usize>, stride: usize, mut vis
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Request {
     region: Bounds2,
-    width: f64,
-    height: f64,
+    visible: Bounds2,
+    options: DetailOptions,
 }
 
 impl Request {
+    fn new(bounds: Bounds2, options: DetailOptions) -> Self {
+        let cap = |region: Bounds2| {
+            if options.radius > 0.0 {
+                let center = bounds.center();
+                let radius = Vec2::new(options.radius, options.radius);
+                Bounds2 { min: region.min.max(center - radius), max: region.max.min(center + radius) }
+            } else {
+                region
+            }
+        };
+        let visible = cap(bounds);
+        let padding = 0.2 * visible.width().min(visible.height());
+        Self { region: cap(visible.expand(padding)), visible, options }
+    }
+
+    fn covers_request(&self, next: Self) -> bool {
+        // Radius changes affect where detail may appear. Batch changes only change pending work.
+        self.options.radius == next.options.radius && self.covers(next.visible)
+    }
+
     fn covers(&self, view: Bounds2) -> bool {
-        self.region.contains_box(&view) && self.width * 0.5 <= view.width() && self.height * 0.5 <= view.height()
+        self.region.contains_box(&view) && self.visible.width() * 0.5 <= view.width() && self.visible.height() * 0.5 <= view.height()
     }
 }
 
@@ -284,15 +304,15 @@ impl Bridge {
     }
 
     fn snapshot(&self, state: &State, bounds: Bounds2) -> CloudView {
-        let detail = state
-            .details
-            .iter()
-            .rev()
-            .find(|(request, _)| request.covers(bounds))
-            .or_else(|| state.details.iter().rev().find(|(request, _)| request.region.contains_box(&bounds)))
-            .or_else(|| state.wanted.and_then(|_| state.details.iter().rev().find(|(request, _)| request.region.intersects(&bounds))));
+        let details =
+            || state.details.iter().rev().filter(|(request, _)| state.wanted.is_none_or(|wanted| request.options.radius == wanted.options.radius));
+        let detail = details()
+            .find(|(request, _)| state.wanted == Some(*request) && request.region.intersects(&bounds))
+            .or_else(|| details().find(|(request, _)| request.covers(bounds)))
+            .or_else(|| details().find(|(request, _)| request.region.contains_box(&bounds)))
+            .or_else(|| state.wanted.and_then(|_| details().find(|(request, _)| request.region.intersects(&bounds))));
         let complete = state.wanted.is_none_or(|wanted| state.details.iter().any(|(request, _)| *request == wanted));
-        let partial = state.partial.as_ref().filter(|(request, _)| state.wanted == Some(*request) && request.region.contains_box(&bounds));
+        let partial = state.partial.as_ref().filter(|(request, _)| state.wanted == Some(*request) && request.region.intersects(&bounds));
         let overlay = partial.or(detail).map(|(_, cloud)| cloud.clone());
         let overview = overlay.as_ref().and(state.overview.clone());
         let points = overlay.or_else(|| state.overview.clone());
@@ -301,23 +321,26 @@ impl Bridge {
 }
 
 impl CloudDetails for Bridge {
-    fn view(&self, bounds: Bounds2) -> CloudView {
+    fn view_with(&self, bounds: Bounds2, options: DetailOptions) -> CloudView {
         let mut state = self.state();
         let close = bounds.intersects(&self.extent) && (bounds.width() < 0.65 * self.extent.width() || bounds.height() < 0.65 * self.extent.height());
         if !close {
             state.wanted = None;
             state.partial = None;
-        } else if !state.failed && !state.wanted.is_some_and(|request| request.covers(bounds)) {
-            state.partial = None;
-            let cached = state.details.iter().position(|(request, _)| request.covers(bounds));
+        } else if !state.failed {
+            let next = Request::new(bounds, options);
+            let cached = state.details.iter().rposition(|(old, _)| old.covers_request(next));
             if let Some(index) = cached
                 && let Some(detail) = state.details.remove(index)
             {
+                if state.wanted != Some(detail.0) {
+                    state.partial = None;
+                }
                 state.wanted = Some(detail.0);
                 state.details.push_back(detail);
-            } else {
-                let padding = 0.2 * bounds.width().min(bounds.height());
-                state.wanted = Some(Request { region: bounds.expand(padding), width: bounds.width(), height: bounds.height() });
+            } else if !state.wanted.is_some_and(|old| old.options == options && old.covers_request(next)) {
+                state.partial = None;
+                state.wanted = Some(next);
                 let _ = self.wake.try_send(());
             }
         }
@@ -453,6 +476,10 @@ fn query(source: &mut Source, index: &[BlockExtent], request: Request, bridge: &
     log::debug!("point cloud detail: {} candidate blocks, {candidate_points} source points", matches.len());
     let mut ids = matches.into_iter().peekable();
     let mut last_partial: Option<Instant> = None;
+    // Keep enough complete source chunks per round to feed the Rayon pool even when the
+    // configured batch for each worker is smaller than a source chunk.
+    let points_per_round = u64::from(request.options.batch_points) * rayon::current_num_threads() as u64;
+    let workers = rayon::current_num_threads();
     let retain = |hits: &mut Sample, points: &[CloudPoint]| {
         for &point in points {
             if request.region.contains(point.position.xy()) {
@@ -475,6 +502,7 @@ fn query(source: &mut Source, index: &[BlockExtent], request: Request, bridge: &
         while let Some(&next) = ids.peek() {
             let entry = source.entries[next];
             if cache.blocks.contains_key(&next)
+                || (points_per_round != 0 && group.len() >= workers && points + entry.point_count > points_per_round)
                 || bytes + entry.byte_count > 32 << 20
                 || (points + entry.point_count) * source.record_len as u64 > 32 << 20
             {
@@ -603,6 +631,22 @@ mod tests {
             }
             assert!(std::time::Instant::now() < deadline, "detail worker stalled");
             std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let area = Bounds2::new(area.min, Vec2::new(area.max.x, 6.0));
+        let options = DetailOptions { radius: 2.0, batch_points: 50_000 };
+        let mut view = source.view_with(area, options);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while view.pending && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+            view = source.current(area);
+        }
+        assert!(!view.pending && !view.failed);
+        assert!(view.overview.is_some());
+        let selected = view.points.unwrap();
+        assert!(!selected.points().is_empty());
+        assert!(selected.points().iter().all(|p| Bounds2::new(area.center(), area.center()).expand(2.0).contains(p.position.xy())));
+        for _ in 0..2 {
+            assert!(!source.view_with(area, options).pending, "the same capped view reuses its detail");
         }
         drop(d);
         std::fs::remove_file(&path).ok();

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 pub(super) fn controls(app: &mut CadApp, ui: &mut egui::Ui) {
     let orbit = app.session.state().is_ok_and(|state| state.point_cloud_orbit.is_some());
-    let status = cloud(app).map(|cloud| view(cloud, cloud.bounds(), false)).unwrap_or_default();
+    let status = cloud(app).map(|cloud| view(cloud, cloud.bounds(), app, false)).unwrap_or_default();
     if status.pending {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(125));
     }
@@ -24,6 +24,36 @@ pub(super) fn controls(app: &mut CadApp, ui: &mut egui::Ui) {
         }
         if ui.selectable_label(orbit, crate::i18n::t("3D Orbit")).clicked() {
             let _ = app.run("3dorbit", json!({ "enabled": !orbit }));
+        }
+        if cloud(app).is_some_and(|cloud| cloud.detail.is_some()) {
+            ui.menu_button(crate::i18n::t("Detail loading"), |ui| {
+                let mut radius = app.session.settings.point_cloud_detail_radius;
+                let mut batch = app.session.settings.point_cloud_batch_points / 1_000;
+                if ui
+                    .add(egui::Slider::new(&mut radius, 0.0..=1000.0).logarithmic(true).text(crate::i18n::t("Detail radius (drawing units)")))
+                    .changed()
+                {
+                    let _ = app.run("pointcloud.settings", json!({ "detailRadius": radius }));
+                }
+                if ui
+                    .add(
+                        egui::Slider::new(&mut batch, 0..=2000)
+                            .step_by(10.0)
+                            .logarithmic(true)
+                            .text(crate::i18n::t("Read batch (k points per worker)")),
+                    )
+                    .changed()
+                {
+                    let _ = app.run("pointcloud.settings", json!({ "batchPoints": batch * 1_000 }));
+                }
+                ui.label(crate::i18n::t("Zero uses automatic loading."));
+                if ui.button(crate::i18n::t("Fast close-up")).clicked() {
+                    let _ = app.run("pointcloud.settings", json!({ "detailRadius": 5.0, "batchPoints": 50_000 }));
+                }
+                if ui.button(crate::i18n::t("Automatic")).clicked() {
+                    let _ = app.run("pointcloud.settings", json!({ "detailRadius": 0.0, "batchPoints": 0 }));
+                }
+            });
         }
         if status.failed {
             ui.label(crate::i18n::t("Could not load point cloud detail"));
@@ -57,8 +87,10 @@ fn color(cloud: &PointCloud, point: &CloudPoint, fallback: Color32) -> Color32 {
     }
 }
 
-fn view(cloud: &PointCloud, bounds: Bounds2, request: bool) -> CloudView {
-    cloud.detail.as_ref().map_or_else(CloudView::default, |details| if request { details.0.view(bounds) } else { details.0.current(bounds) })
+fn view(cloud: &PointCloud, bounds: Bounds2, app: &CadApp, request: bool) -> CloudView {
+    cloud.detail.as_ref().map_or_else(CloudView::default, |details| {
+        if request { details.0.view_with(bounds, app.session.settings.cloud_detail_options()) } else { details.0.current(bounds) }
+    })
 }
 
 fn layers<'a>(snapshot: &'a CloudView, root: &'a Arc<PointCloud>) -> impl Iterator<Item = &'a Arc<PointCloud>> {
@@ -68,7 +100,7 @@ fn layers<'a>(snapshot: &'a CloudView, root: &'a Arc<PointCloud>) -> impl Iterat
 pub(super) fn paint_plan(app: &CadApp, painter: &egui::Painter, xf: &Xf, request: bool) {
     let Some(cloud) = cloud(app) else { return };
     let bounds = xf.world_bounds();
-    let snapshot = view(cloud, bounds, request);
+    let snapshot = view(cloud, bounds, app, request);
     if request && snapshot.pending {
         painter.ctx().request_repaint_after(std::time::Duration::from_millis(125));
     }
@@ -109,7 +141,7 @@ pub(super) fn paint_plan(app: &CadApp, painter: &egui::Painter, xf: &Xf, request
 pub(super) fn snap_visible(app: &CadApp, xf: &Xf, raw: Vec2, aperture: f64) -> Option<Vec2> {
     let cloud = cloud(app)?;
     let bounds = xf.world_bounds();
-    let snapshot = view(cloud, bounds, false);
+    let snapshot = view(cloud, bounds, app, false);
     let mut nearest = None;
     let mut distance = aperture.max(f64::from(app.session.settings.point_cloud_size) * 0.5 / xf.scale).powi(2);
     let gpu = layers(&snapshot, cloud).all(|shown| crate::cloud_gpu::available(app.canvas.gpu, shown));
@@ -228,7 +260,7 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     let mut frame = OrbitFrame::new(orbit, plan, &root, rect);
     let mut updated = false;
     if press && let Some(cursor) = pointer.filter(|p| rect.contains(*p)) {
-        let snapshot = view(&root, frame.bounds, false);
+        let snapshot = view(&root, frame.bounds, app, false);
         let gpu = layers(&snapshot, &root).all(|shown| crate::cloud_gpu::available(app.canvas.gpu, shown));
         let limit = if gpu { usize::MAX } else { sample_budget(rect) };
         if let Some(pivot) = layers(&snapshot, &root)
@@ -246,7 +278,7 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
         }
     }
     let motion = response.drag_motion();
-    let rotation = if response.dragged_by(PointerButton::Middle) { motion } else { egui::Vec2::ZERO } + keys * 10.0;
+    let rotation = if response.dragged_by(PointerButton::Middle) { vec2(motion.x, -motion.y) } else { egui::Vec2::ZERO } + keys * 10.0;
     if rotation != egui::Vec2::ZERO {
         orbit.yaw += f64::from(rotation.x / rect.width().max(1.0)) * 220.0_f64.to_radians();
         orbit.tilt += f64::from(rotation.y / rect.height().max(1.0)) * 220.0_f64.to_radians();
@@ -276,7 +308,7 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
             frame = OrbitFrame::new(applied, plan, &root, rect);
         }
     }
-    let snapshot = view(&root, frame.bounds, true);
+    let snapshot = view(&root, frame.bounds, app, true);
     if snapshot.pending {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(70));
     }
@@ -345,7 +377,7 @@ mod tests {
         harness.step();
         let rotated = orbit(harness.state());
         assert_ne!(rotated.yaw, before.yaw);
-        assert_ne!(rotated.tilt, before.tilt);
+        assert!(rotated.tilt < before.tilt, "dragging down tilts the image down");
         harness.event(button(at, PointerButton::Middle, false));
         harness.step();
 
