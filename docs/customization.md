@@ -73,7 +73,8 @@ the original coordinates and scan colors, when present. CADCraft does not reproj
 On desktop, clouds with more than 25 million points first show a sparse preview. CADCraft
 indexes the source blocks and smaller point ranges in the background. When you zoom in, it decompresses overlapping
 blocks in parallel, draws the completed detail over a separate overview buffer, and reuses
-recent views while you move the camera. The native GPU renderer keeps point buffers resident while panning,
+recent views while you move the camera. In Orbit, detail follows the surface under the center
+of the view after the camera settles, independent of the overall cloud elevation range. The native GPU renderer keeps point buffers resident while panning,
 zooming or orbiting. The source stays on disk, and the preview remains bounded in memory. The desktop accepts up to one billion input points. The browser
 accepts up to two million and keeps them in memory.
 

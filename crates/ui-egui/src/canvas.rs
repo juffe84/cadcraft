@@ -120,6 +120,7 @@ pub struct CanvasState {
     pub gpu: Option<crate::gpu::GpuTarget>,
     /// The wgpu device, for background rebuilds to create their buffers (see [`rebuild`]).
     pub gpu_device: Option<egui_wgpu::wgpu::Device>,
+    cloud_orbit_focus: Option<point_cloud::OrbitFocus>,
     /// The mesh last handed to the GPU (see [`crate::gpu::CanvasCallback::key`]).
     mesh_key: Option<u64>,
     mesh_slot: crate::gpu::MeshSlot,
@@ -834,6 +835,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
             return;
         }
     }
+    app.canvas.cloud_orbit_focus = None;
     let full = ui.available_rect_before_wrap();
     // Tiled model viewports (VPORTS): the current tile is the drawing area below; `draw_tiles`
     // draws the others.

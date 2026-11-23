@@ -5,7 +5,7 @@ use cadcraft_engine::PointCloudOrbit;
 use cadcraft_geom::{Bounds2, Vec3};
 use egui::{Key, PointerButton, Sense};
 use serde_json::json;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 pub(super) fn controls(app: &mut CadApp, ui: &mut egui::Ui) {
     let orbit = app.session.state().is_ok_and(|state| state.point_cloud_orbit.is_some());
@@ -213,8 +213,25 @@ impl OrbitFrame {
         (pos2(at.x + ((x.dot(point) + px) * self.camera.scale) as f32, at.y - ((y.dot(point) + py) * self.camera.scale) as f32), z.dot(point))
     }
 
+    /// The ray through the center of the window, at the depth of a known surface point.
+    /// This also tracks a screen-space pan when the exact point is between rendered samples.
+    fn center_on_surface(&self, point: Vec3) -> Vec3 {
+        let [right, up, front] = self.camera.axes;
+        let [x, y] = self.camera.pan;
+        self.camera.center - right * x - up * y + front * front.dot(point - self.camera.center)
+    }
+
+    fn detail_bounds(&self, focus: Vec3) -> Bounds2 {
+        // Loading is centered on the geometry under the view. The wide footprint belonging
+        // to the cloud's entire elevation range is only used for render culling.
+        let half = Vec2::new(f64::from(self.rect.width()), f64::from(self.rect.height())) / (2.0 * self.camera.scale);
+        let margin = half.x.max(half.y) * (1.0 - self.camera.axes[2].z.abs());
+        let span = half + Vec2::new(margin, margin);
+        Bounds2::new(focus.xy() - span, focus.xy() + span)
+    }
+
     fn pick(&self, shown: &PointCloud, cursor: egui::Pos2, limit: usize, radius: f32) -> Option<Vec3> {
-        // Only run on a middle-button press. Screen distance chooses the pixel, and depth breaks
+        // Only run when picking a pivot or when the camera settles. Screen distance chooses the pixel, and depth breaks
         // ties so overlapping points turn around the front of the cloud.
         let mut best = (radius * radius, f64::NEG_INFINITY);
         let mut pivot = None;
@@ -230,10 +247,72 @@ impl OrbitFrame {
     }
 }
 
+#[derive(PartialEq)]
+struct FocusPose {
+    center: Vec3,
+    axes: [Vec3; 3],
+    pan: [f64; 2],
+    scale: f64,
+    rect: Rect,
+}
+
+impl From<&OrbitFrame> for FocusPose {
+    fn from(frame: &OrbitFrame) -> Self {
+        Self { center: frame.camera.center, axes: frame.camera.axes, pan: frame.camera.pan, scale: frame.camera.scale, rect: frame.rect }
+    }
+}
+
+pub(super) struct OrbitFocus {
+    document: u64,
+    pose: FocusPose,
+    changed_at: f64,
+    surface: Vec3,
+    sample_source: Weak<PointCloud>,
+}
+
+/// Use coarse visible geometry to find the center of interest. Never read the GPU depth buffer
+/// back into the CPU or restart a streaming request for every drag event.
+fn detail_view(app: &mut CadApp, ui: &egui::Ui, root: &Arc<PointCloud>, frame: &OrbitFrame, document: u64, dragging: bool) -> CloudView {
+    let snapshot = view(root, frame.bounds, app, false);
+    if root.detail.is_none() {
+        return snapshot;
+    }
+    let now = ui.input(|input| input.time);
+    let pose = FocusPose::from(frame);
+    let mut state = app.canvas.cloud_orbit_focus.take().filter(|state| state.document == document);
+    if state.as_ref().is_none_or(|state| state.pose != pose) {
+        let surface = state.as_ref().map_or(frame.camera.center, |state| state.surface);
+        state = Some(OrbitFocus { document, pose, changed_at: now, surface, sample_source: Weak::new() });
+    }
+    let Some(mut state) = state else { return snapshot };
+    if dragging || now - state.changed_at < 0.12 {
+        app.canvas.cloud_orbit_focus = Some(state);
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
+        return snapshot;
+    }
+    let overview = snapshot.overview.as_ref().or(snapshot.points.as_ref()).unwrap_or(root);
+    let samples = Arc::downgrade(overview);
+    if !Weak::ptr_eq(&state.sample_source, &samples) {
+        // The shader draws all resident vertices. Keep the CPU pick bounded when the
+        // camera is looking at a large area and points are densely packed.
+        if let Some(point) = frame.pick(overview, frame.rect.center(), 160_000, 24.0) {
+            state.surface = point;
+        }
+        state.sample_source = samples;
+    }
+    let center = frame.center_on_surface(state.surface);
+    let bounds = frame.detail_bounds(center);
+    app.canvas.cloud_orbit_focus = Some(state);
+    let _ = view(root, bounds, app, true);
+    // Fetch the composed layers against the actual render footprint, not the load zone.
+    view(root, frame.bounds, app, false)
+}
+
 pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     let Ok(state) = app.session.state() else { return };
     let Some(mut orbit) = state.point_cloud_orbit else { return };
     let plan = state.view();
+    let document = state.uid;
     let Some(root) = cloud(app).cloned() else { return };
     let (rect, response) = ui.allocate_exact_size(ui.available_size(), Sense::click_and_drag());
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Image, true, crate::i18n::t("Point cloud 3D view")));
@@ -308,7 +387,8 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
             frame = OrbitFrame::new(applied, plan, &root, rect);
         }
     }
-    let snapshot = view(&root, frame.bounds, app, true);
+    let dragging = response.dragged_by(PointerButton::Middle) || response.dragged_by(PointerButton::Secondary);
+    let snapshot = detail_view(app, ui, &root, &frame, document, dragging);
     if snapshot.pending {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(70));
     }
@@ -343,6 +423,30 @@ mod tests {
     use cadcraft_engine::Session;
     use egui_kittest::kittest::{NodeT, Queryable};
     use std::sync::Arc;
+
+    #[test]
+    fn orbit_detail_follows_the_panned_surface_instead_of_the_whole_cloud_height() {
+        let points = [Vec3::new(-500.0, -900.0, -800.0), Vec3::new(100.0, 700.0, 400.0)].map(|position| CloudPoint {
+            position,
+            rgb: [0; 3],
+            intensity: 0,
+            classification: 0,
+        });
+        let cloud = PointCloud::new(points.to_vec(), 2, false, false);
+        let plan = cadcraft_engine::View { center: Vec2::ZERO, height: 60.0, twist: 0.0 };
+        let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 500.0));
+        let mut orbit = PointCloudOrbit { pivot: Some(Vec3::ZERO), yaw: 0.5, tilt: 1.3, ..Default::default() };
+        let before = OrbitFrame::new(orbit, plan, &cloud, rect);
+        let target = Vec3::new(32.0, -78.0, 75.0);
+        let [right, up, _] = before.camera.axes;
+        orbit.pan = Vec2::new(-right.dot(target), -up.dot(target));
+        let frame = OrbitFrame::new(orbit, plan, &cloud, rect);
+        assert!(frame.project(target).0.distance(rect.center()) < 0.01);
+        let focus = frame.center_on_surface(target);
+        assert!((focus - target).len() < 1e-8);
+        assert!(frame.detail_bounds(focus).center().near(target.xy(), 1e-8));
+        assert!(frame.bounds.center().dist(target.xy()) > frame.detail_bounds(focus).height());
+    }
 
     #[test]
     fn a_visible_cloud_point_snaps_and_the_orbit_control_returns_to_plan() {

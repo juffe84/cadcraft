@@ -354,6 +354,8 @@ impl CloudDetails for Bridge {
 
 /// Flight lines can make a single LAZ block's bounding box much larger than the area
 /// its points occupy. Smaller consecutive ranges reject gaps without missing any point.
+const STRIPE_POINTS: usize = 256;
+
 struct BlockExtent {
     bounds: Bounds2,
     stripes: Vec<Bounds2>,
@@ -361,7 +363,6 @@ struct BlockExtent {
 
 impl BlockExtent {
     fn new(data: &PointData, range: std::ops::Range<usize>) -> Self {
-        const STRIPE_POINTS: usize = 256;
         let mut xy = data.x().zip(data.y()).skip(range.start).take(range.len());
         let stripes: Vec<_> =
             range.step_by(STRIPE_POINTS).map(|_| Bounds2::from_points(xy.by_ref().take(STRIPE_POINTS).map(|(x, y)| Vec2::new(x, y)))).collect();
@@ -369,8 +370,19 @@ impl BlockExtent {
         Self { bounds, stripes }
     }
 
-    fn intersects(&self, region: &Bounds2) -> bool {
-        self.bounds.intersects(region) && self.stripes.iter().any(|stripe| stripe.intersects(region))
+    fn distance_to(&self, region: &Bounds2, focus: Vec2) -> Option<f64> {
+        if !self.bounds.intersects(region) {
+            return None;
+        }
+        self.stripes
+            .iter()
+            .filter(|bounds| bounds.intersects(region))
+            .map(|bounds| {
+                let nearest = focus.max(bounds.min).min(bounds.max);
+                let delta = nearest - focus;
+                delta.dot(delta)
+            })
+            .min_by(f64::total_cmp)
     }
 }
 
@@ -435,7 +447,10 @@ fn work(mut source: Source, bridge: &Weak<Bridge>, wake: Receiver<()>) -> Result
 
 // Keep decoded blocks from nearby views. A block can be larger than the usual budget, so
 // limit the cache by the actual number of retained points, not by a number of blocks.
-const CACHE_POINTS: usize = 3_000_000;
+const CACHE_POINTS: usize = 10_000_000;
+// When a region exceeds the cache, remember the first (closest) blocks without evicting
+// every previously cached block as the query crosses the rest of the file.
+const LARGE_QUERY_CACHE_POINTS: u64 = 3_000_000;
 
 #[derive(Default)]
 struct BlockCache {
@@ -470,11 +485,13 @@ impl BlockCache {
 
 fn query(source: &mut Source, index: &[BlockExtent], request: Request, bridge: &Weak<Bridge>, cache: &mut BlockCache) -> Result<Option<PointCloud>> {
     let mut hits = Sample::new(DETAIL_BUDGET);
-    let matches: Vec<_> = index.iter().enumerate().filter_map(|(id, extent)| extent.intersects(&request.region).then_some(id)).collect();
-    let candidate_points = matches.iter().map(|&id| source.entries[id].point_count).sum::<u64>();
-    let keep_whole_blocks = candidate_points <= CACHE_POINTS as u64;
+    let center = request.visible.center();
+    let mut matches: Vec<_> =
+        index.iter().enumerate().filter_map(|(id, extent)| extent.distance_to(&request.region, center).map(|distance| (id, distance))).collect();
+    matches.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+    let candidate_points = matches.iter().map(|&(id, _)| source.entries[id].point_count).sum::<u64>();
+    let mut cache_budget = if candidate_points <= CACHE_POINTS as u64 { CACHE_POINTS as u64 } else { LARGE_QUERY_CACHE_POINTS };
     log::debug!("point cloud detail: {} candidate blocks, {candidate_points} source points", matches.len());
-    let mut ids = matches.into_iter().peekable();
     let mut last_partial: Option<Instant> = None;
     // Keep enough complete source chunks per round to feed the Rayon pool even when the
     // configured batch for each worker is smaller than a source chunk.
@@ -487,22 +504,27 @@ fn query(source: &mut Source, index: &[BlockExtent], request: Request, bridge: &
             }
         }
     };
+    // Reuse all matching cached data before admitting new blocks that could evict it.
+    let mut unread = Vec::with_capacity(matches.len());
+    for (id, _) in matches {
+        if let Some(points) = cache.get(id) {
+            retain(&mut hits, points);
+        } else {
+            unread.push(id);
+        }
+    }
+    publish_partial(source, request, bridge, &hits, &mut last_partial);
+    let mut ids = unread.into_iter().peekable();
     while let Some(id) = ids.next() {
         if !bridge.upgrade().is_some_and(|b| b.state().wanted == Some(request)) {
             return Ok(None);
-        }
-        if let Some(points) = cache.get(id) {
-            retain(&mut hits, points);
-            publish_partial(source, request, bridge, &hits, &mut last_partial);
-            continue;
         }
         let mut group = vec![id];
         let mut bytes = source.entries[id].byte_count;
         let mut points = source.entries[id].point_count;
         while let Some(&next) = ids.peek() {
             let entry = source.entries[next];
-            if cache.blocks.contains_key(&next)
-                || (points_per_round != 0 && group.len() >= workers && points + entry.point_count > points_per_round)
+            if (points_per_round != 0 && group.len() >= workers && points + entry.point_count > points_per_round)
                 || bytes + entry.byte_count > 32 << 20
                 || (points + entry.point_count) * source.record_len as u64 > 32 << 20
             {
@@ -513,34 +535,58 @@ fn query(source: &mut Source, index: &[BlockExtent], request: Request, bridge: &
             bytes += entry.byte_count;
             points += entry.point_count;
         }
-        let data = source.read_selected(&group)?;
+        let mut group: Vec<_> = group
+            .into_iter()
+            .map(|id| {
+                let count = source.entries[id].point_count;
+                let keep = cache_budget >= count;
+                if keep {
+                    cache_budget -= count;
+                }
+                (id, keep)
+            })
+            .collect();
+        // Pick batches by screen proximity, but fetch their bytes in file order.
+        group.sort_unstable_by_key(|&(id, _)| id);
+        let blocks: Vec<_> = group.iter().map(|&(id, _)| id).collect();
+        let data = source.read_selected(&blocks)?;
         let mut offset = 0;
         let ranges: Vec<_> = group
             .iter()
-            .map(|&id| {
+            .map(|&(id, keep)| {
                 let start = offset;
                 offset += source.entries[id].point_count as usize;
-                start..offset
+                (id, keep, start..offset)
             })
             .collect();
-        let decoded: Vec<Vec<CloudPoint>> = ranges
+        let decoded: Vec<_> = ranges
             .into_par_iter()
-            .map(|range| {
+            .map(|(id, keep, range)| {
                 let mut points = Vec::new();
-                if keep_whole_blocks {
+                if keep {
                     points.reserve(range.len());
-                }
-                visit(&data, range, 1, |point| {
-                    if keep_whole_blocks || request.region.contains(point.position.xy()) {
-                        points.push(point);
+                    visit(&data, range, 1, |point| points.push(point))?;
+                } else {
+                    // Chunks still decompress whole, but skip converting attributes in the
+                    // stripes proven to be outside this request.
+                    for (stripe, extent) in index[id].stripes.iter().enumerate() {
+                        if extent.intersects(&request.region) {
+                            let start = range.start + stripe * STRIPE_POINTS;
+                            let end = (start + STRIPE_POINTS).min(range.end);
+                            visit(&data, start..end, 1, |point| {
+                                if request.region.contains(point.position.xy()) {
+                                    points.push(point);
+                                }
+                            })?;
+                        }
                     }
-                })?;
-                Ok(points)
+                }
+                Ok((id, keep, points))
             })
             .collect::<Result<_>>()?;
-        for (id, points) in group.into_iter().zip(decoded) {
+        for (id, keep, points) in decoded {
             retain(&mut hits, &points);
-            if keep_whole_blocks {
+            if keep {
                 cache.insert(id, points);
             }
         }
@@ -591,9 +637,10 @@ mod tests {
         let extent = BlockExtent::new(&data, 0..513);
         let square = |x| Bounds2::new(Vec2::new(x, 0.0), Vec2::new(x, 0.0)).expand(20.0);
         assert!(extent.bounds.intersects(&square(450.0)));
-        assert!(!extent.intersects(&square(450.0)));
-        assert!(extent.intersects(&square(0.0)) && extent.intersects(&square(900.0)));
-        assert!(!extent.intersects(&square(1_800.0)));
+        assert!(extent.distance_to(&square(450.0), Vec2::new(450.0, 0.0)).is_none());
+        assert!(extent.distance_to(&square(0.0), Vec2::ZERO).is_some());
+        assert!(extent.distance_to(&square(900.0), Vec2::new(900.0, 0.0)).is_some());
+        assert!(extent.distance_to(&square(1_800.0), Vec2::new(1_800.0, 0.0)).is_none());
     }
 
     #[test]
