@@ -696,8 +696,9 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     });
     if escape {
         ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
-        if app.session.prompting() || super::cloud_selection::active(app) {
+        if app.session.prompting() || !app.session.selection().is_empty() || super::cloud_selection::active(app) {
             crate::cmdline::escape(app);
+            response.request_focus();
         } else {
             let _ = app.run("3dorbit", json!({ "enabled": false }));
         }
@@ -1208,10 +1209,10 @@ mod tests {
     }
 
     #[test]
-    fn model_orbit_opens_without_a_cloud_and_can_exit_from_keyboard() {
+    fn escape_clears_model_selection_before_leaving_orbit() {
         use cadcraft_doc::{Common, Drawing, EntityKind, Line};
         let mut drawing = Drawing::new_metric();
-        drawing.add(&Space::Model, Common::default(), EntityKind::Line(Line { a: Vec3::ZERO, b: Vec3::new(0.0, 0.0, 20.0) })).unwrap();
+        let line = drawing.add(&Space::Model, Common::default(), EntityKind::Line(Line { a: Vec3::ZERO, b: Vec3::new(0.0, 0.0, 20.0) })).unwrap();
         let mut session = Session::empty();
         session.open_drawing(drawing, "Model", None);
         let plan = session.state().unwrap().view();
@@ -1224,8 +1225,15 @@ mod tests {
         let key = |key| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
         harness.event(key(Key::ArrowRight));
         harness.run();
-        assert!(harness.state().session.state().unwrap().orbit.unwrap().yaw > 0.0);
-        harness.event(key(Key::Escape));
+        let pose = harness.state().session.state().unwrap().orbit.unwrap();
+        assert!(pose.yaw > 0.0);
+        harness.state_mut().session.set_selection(vec![line]);
+        harness.key_press(Key::Escape);
+        harness.run();
+        assert!(harness.state().session.selection().is_empty());
+        let after = harness.state().session.state().unwrap().orbit.unwrap();
+        assert_eq!((after.yaw, after.tilt, after.pan, after.zoom), (pose.yaw, pose.tilt, pose.pan, pose.zoom));
+        harness.key_press(Key::Escape);
         harness.run();
         let state = harness.state().session.state().unwrap();
         assert!(state.orbit.is_none());
