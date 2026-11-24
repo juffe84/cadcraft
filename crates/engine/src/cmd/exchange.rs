@@ -82,10 +82,10 @@ pub fn specs() -> Vec<CommandSpec> {
             .enabled(super::file::cloud_export::enabled)
             .params("{path: output .laz file} → {path, points, removedPoints}")
             .noundo(),
-        CommandSpec::new(super::file::cloud_export::COPY_ID, "Copy Cloud Points with Base Point...", super::file::cloud_export::run_copy)
-            .enabled(super::file::cloud_export::copy_enabled)
-            .params("{path: output .laz file, base: [x,y,z] in world coordinates} → {path, points, base}; uses the current cloud selection")
-            .interactive(|_| Ok(Box::new(super::file::cloud_export::BasePointPrompt)))
+        CommandSpec::new(super::file::cloud_copy::COPY_ID, "Copy Cloud Points with Base Point...", super::file::cloud_copy::run)
+            .enabled(super::file::cloud_copy::enabled)
+            .params("{base: [x,y,z] in world coordinates} → {copied}; copies the current cloud selection as CAD POINT objects")
+            .interactive(|_| Ok(Box::new(super::file::cloud_copy::BasePointPrompt)))
             .noundo(),
         CommandSpec::new("pointcloud.select", "Select cloud points", run_cloud_select)
             .params("{min: [x,y], max: [x,y]} | {region: {origin: {x,y,z}, planes: [[a,b,c,d]; 5]}} | {enabled: bool}")

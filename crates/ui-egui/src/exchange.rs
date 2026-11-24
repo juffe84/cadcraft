@@ -4,7 +4,7 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use cadcraft_doc::point_cloud::{CloudCopy, CloudRegion};
+use cadcraft_doc::point_cloud::CloudRegion;
 use egui::TextureHandle;
 use serde_json::{Value, json};
 
@@ -25,7 +25,7 @@ pub fn route(app: &mut CadApp, id: &str) -> Result<Value, String> {
         "pointcloud.export" => {
             let command = cadcraft_engine::find_command(id).ok_or_else(|| id.to_owned())?;
             (command.enabled)(&app.session).inspect_err(|e| app.set_status(e))?;
-            app.pick_then(Pick::Save(format!("{stem}-edited.laz")), |app, path| start_laz_export(app, path, None))
+            app.pick_then(Pick::Save(format!("{stem}-edited.laz")), start_laz_export)
                 .unwrap_or_else(|| no_picker(app, id, r#"pointcloud.export {"path":"edited.laz"}"#))
         }
         "pointcloud.copybase" => start_cloud_copy(app),
@@ -114,7 +114,7 @@ fn save_selected_objects(app: &mut CadApp, handles: Vec<cadcraft_doc::Handle>) -
     .unwrap_or_else(|| no_picker(app, "export.selection", r#"export.selection {"path":"selection.dwg"}"#))
 }
 
-/// Bind the LAZ copy to the selected volume and the base point prompt in its drawing.
+/// Bind the copy to the selected volume and the base point prompt in its drawing.
 pub(crate) struct CloudCopyRequest {
     document: u64,
     command: u64,
@@ -130,7 +130,7 @@ fn start_cloud_copy(app: &mut CadApp) -> Result<Value, String> {
     let region = state.cloud_selection.ok_or_else(|| crate::i18n::t("Select point cloud points before copying.").to_owned())?;
     app.session.start(id).map_err(|e| e.to_string())?;
     app.cloud_copy = Some(CloudCopyRequest { document, command: app.session.commands_started, region });
-    app.set_status(crate::i18n::t("Specify the base point for the new LAZ file."));
+    app.set_status(crate::i18n::t("Specify the base point for the copied CAD points."));
     Ok(Value::Null)
 }
 
@@ -141,26 +141,65 @@ pub(crate) fn finish_cloud_copy(app: &mut CadApp) {
         return;
     }
     let finished = same_command && app.session.last_finished.is_some_and(|(command, _)| command == pending.command);
-    let copy = CloudCopy { region: pending.region, base: app.session.last_point3() };
+    let region = pending.region;
     app.cloud_copy = None;
-    if !finished {
-        return;
-    }
-    let stem = drawing_stem(app);
-    let result = app
-        .pick_then(Pick::Save(format!("{stem}-selection.laz")), move |app, path| start_laz_export(app, path, Some(copy)))
-        .unwrap_or_else(|| no_picker(app, "pointcloud.copybase", r#"pointcloud.copybase {"path":"selection.laz","base":[0,0,0]}"#));
-    if let Err(error) = result {
+    if finished && let Err(error) = read_cloud_copy(app, region) {
         app.set_status(error);
     }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn start_laz_export(app: &mut CadApp, path: String, copy: Option<CloudCopy>) -> Result<Value, String> {
+fn read_cloud_copy(app: &mut CadApp, region: CloudRegion) -> Result<(), String> {
+    if app.cloud_copy_job.is_some() {
+        return Err(crate::i18n::t("A point cloud copy is already running.").into());
+    }
+    let job = cadcraft_engine::cmd::file::cloud_copy::prepare(&app.session, region, app.session.last_point3()).map_err(|e| e.to_string())?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("cadcraft-cloud-copy".into())
+        .spawn(move || {
+            let _ = sender.send(job.read().map_err(|error| error.to_string()));
+        })
+        .map_err(|e| e.to_string())?;
+    app.cloud_copy_job = Some(receiver);
+    app.set_status(crate::i18n::t("Copying CAD points..."));
+    Ok(())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn read_cloud_copy(_app: &mut CadApp, _region: CloudRegion) -> Result<(), String> {
+    Err(crate::i18n::t("Copying cloud points requires the desktop app.").into())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn poll_cloud_copy(app: &mut CadApp, ctx: &egui::Context) {
+    use std::sync::mpsc::TryRecvError;
+    let Some(receiver) = &app.cloud_copy_job else { return };
+    let copied = match receiver.try_recv() {
+        Ok(result) => result.and_then(|copy| copy.apply(&mut app.session).map_err(|error| error.to_string())),
+        Err(TryRecvError::Disconnected) => Err(crate::i18n::t("Point cloud copying stopped.").into()),
+        Err(TryRecvError::Empty) => {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            return;
+        }
+    };
+    app.cloud_copy_job = None;
+    let message = copied.map_or_else(
+        |error| error,
+        |count| {
+            crate::i18n::t("Copied {count} CAD points. Use Paste to Original Coordinates in another drawing.").replace("{count}", &count.to_string())
+        },
+    );
+    app.session.echo(message.clone());
+    app.set_status(message);
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn start_laz_export(app: &mut CadApp, path: String) -> Result<Value, String> {
     if app.laz_export.is_some() {
         return Err(crate::i18n::t("A point cloud export is already running.").into());
     }
-    let job = cadcraft_engine::cmd::file::cloud_export::prepare(&app.session, &path, copy).map_err(|e| e.to_string())?;
+    let job = cadcraft_engine::cmd::file::cloud_export::prepare(&app.session, &path).map_err(|e| e.to_string())?;
     let (sender, receiver) = std::sync::mpsc::channel();
     std::thread::Builder::new()
         .name("cadcraft-laz-export".into())
@@ -174,7 +213,7 @@ fn start_laz_export(app: &mut CadApp, path: String, copy: Option<CloudCopy>) -> 
 }
 
 #[cfg(target_arch = "wasm32")]
-fn start_laz_export(_app: &mut CadApp, _path: String, _copy: Option<CloudCopy>) -> Result<Value, String> {
+fn start_laz_export(_app: &mut CadApp, _path: String) -> Result<Value, String> {
     Err(crate::i18n::t("LAZ export requires the desktop app or CLI.").into())
 }
 

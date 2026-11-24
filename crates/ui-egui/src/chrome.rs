@@ -510,6 +510,8 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
         let message = message.map(String::as_str);
         #[cfg(not(target_arch = "wasm32"))]
         let message = message.or_else(|| app.laz_export.is_some().then(|| crate::i18n::t("Exporting point cloud...")));
+        #[cfg(not(target_arch = "wasm32"))]
+        let message = message.or_else(|| app.cloud_copy_job.is_some().then(|| crate::i18n::t("Copying CAD points...")));
         let readout = message.map(str::to_owned).or(coord);
         if let Some(text) = readout {
             let left = x + 8.0;

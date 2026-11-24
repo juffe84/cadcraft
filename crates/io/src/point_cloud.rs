@@ -1,5 +1,9 @@
 //! CADCraft's import policy on top of the Rust LAS/LAZ decoder.
 #[cfg(not(target_arch = "wasm32"))]
+mod copy;
+#[cfg(not(target_arch = "wasm32"))]
+pub use copy::read_selection;
+#[cfg(not(target_arch = "wasm32"))]
 mod export;
 #[cfg(not(target_arch = "wasm32"))]
 pub use export::export_laz;

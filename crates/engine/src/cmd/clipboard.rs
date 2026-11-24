@@ -14,13 +14,13 @@ use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use cadcraft_doc::{Block, Drawing, Entity, EntityKind, HVal, Handle};
-use cadcraft_geom::{Mat3, Vec2};
+use cadcraft_geom::{Mat3, Vec2, Vec3};
 
 use super::{bad, has_doc};
 use crate::{Result, Session};
 
 /// More objects than this aren't mirrored to (or read from) the system clipboard.
-const MAX_SYSTEM_OBJECTS: usize = 50_000;
+pub(crate) const MAX_SYSTEM_OBJECTS: usize = 50_000;
 /// Bounds the walk through nested block references.
 const MAX_WALK: usize = 5_000_000;
 
@@ -34,21 +34,28 @@ pub struct ClipSource {
     pub defs: Arc<Drawing>,
     /// Counts copies, so a front end mirrors each new clipboard to the system clipboard once.
     pub serial: u64,
+    /// Original base height written to the system clipboard alongside X and Y.
+    base_z: f64,
 }
 
 /// Put copies of `ents` from the active drawing on the clipboard, with `base` as base point.
 pub(crate) fn copy(s: &mut Session, ents: Vec<Entity>, base: Vec2) -> Result<()> {
     let uid = s.state()?.uid;
     let defs = defs_for(s.doc()?, &ents);
-    set(s, ents, base, defs, Some(uid));
+    set(s, ents, base.to3(0.0), defs, Some(uid));
     Ok(())
 }
 
-fn set(s: &mut Session, ents: Vec<Entity>, base: Vec2, defs: Drawing, uid: Option<u64>) {
+pub(crate) fn copy_from(s: &mut Session, drawing: &Drawing, uid: u64, ents: Vec<Entity>, base: Vec3) {
+    let defs = defs_for(drawing, &ents);
+    set(s, ents, base, defs, Some(uid));
+}
+
+fn set(s: &mut Session, ents: Vec<Entity>, base: Vec3, defs: Drawing, uid: Option<u64>) {
     let serial = s.clipboard_source.as_ref().map_or(0, |c| c.serial).wrapping_add(1);
     s.clipboard = ents;
-    s.clipboard_base = base;
-    s.clipboard_source = Some(ClipSource { uid, defs: Arc::new(defs), serial });
+    s.clipboard_base = base.xy();
+    s.clipboard_source = Some(ClipSource { uid, defs: Arc::new(defs), serial, base_z: base.z });
 }
 
 /// Enabled check of PASTECLIP and PASTEBLOCK: something to paste.
@@ -138,7 +145,7 @@ pub fn system_text(s: &Session) -> Option<String> {
         }
         None => BTreeMap::new(),
     };
-    d.header.set("INSBASE", HVal::Point(s.clipboard_base.to3(0.0)));
+    d.header.set("INSBASE", HVal::Point(s.clipboard_base.to3(s.clipboard_source.as_ref().map_or(0.0, |source| source.base_z))));
     for e in &s.clipboard {
         let e = adopt(&mut d, e, &renames);
         d.ensure_layer(&e.common.layer);
@@ -162,7 +169,7 @@ pub fn load_system_text(s: &mut Session, text: &str) -> bool {
         return false;
     }
     let ents: Vec<Entity> = src.model.iter().map(|e| (**e).clone()).collect();
-    let base = src.header.point("INSBASE").map(|p| p.xy()).filter(|p| p.is_finite()).unwrap_or(Vec2::ZERO);
+    let base = src.header.point("INSBASE").filter(|p| p.is_finite()).unwrap_or(Vec3::ZERO);
     let defs = defs_for(&src, &ents);
     set(s, ents, base, defs, None);
     true

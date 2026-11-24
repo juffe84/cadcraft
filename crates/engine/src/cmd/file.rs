@@ -121,6 +121,7 @@ fn proxies_lost(d: &Drawing, version: Version) -> std::collections::BTreeMap<Str
     }
 }
 
+pub mod cloud_copy;
 pub mod cloud_export;
 /// COMPARE (drawing comparison).
 pub mod compare;

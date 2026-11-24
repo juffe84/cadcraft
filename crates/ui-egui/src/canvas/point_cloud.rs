@@ -75,7 +75,7 @@ fn controls(app: &mut CadApp, ui: &mut egui::Ui) {
             let label = "Copy Cloud Points with Base Point...";
             let copy = ui
                 .button(crate::i18n::t(label))
-                .on_hover_text(crate::i18n::t("Save the selected points to a new LAZ with the base point at its origin."));
+                .on_hover_text(crate::i18n::t("Copy the selected points as CAD objects for pasting into another drawing."));
             crate::control::record_widget(ui, &copy, label, "button", None);
             if copy.clicked() {
                 app.start("pointcloud.copybase");
@@ -853,13 +853,11 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn copy_with_base_point_accepts_xyz_and_snaps_to_cloud_height() {
-        use std::{cell::RefCell, rc::Rc};
-
         cadcraft_engine::cmd::file::set_point_cloud_reader(|input, step, progress| {
             cadcraft_io::point_cloud::read_with_overview_progress(input, step, None, progress).map_err(|error| error.to_string())
         });
-        cadcraft_engine::cmd::file::cloud_export::set_writer(|input, output, removals, copy| {
-            cadcraft_io::point_cloud::export_laz(input, output, removals, copy).map_err(|error| error.to_string())
+        cadcraft_engine::cmd::file::cloud_copy::set_reader(|input, region, removals, limit| {
+            cadcraft_io::point_cloud::read_selection(input, region, removals, limit).map_err(|error| error.to_string())
         });
         let source = std::env::temp_dir().join(format!("cadcraft-copy-base-{}.las", std::process::id()));
         // Three authored LAS 1.2 format-0 points; the middle one is on the centre pixel.
@@ -888,15 +886,8 @@ mod tests {
             if orbit {
                 session.execute("3dorbit", &json!({ "view": "top", "fit": true })).unwrap();
             }
-            let asked = Rc::new(RefCell::new(Vec::new()));
-            let picked = asked.clone();
-            let services = crate::Services {
-                pick_save: Some(Box::new(move |name| {
-                    picked.borrow_mut().push(name.to_owned());
-                    None
-                })),
-                ..Default::default()
-            };
+            let services =
+                crate::Services { pick_save: Some(Box::new(|_| panic!("copying points must not show a save dialog"))), ..Default::default() };
             let app = CadApp::new(session, services);
             let mut harness = egui_kittest::Harness::builder().with_size(vec2(900.0, 500.0)).build_ui_state(
                 |ui, app: &mut CadApp| {
@@ -927,8 +918,18 @@ mod tests {
             harness.run();
             assert_eq!(harness.state().session.last_point3(), base);
             assert!(harness.state().session.state().unwrap().cloud_selection.is_some());
-            assert_eq!(asked.borrow().len(), 1);
-            assert!(asked.borrow()[0].ends_with("-selection.laz"));
+            let app = harness.state_mut();
+            // The copy is bound to the source even if a new drawing is opened before it finishes.
+            app.session.new_drawing(true);
+            let result = app.cloud_copy_job.as_ref().unwrap().recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            let (send, receive) = std::sync::mpsc::channel();
+            send.send(result).unwrap();
+            app.cloud_copy_job = Some(receive);
+            crate::exchange::poll_cloud_copy(app, &egui::Context::default());
+            assert_eq!(app.session.clipboard.len(), 1, "{:?}", app.session.log);
+            app.session.execute("pasteorig", &json!({})).unwrap();
+            let pasted = app.session.doc().unwrap().model.iter().next().unwrap();
+            assert!(matches!(&pasted.kind, cadcraft_doc::EntityKind::Point(point) if point.p == Vec3::new(0.0, 0.0, 32.0)));
         }
         std::fs::remove_file(source).unwrap();
     }

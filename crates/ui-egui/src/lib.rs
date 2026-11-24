@@ -305,6 +305,8 @@ pub struct CadApp {
     selection_export: Option<exchange::SelectionExport>,
     cloud_copy: Option<exchange::CloudCopyRequest>,
     #[cfg(not(target_arch = "wasm32"))]
+    cloud_copy_job: Option<Receiver<Result<cadcraft_engine::cmd::file::cloud_copy::ReadyCopy, String>>>,
+    #[cfg(not(target_arch = "wasm32"))]
     laz_export: Option<Receiver<Result<Value, String>>>,
     pub integrated_titlebar: bool,
     control_rx: Option<Receiver<ControlRequest>>,
@@ -403,6 +405,8 @@ impl CadApp {
             opening: opening::Opening::default(),
             selection_export: None,
             cloud_copy: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            cloud_copy_job: None,
             #[cfg(not(target_arch = "wasm32"))]
             laz_export: None,
             integrated_titlebar: false,
@@ -949,6 +953,8 @@ impl CadApp {
         self.finish_opening();
         exchange::finish_selection_export(self);
         exchange::finish_cloud_copy(self);
+        #[cfg(not(target_arch = "wasm32"))]
+        exchange::poll_cloud_copy(self, ctx);
         #[cfg(not(target_arch = "wasm32"))]
         exchange::poll_laz_export(self, ctx);
         // Finishing an open switches to the new drawing.
