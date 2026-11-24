@@ -789,7 +789,11 @@ impl CadApp {
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            self.opening.start(path);
+            if cadcraft_doc::Format::from_path(path).is_some_and(cadcraft_doc::Format::is_point_cloud) {
+                self.opening.queue_cloud(path);
+            } else {
+                self.opening.start(path);
+            }
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -987,11 +991,11 @@ impl CadApp {
         ctx.request_repaint_of(egui::ViewportId::ROOT);
     }
 
-    /// Whether a modal dialog is up: the "Save changes?" prompt, the lossy-save warning or Drawing Recovery. The
-    /// floating panels' own OS windows take no input meanwhile (egui's `Modal` blocks only the
+    /// Whether a modal dialog is up. Floating panels' own OS windows take no input meanwhile
+    /// (egui's `Modal` blocks only the
     /// main window). The app's other dialogs are ordinary windows that leave the drawing usable.
     pub fn shows_modal(&self) -> bool {
-        self.close_prompt().is_some() || self.save_loss.is_some() || !self.recovery.items.is_empty()
+        self.close_prompt().is_some() || self.save_loss.is_some() || !self.recovery.items.is_empty() || self.opening.prompting()
     }
 
     /// Input hook: refresh the raw surface snapshot, put in keys forwarded from floating panels'
@@ -1168,6 +1172,8 @@ impl CadApp {
             }
         });
         self.opening.show(ui.ctx());
+        #[cfg(not(target_arch = "wasm32"))]
+        opening::cloud_prompt(self, ui.ctx());
         #[cfg(not(target_arch = "wasm32"))]
         updates_ui::show(self, ui.ctx());
         dialogs::show(self, ui.ctx());

@@ -1,5 +1,5 @@
 //! A bounded, replaceable cache for the most recently indexed desktop point cloud.
-use super::{BlockExtent, CloudPoint, OVERVIEW_BUDGET, PointCloud, STRIPE_POINTS, Source};
+use super::{BlockExtent, CloudPoint, PointCloud, STRIPE_POINTS, Source};
 use cadcraft_geom::{Bounds2, Vec2, Vec3};
 use std::fs::{self, File, OpenOptions};
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -16,11 +16,12 @@ const MAX_BYTES: usize = 192 << 20;
 pub(super) struct IndexCache {
     path: PathBuf,
     fingerprint: u64,
+    stride: usize,
 }
 
 impl IndexCache {
-    pub(super) fn new(directory: &Path, source: &File) -> Option<Self> {
-        Some(Self { path: directory.join("index-v1.bin"), fingerprint: fingerprint(source)? })
+    pub(super) fn new(directory: &Path, source: &File, stride: usize) -> Option<Self> {
+        Some(Self { path: directory.join("index-v1.bin"), fingerprint: fingerprint(source, stride)?, stride })
     }
 
     pub(super) fn load(&self, source: &Source) -> Option<(Vec<BlockExtent>, Vec<CloudPoint>)> {
@@ -37,12 +38,12 @@ impl IndexCache {
         let count = usize::try_from(integer(&header[16..])).ok()?;
         let stripe_counts = source.entries.iter().map(|entry| entry.point_count.div_ceil(STRIPE_POINTS as u64) as usize);
         let index_bytes = stripe_counts.clone().sum::<usize>() * STRIPE_SIZE;
-        if count == 0 || count > OVERVIEW_BUDGET || len != HEADER_SIZE + index_bytes + count * POINT_SIZE || len > MAX_BYTES {
+        if count as u64 != source.count.div_ceil(self.stride as u64) || len != HEADER_SIZE + index_bytes + count * POINT_SIZE || len > MAX_BYTES {
             return None;
         }
         let mut payload = vec![0; len - HEADER_SIZE];
         file.read_exact(&mut payload).ok()?;
-        if checksum(&payload) != integer(&header[24..]) || fingerprint(source.file.get_ref())? != self.fingerprint {
+        if checksum(&payload) != integer(&header[24..]) || fingerprint(source.file.get_ref(), self.stride)? != self.fingerprint {
             return None;
         }
         let (bounds, points) = payload.split_at(index_bytes);
@@ -85,7 +86,7 @@ impl IndexCache {
     fn save(&self, source: &File, index: &[BlockExtent], overview: &PointCloud) -> std::io::Result<()> {
         let points = overview.points();
         let len = index.iter().map(|block| block.stripes.len() * STRIPE_SIZE).sum::<usize>() + points.len() * POINT_SIZE;
-        if len > MAX_BYTES - HEADER_SIZE || fingerprint(source) != Some(self.fingerprint) {
+        if len > MAX_BYTES - HEADER_SIZE || fingerprint(source, self.stride) != Some(self.fingerprint) {
             return Ok(());
         }
         let mut payload = Vec::with_capacity(len);
@@ -133,11 +134,12 @@ impl IndexCache {
     }
 }
 
-fn fingerprint(file: &File) -> Option<u64> {
+fn fingerprint(file: &File, stride: usize) -> Option<u64> {
     let metadata = file.metadata().ok()?;
     let mut hash = DefaultHasher::new();
     metadata.len().hash(&mut hash);
     metadata.modified().ok()?.hash(&mut hash);
+    stride.hash(&mut hash);
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -188,7 +190,7 @@ mod tests {
         let mut source = Source::new(file, &header, None).unwrap();
         let index: Vec<_> = source.read_blocks(&[0]).unwrap().iter().map(BlockExtent::new).collect();
         let overview = source.cloud(vec![point]);
-        let cache = IndexCache::new(&directory, source.file.get_ref()).unwrap();
+        let cache = IndexCache::new(&directory, source.file.get_ref(), 1).unwrap();
         cache.save(source.file.get_ref(), &index, &overview).unwrap();
         let (restored, points) = cache.load(&source).unwrap();
         assert_eq!(points, overview.points());

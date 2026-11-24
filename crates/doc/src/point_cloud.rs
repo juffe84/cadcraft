@@ -134,6 +134,7 @@ pub struct DetailOptions {
     pub radius: f64,
     pub radius_factor: f64,
     pub batch_points: u32,
+    pub block_points: u32,
 }
 
 impl DetailOptions {
@@ -142,7 +143,12 @@ impl DetailOptions {
     pub const MIN_RADIUS_FACTOR: f64 = 0.01;
     pub const MIN_BATCH_POINTS: u32 = 10_000;
     pub const MAX_BATCH_POINTS: u32 = 2_000_000;
+    pub const MIN_BLOCK_POINTS: u32 = 50_000;
+    pub const MAX_BLOCK_POINTS: u32 = 2_000_000;
 }
+
+/// Zero leaves the overview density to the reader. Otherwise retain every Nth source point.
+pub const MAX_PREVIEW_STEP: u16 = 1_000;
 
 pub trait CloudDetails: std::fmt::Debug + std::panic::RefUnwindSafe + Send + Sync {
     /// Request more detail without blocking the caller.

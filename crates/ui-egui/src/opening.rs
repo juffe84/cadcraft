@@ -3,11 +3,13 @@
 //! a spinner and the elapsed time and keeps painting. The finished drawing is added to the session
 //! on the UI thread. The web build has no threads and opens synchronously.
 
+#[cfg(not(target_arch = "wasm32"))]
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
-use cadcraft_engine::cmd::file::{ReadFile, read_file};
+use cadcraft_engine::cmd::file::{ReadFile, read_file_with_preview};
 
 use crate::theme::Tokens;
 
@@ -23,15 +25,34 @@ struct Job {
 #[derive(Default)]
 pub struct Opening {
     jobs: Vec<Job>,
+    #[cfg(not(target_arch = "wasm32"))]
+    clouds: VecDeque<PathBuf>,
+    #[cfg(not(target_arch = "wasm32"))]
+    cloud_prompt: Option<CloudPrompt>,
+    #[cfg(not(target_arch = "wasm32"))]
+    restore_focus: Option<egui::Id>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct CloudPrompt {
+    step: u16,
+    radius: f64,
+    block_points: u32,
+    previous_focus: Option<egui::Id>,
+    focused: bool,
 }
 
 impl Opening {
     /// Start reading `path` on a worker thread.
     pub fn start(&mut self, path: &Path) {
+        self.start_with_preview(path, 0);
+    }
+
+    fn start_with_preview(&mut self, path: &Path, step: u16) {
         let (tx, rx) = channel();
         let p = path.to_path_buf();
         let spawned = std::thread::Builder::new().name("cadcraft-open".into()).spawn(move || {
-            let _ = tx.send(read_file(&p));
+            let _ = tx.send(read_file_with_preview(&p, step));
         });
         if spawned.is_err() {
             // No thread to read on: report it like any other failed open.
@@ -41,6 +62,20 @@ impl Opening {
             return;
         }
         self.jobs.push(Job { path: path.to_path_buf(), started: Instant::now(), rx });
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn queue_cloud(&mut self, path: &Path) {
+        self.clouds.push_back(path.to_path_buf());
+    }
+
+    pub(crate) fn prompting(&self) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            !self.clouds.is_empty()
+        }
+        #[cfg(target_arch = "wasm32")]
+        false
     }
 
     /// Whether any file is still being read.
@@ -99,6 +134,92 @@ impl Opening {
     }
 }
 
+pub(crate) fn detail_controls(ui: &mut egui::Ui, radius: &mut f64, block_points: &mut u32) -> bool {
+    use cadcraft_doc::point_cloud::DetailOptions;
+    let label = "Load radius (×)";
+    let radius = ui.add(egui::Slider::new(radius, 0.0..=DetailOptions::MAX_RADIUS_FACTOR).step_by(0.01).text(crate::i18n::t(label)));
+    crate::control::record_widget(ui, &radius, label, "slider", None);
+    let label = "Loading block size (k points)";
+    let max = DetailOptions::MAX_BLOCK_POINTS / 1_000;
+    let mut thousands = *block_points / 1_000;
+    let block = ui.add(egui::Slider::new(&mut thousands, 0..=max).step_by(50.0).text(crate::i18n::t(label)));
+    crate::control::record_widget(ui, &block, label, "slider", None);
+    if block.changed() {
+        *block_points = thousands * 1_000;
+    }
+    radius.changed() || block.changed()
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn cloud_prompt(app: &mut crate::CadApp, ctx: &egui::Context) {
+    use crate::i18n::t;
+    let modal_id = egui::Id::unique("cc_point_cloud_open");
+    let Some(path) = app.opening.clouds.front() else {
+        if let Some(id) = app.opening.restore_focus {
+            // The previous frame's modal layer can still disable the opener.
+            let layer = ctx.memory(|mem| mem.top_modal_layer());
+            if layer.is_none() {
+                ctx.memory_mut(|mem| mem.request_focus(id));
+                app.opening.restore_focus = None;
+            } else if layer == Some(egui::Modal::default_area(modal_id).layer()) {
+                ctx.request_repaint();
+            }
+        }
+        return;
+    };
+    let settings = &app.session.settings;
+    let prior_focus = &mut app.opening.restore_focus;
+    let prompt = app.opening.cloud_prompt.get_or_insert_with(|| CloudPrompt {
+        step: if settings.point_cloud_preview_step == 0 { 100 } else { settings.point_cloud_preview_step },
+        radius: settings.point_cloud_radius_factor,
+        block_points: settings.point_cloud_block_points,
+        previous_focus: prior_focus.take().or_else(|| ctx.memory(|mem| mem.focused())),
+        focused: false,
+    });
+    let mut open = false;
+    let mut cancel = false;
+    let modal = crate::modal::instant(ctx, modal_id).show(ctx, |ui| {
+        ui.set_min_width(340.0);
+        ui.heading(t("Open point cloud"));
+        ui.label(path.file_name().unwrap_or(path.as_os_str()).to_string_lossy());
+        let label = "Preview interval";
+        let step = ui.add(egui::Slider::new(&mut prompt.step, 1..=cadcraft_doc::point_cloud::MAX_PREVIEW_STEP).logarithmic(true).text(t(label)));
+        crate::control::record_widget(ui, &step, label, "slider", None);
+        if !prompt.focused {
+            step.request_focus();
+            prompt.focused = true;
+        }
+        ui.label(t("1 loads all points. 1000 keeps every thousandth point in the preview."));
+        ui.add_enabled_ui(prompt.step != 1, |ui| {
+            detail_controls(ui, &mut prompt.radius, &mut prompt.block_points);
+        });
+        ui.horizontal(|ui| {
+            let button = ui.button(t("Open"));
+            crate::control::record_widget(ui, &button, "Open", "button", None);
+            open = button.clicked();
+            let button = ui.button(t("Cancel"));
+            crate::control::record_widget(ui, &button, "Cancel", "button", None);
+            cancel = button.clicked();
+        });
+    });
+    if (open || cancel || modal.should_close())
+        && let Some(path) = app.opening.clouds.pop_front()
+    {
+        let choice = (prompt.step, prompt.radius, prompt.block_points);
+        app.opening.restore_focus = prompt.previous_focus;
+        app.opening.cloud_prompt = None;
+        if open {
+            let (step, radius, block_points) = choice;
+            let params = serde_json::json!({"previewStep":step, "detailRadiusFactor":radius, "blockPoints":block_points});
+            match app.run("pointcloud.settings", params) {
+                Ok(_) => app.opening.start_with_preview(&path, step),
+                Err(error) => app.open_failed(error),
+            }
+        }
+        ctx.request_repaint();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -107,6 +228,36 @@ mod tests {
     use cadcraft_engine::Session;
 
     use crate::{CadApp, Services};
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn point_cloud_open_takes_focus_and_escape_returns_without_reading() {
+        use egui_kittest::kittest::Queryable;
+
+        let app = CadApp::new(Session::new(), Services::default());
+        let mut harness = egui_kittest::Harness::builder().build_ui_state(
+            |ui, app: &mut CadApp| {
+                if ui.button("Choose file").clicked() {
+                    app.open_path(Path::new("cloud.laz"));
+                }
+                super::cloud_prompt(app, ui.ctx());
+            },
+            app,
+        );
+        let opener = harness.get_by_label("Choose file");
+        opener.focus();
+        harness.run();
+        harness.key_press(egui::Key::Enter);
+        harness.run();
+
+        assert!(harness.get_by_role_and_label(egui::Role::Slider, "Preview interval").is_focused());
+        assert!(!harness.state().opening.busy(), "the read must wait for a choice");
+        harness.key_press(egui::Key::Escape);
+        harness.run();
+        assert!(harness.state().opening.clouds.is_empty());
+        assert!(!harness.state().opening.busy());
+        assert!(harness.get_by_label("Choose file").is_focused());
+    }
 
     /// Opening starts in the background (the UI is not blocked), shows the card, and a file that
     /// cannot be read is reported like a failed OPEN without adding a drawing.

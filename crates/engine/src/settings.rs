@@ -11,6 +11,8 @@ pub struct Settings {
     pub point_cloud_detail_radius: f64,
     pub point_cloud_radius_factor: f64,
     pub point_cloud_batch_points: u32,
+    pub point_cloud_block_points: u32,
+    pub point_cloud_preview_step: u16,
     pub orthomode: bool,
     pub polarmode: bool,
     /// POLARANG (radians).
@@ -152,8 +154,10 @@ impl Default for Settings {
             point_cloud_size: 1.5,
             point_cloud_snap: true,
             point_cloud_detail_radius: 0.0,
-            point_cloud_radius_factor: 0.0,
+            point_cloud_radius_factor: 0.1,
             point_cloud_batch_points: 0,
+            point_cloud_block_points: 50_000,
+            point_cloud_preview_step: 0,
             orthomode: false,
             polarmode: true,
             polarang: std::f64::consts::FRAC_PI_2,
@@ -225,6 +229,7 @@ impl Settings {
             radius: self.point_cloud_detail_radius,
             radius_factor: self.point_cloud_radius_factor,
             batch_points: self.point_cloud_batch_points,
+            block_points: self.point_cloud_block_points,
         }
     }
 }

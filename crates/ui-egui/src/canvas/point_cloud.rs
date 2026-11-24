@@ -64,21 +64,9 @@ fn controls(app: &mut CadApp, ui: &mut egui::Ui) {
         if streaming {
             ui.menu_button(crate::i18n::t("Detail loading"), |ui| {
                 let mut radius = app.session.settings.point_cloud_radius_factor;
-                let mut batch = app.session.settings.point_cloud_batch_points / 1_000;
-                if ui.add(egui::Slider::new(&mut radius, 0.0..=5.0).logarithmic(true).step_by(0.01).text(crate::i18n::t("Load radius (×)"))).changed()
-                {
-                    let _ = app.run("pointcloud.settings", json!({ "detailRadius": 0.0, "detailRadiusFactor": radius }));
-                }
-                if ui
-                    .add(
-                        egui::Slider::new(&mut batch, 0..=2000)
-                            .step_by(10.0)
-                            .logarithmic(true)
-                            .text(crate::i18n::t("Read batch (k points per worker)")),
-                    )
-                    .changed()
-                {
-                    let _ = app.run("pointcloud.settings", json!({ "batchPoints": batch * 1_000 }));
+                let mut block_points = app.session.settings.point_cloud_block_points;
+                if crate::opening::detail_controls(ui, &mut radius, &mut block_points) {
+                    let _ = app.run("pointcloud.settings", json!({ "detailRadiusFactor": radius, "blockPoints": block_points }));
                 }
                 ui.label(crate::i18n::t("Zero uses automatic loading. At close zoom, 0.10× loads at least 30 drawing units on each side."));
                 let absolute = app.session.settings.point_cloud_detail_radius;
@@ -86,10 +74,11 @@ fn controls(app: &mut CadApp, ui: &mut egui::Ui) {
                     ui.label(crate::i18n::t("Saved absolute radius: {radius} drawing units").replace("{radius}", &absolute.to_string()));
                 }
                 if ui.button(crate::i18n::t("Fast close-up")).clicked() {
-                    let _ = app.run("pointcloud.settings", json!({ "detailRadius": 0.0, "detailRadiusFactor": 0.02, "batchPoints": 50_000 }));
+                    let _ = app.run("pointcloud.settings", json!({ "detailRadius": 0.0, "detailRadiusFactor": 0.02, "blockPoints": 50_000 }));
                 }
                 if ui.button(crate::i18n::t("Automatic")).clicked() {
-                    let _ = app.run("pointcloud.settings", json!({ "detailRadius": 0.0, "detailRadiusFactor": 0.0, "batchPoints": 0 }));
+                    let _ =
+                        app.run("pointcloud.settings", json!({ "detailRadius": 0.0, "detailRadiusFactor": 0.0, "blockPoints": 0, "batchPoints": 0 }));
                 }
             });
         }

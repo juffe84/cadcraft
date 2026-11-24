@@ -51,7 +51,7 @@ pub fn io() -> Option<&'static IoHooks> {
 
 /// A streaming point-cloud reader, installed by native hosts.
 #[cfg(not(target_arch = "wasm32"))]
-type PointCloudReader = fn(std::io::BufReader<std::fs::File>) -> std::result::Result<Drawing, String>;
+type PointCloudReader = fn(std::io::BufReader<std::fs::File>, u16) -> std::result::Result<Drawing, String>;
 
 #[cfg(not(target_arch = "wasm32"))]
 static POINT_CLOUD_READER: OnceLock<PointCloudReader> = OnceLock::new();
@@ -243,7 +243,7 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("open", "Open...", run_open)
             .menu(&["File", "Open..."])
             .key("Cmd+O")
-            .params("{path} | {data: base64, name} → {index, entities?, warnings: what reading left out}")
+            .params("{path, previewStep?: 0–1000 for native LAS/LAZ} | {data: base64, name} → {index, entities?, warnings: what reading left out}")
             .enabled(always)
             .noundo(),
         CommandSpec::new("close", "Close", run_close).menu(&["File", "Close"]).key("Cmd+W").params("{index?}").noundo(),
@@ -350,6 +350,10 @@ pub struct ReadFile {
 
 /// Read and decode `path` (the slow half of `OPEN {path}`). Needs no session; runs anywhere.
 pub fn read_file(path: &std::path::Path) -> std::result::Result<ReadFile, String> {
+    read_file_with_preview(path, 0)
+}
+
+pub fn read_file_with_preview(path: &std::path::Path, preview_step: u16) -> std::result::Result<ReadFile, String> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let r = std::panic::catch_unwind(|| {
@@ -363,8 +367,11 @@ pub fn read_file(path: &std::path::Path) -> std::result::Result<ReadFile, String
                 && let Some(read) = POINT_CLOUD_READER.get()
             {
                 let file = crate::capped_read::open_regular(path).map_err(|e| bad("open", format!("{shown}: {e}")))?;
-                let drawing = read(std::io::BufReader::new(file)).map_err(|e| bad("open", format!("{shown}: {e}")))?;
+                let drawing = read(std::io::BufReader::new(file), preview_step).map_err(|e| bad("open", format!("{shown}: {e}")))?;
                 return Ok(ReadFile { drawing, binary_dxf: false, name: text_path.to_string(), path: None });
+            }
+            if preview_step != 0 {
+                return Err(bad("open", "previewStep requires the native LAS/LAZ reader"));
             }
             let bytes = crate::capped_read::read_capped(path, MAX_DRAWING_BYTES).map_err(|e| bad("open", format!("{shown}: {e}")))?;
             read_bytes(&bytes, text_path, Some(text_path.to_string()))
@@ -376,9 +383,17 @@ pub fn read_file(path: &std::path::Path) -> std::result::Result<ReadFile, String
     }
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = path;
+        let _ = (path, preview_step);
         Err(bad("open", "paths are not available on the web; pass `data`").to_string())
     }
+}
+
+pub(crate) fn cloud_preview_step(value: &Value, command: &str) -> Result<u16> {
+    value
+        .as_u64()
+        .and_then(|step| u16::try_from(step).ok())
+        .filter(|&step| step <= cadcraft_doc::point_cloud::MAX_PREVIEW_STEP)
+        .ok_or_else(|| bad(command, "previewStep must be an integer between 0 and 1000"))
 }
 
 /// Add a [`read_file`] result to the session as the active drawing: the fast half of OPEN.
@@ -454,14 +469,19 @@ fn opened(s: &Session, i: usize, entities: bool) -> Value {
 
 /// Open a drawing from bounded regular-file bytes or base64 data and resolve its external references.
 fn run_open(s: &mut Session, p: &Value) -> Result<Value> {
+    let preview = p.get("previewStep");
     if let Some(_path) = str_param(p, "path") {
         #[cfg(not(target_arch = "wasm32"))]
         let path = _path;
         #[cfg(not(target_arch = "wasm32"))]
         {
             if cadcraft_doc::Format::from_path(path).is_some_and(cadcraft_doc::Format::is_point_cloud) {
-                let file = read_file(std::path::Path::new(path)).map_err(EngineError::Other)?;
+                let step = preview.map(|value| cloud_preview_step(value, "open")).transpose()?.unwrap_or(s.settings.point_cloud_preview_step);
+                let file = read_file_with_preview(std::path::Path::new(path), step).map_err(EngineError::Other)?;
                 return finish_open(s, file);
+            }
+            if preview.is_some() {
+                return Err(bad("open", "previewStep applies to native LAS/LAZ paths"));
             }
             crate::file_access::check_read(path).map_err(|e| bad("open", e))?;
             let bytes =
@@ -473,6 +493,9 @@ fn run_open(s: &mut Session, p: &Value) -> Result<Value> {
         }
         #[cfg(target_arch = "wasm32")]
         return Err(bad("open", "paths are not available on the web; pass `data`"));
+    }
+    if preview.is_some() {
+        return Err(bad("open", "previewStep applies to native LAS/LAZ paths"));
     }
     let data = str_param(p, "data").ok_or_else(|| bad("open", "`path` or `data` (base64) is required"))?;
     let bytes = base64_decode(data).ok_or_else(|| bad("open", "invalid base64"))?;

@@ -483,6 +483,7 @@ impl CadApp {
                 "size": self.session.settings.point_cloud_size, "snap": self.session.settings.point_cloud_snap,
                 "detailRadius": self.session.settings.point_cloud_detail_radius,
                 "detailRadiusFactor": self.session.settings.point_cloud_radius_factor, "batchPoints": self.session.settings.point_cloud_batch_points,
+                "blockPoints": self.session.settings.point_cloud_block_points, "previewStep": self.session.settings.point_cloud_preview_step,
             },
             "timeSensitiveRightClick": self.options.time_sensitive_right_click,
             "rightClickDuration": self.options.right_click_hold_ms,

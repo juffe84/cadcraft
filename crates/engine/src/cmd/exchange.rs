@@ -72,7 +72,7 @@ pub fn specs() -> Vec<CommandSpec> {
             .transparent(),
         CommandSpec::new("pointcloud.settings", "Point cloud display", run_cloud_settings)
             .enabled(always)
-            .params("{size?: 1–12 screen points, snap?: bool, detailRadiusFactor?: 0 or 0.01–5, detailRadius?: 0–1000 drawing units, batchPoints?: 0 or 10000–2000000 per worker}; zero is automatic")
+            .params("{size?: 1–12 screen points, snap?: bool, detailRadiusFactor?: 0 or 0.01–5, detailRadius?: 0–1000 drawing units, blockPoints?: 0 or 50000–2000000, batchPoints?: 0 or 10000–2000000 per worker, previewStep?: 0–1000 for the next open}; zero is automatic")
             .noundo(),
         CommandSpec::new("pointcloud.snap", "Pick point cloud point", run_cloud_snap)
             .params("{point: [x,y], aperture: drawing units} → {point: [x,y,z] | null}")
@@ -180,6 +180,16 @@ fn run_cloud_settings(s: &mut Session, p: &Value) -> Result<Value> {
                 .ok_or_else(|| bad("pointcloud.settings", "batchPoints must be 0 or between 10000 and 2000000"))
         })
         .transpose()?;
+    let block_points = p
+        .get("blockPoints")
+        .map(|v| {
+            v.as_u64()
+                .and_then(|x| u32::try_from(x).ok())
+                .filter(|&x| x == 0 || (DetailOptions::MIN_BLOCK_POINTS..=DetailOptions::MAX_BLOCK_POINTS).contains(&x))
+                .ok_or_else(|| bad("pointcloud.settings", "blockPoints must be 0 or between 50000 and 2000000"))
+        })
+        .transpose()?;
+    let preview_step = p.get("previewStep").map(|value| super::file::cloud_preview_step(value, "pointcloud.settings")).transpose()?;
     if let Some(size) = size {
         s.settings.point_cloud_size = size as f32;
     }
@@ -199,8 +209,15 @@ fn run_cloud_settings(s: &mut Session, p: &Value) -> Result<Value> {
     if let Some(batch_points) = batch_points {
         s.settings.point_cloud_batch_points = batch_points;
     }
+    if let Some(block_points) = block_points {
+        s.settings.point_cloud_block_points = block_points;
+    }
+    if let Some(preview_step) = preview_step {
+        s.settings.point_cloud_preview_step = preview_step;
+    }
     Ok(json!({ "size": s.settings.point_cloud_size, "snap": s.settings.point_cloud_snap,
-        "detailRadius": s.settings.point_cloud_detail_radius, "detailRadiusFactor": s.settings.point_cloud_radius_factor, "batchPoints": s.settings.point_cloud_batch_points }))
+        "detailRadius": s.settings.point_cloud_detail_radius, "detailRadiusFactor": s.settings.point_cloud_radius_factor,
+        "batchPoints": s.settings.point_cloud_batch_points, "blockPoints": s.settings.point_cloud_block_points, "previewStep": s.settings.point_cloud_preview_step }))
 }
 
 fn run_cloud_snap(s: &mut Session, p: &Value) -> Result<Value> {
