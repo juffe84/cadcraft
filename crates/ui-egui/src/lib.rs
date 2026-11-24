@@ -302,6 +302,7 @@ pub struct CadApp {
     pub status: Option<(String, f64)>,
     /// Drawings being read on worker threads ([`opening`]).
     pub opening: opening::Opening,
+    selection_export: Option<exchange::SelectionExport>,
     #[cfg(not(target_arch = "wasm32"))]
     laz_export: Option<Receiver<Result<Value, String>>>,
     pub integrated_titlebar: bool,
@@ -399,6 +400,7 @@ impl CadApp {
             cmd: cmdline::CmdLine::default(),
             status: None,
             opening: opening::Opening::default(),
+            selection_export: None,
             #[cfg(not(target_arch = "wasm32"))]
             laz_export: None,
             integrated_titlebar: false,
@@ -943,6 +945,7 @@ impl CadApp {
         self.drain_control(ctx);
         self.finish_pick(ctx);
         self.finish_opening();
+        exchange::finish_selection_export(self);
         #[cfg(not(target_arch = "wasm32"))]
         exchange::poll_laz_export(self, ctx);
         // Finishing an open switches to the new drawing.

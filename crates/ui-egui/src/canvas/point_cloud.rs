@@ -80,6 +80,12 @@ fn controls(app: &mut CadApp, ui: &mut egui::Ui) {
                 let _ = app.run("erase.selection", json!({}));
             }
         }
+        let label = "Export LAZ...";
+        let export = ui.button(crate::i18n::t(label)).on_hover_text(crate::i18n::t("Save the edited point cloud as a full-resolution LAZ file."));
+        crate::control::record_widget(ui, &export, label, "button", None);
+        if export.clicked() {
+            app.start("pointcloud.export");
+        }
         if streaming {
             ui.menu_button(crate::i18n::t("Detail loading"), |ui| {
                 let mut radius = app.session.settings.point_cloud_radius_factor;
@@ -830,6 +836,69 @@ mod tests {
     use cadcraft_engine::Session;
     use egui_kittest::kittest::{NodeT, Queryable};
     use std::sync::Arc;
+
+    #[test]
+    fn cloud_toolbar_exposes_laz_export_and_dwg_export_can_pick_cad_in_both_views() {
+        use std::{cell::RefCell, rc::Rc};
+
+        let extent = Vec3::new(20.0, 20.0, 10.0);
+        let samples = [-extent, extent].map(|position| CloudPoint { position, rgb: [255; 3], intensity: 0, classification: 0 });
+        for orbit in [false, true] {
+            let mut drawing = cadcraft_doc::Drawing {
+                point_cloud: Some(Arc::new(PointCloud::new(samples.to_vec(), samples.len() as u64, true, true))),
+                ..cadcraft_doc::Drawing::new_metric()
+            };
+            let line = cadcraft_doc::Line { a: Vec3::new(-20.0, 0.0, -5.0), b: Vec3::new(20.0, 0.0, 5.0) };
+            let handle = drawing.add(&Space::Model, Default::default(), cadcraft_doc::EntityKind::Line(line)).unwrap();
+            let mut session = Session::empty();
+            session.open_drawing(drawing, "Survey", None);
+            session.execute("pointcloud.select", &json!({ "enabled": true })).unwrap();
+            if orbit {
+                session.execute("3dorbit", &json!({ "view": "top", "fit": true })).unwrap();
+            }
+            let asked = Rc::new(RefCell::new(Vec::new()));
+            let picked = asked.clone();
+            let services = crate::Services {
+                pick_save: Some(Box::new(move |name| {
+                    picked.borrow_mut().push(name.to_owned());
+                    None
+                })),
+                ..Default::default()
+            };
+            let app = CadApp::new(session, services);
+            let mut harness = egui_kittest::Harness::builder().with_size(vec2(900.0, 500.0)).build_ui_state(
+                |ui, app: &mut CadApp| {
+                    crate::exchange::finish_selection_export(app);
+                    super::super::show(app, ui);
+                },
+                app,
+            );
+            assert!(harness.get_by_label("Export LAZ...").rect().is_positive());
+
+            harness.state_mut().start("export.selection");
+            harness.step();
+            assert!(harness.state().session.current_prompt().unwrap().accept.select);
+            assert!(asked.borrow().is_empty());
+            harness.key_press(Key::Escape);
+            harness.run();
+            assert!(asked.borrow().is_empty());
+
+            harness.state_mut().start("export.selection");
+            harness.step();
+            let at = harness.state().canvas.rect.unwrap().center();
+            harness.event(egui::Event::PointerMoved(at));
+            harness.step();
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
+                harness.step();
+            }
+            assert_eq!(harness.state().session.selection(), [handle]);
+            assert!(asked.borrow().is_empty());
+            harness.key_press(Key::Enter);
+            harness.run();
+            assert_eq!(*asked.borrow(), ["Survey-selection.dwg"]);
+        }
+    }
 
     #[test]
     fn point_cloud_rectangle_and_delete_work_in_plan_and_orbit() {

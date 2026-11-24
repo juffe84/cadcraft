@@ -12,11 +12,14 @@ use crate::{CadApp, Pick};
 /// Bumped each time PREVIEW is started, so the window renders the drawing as it is now.
 static PREVIEW_GEN: AtomicU32 = AtomicU32::new(0);
 
+fn drawing_stem(app: &CadApp) -> String {
+    let title = app.session.state().map(|s| s.title.as_str()).unwrap_or_default();
+    std::path::Path::new(title).file_stem().map(|s| s.to_string_lossy().into_owned()).filter(|s| !s.is_empty()).unwrap_or_else(|| "Drawing".into())
+}
+
 /// Handle a typed or menu-invoked file exchange command (`id` may be an alias).
 pub fn route(app: &mut CadApp, id: &str) -> Result<Value, String> {
-    let title = app.session.state().map(|s| s.title.clone()).unwrap_or_default();
-    let stem = std::path::Path::new(&title).file_stem().map(|s| s.to_string_lossy().to_string()).filter(|s| !s.is_empty());
-    let stem = stem.unwrap_or_else(|| "Drawing".into());
+    let stem = drawing_stem(app);
     match id {
         "pointcloud.export" => {
             let command = cadcraft_engine::find_command(id).ok_or_else(|| id.to_owned())?;
@@ -24,27 +27,7 @@ pub fn route(app: &mut CadApp, id: &str) -> Result<Value, String> {
             app.pick_then(Pick::Save(format!("{stem}-edited.laz")), start_laz_export)
                 .unwrap_or_else(|| no_picker(app, id, r#"pointcloud.export {"path":"edited.laz"}"#))
         }
-        "export.selection" => {
-            let handles = app.session.selection();
-            if handles.is_empty() {
-                let msg = crate::i18n::t("Select CAD objects before exporting.");
-                app.set_status(msg);
-                return Err(msg.into());
-            }
-            app.pick_then(Pick::Save(format!("{stem}-selection.dwg")), move |app, path| {
-                let result = app.run("export.selection", json!({ "path": path, "handles": handles }));
-                match &result {
-                    Ok(value) => app.set_status(if value["notSaved"].is_object() {
-                        crate::i18n::t("Exported with omissions. See the command history.")
-                    } else {
-                        crate::i18n::t("Exported selected objects.")
-                    }),
-                    Err(error) => app.set_status(error),
-                }
-                result
-            })
-            .unwrap_or_else(|| no_picker(app, id, r#"export.selection {"path":"selection.dwg"}"#))
-        }
+        "export.selection" => select_for_export(app),
         "preview" | "pre" => {
             PREVIEW_GEN.fetch_add(1, Ordering::Relaxed);
             app.ui.dialog = Some("preview".into());
@@ -60,6 +43,73 @@ pub fn route(app: &mut CadApp, id: &str) -> Result<Value, String> {
             .pick_then(Pick::Save(format!("{stem}.svg")), |app, path| app.run("export", json!({ "path": path })))
             .unwrap_or_else(|| no_picker(app, "EXPORT", r#"export {"format": "svg"}"#)),
     }
+}
+
+/// Bind an interactive SELECT to the drawing and command that requested the export.
+pub(crate) struct SelectionExport {
+    document: u64,
+    command: u64,
+}
+
+fn select_for_export(app: &mut CadApp) -> Result<Value, String> {
+    let handles = app.session.selection();
+    if !handles.is_empty() {
+        return save_selected_objects(app, handles);
+    }
+    let state = app.session.state().map_err(|e| e.to_string())?;
+    if !state.drawing().space(&state.edit_space()).is_some_and(|entities| !entities.is_empty()) {
+        let msg = if state.doc.point_cloud.is_some() {
+            crate::i18n::t("This drawing has no CAD objects to export. Use Export LAZ for the point cloud.")
+        } else {
+            crate::i18n::t("This drawing has no CAD objects to export.")
+        };
+        app.set_status(msg);
+        app.session.echo(msg);
+        return Err(msg.into());
+    }
+    let document = state.uid;
+    app.session.start("select").map_err(|e| e.to_string())?;
+    app.selection_export = Some(SelectionExport { document, command: app.session.commands_started });
+    let msg = crate::i18n::t("Select the CAD objects to export and press Enter.");
+    app.session.echo(msg);
+    app.set_status(msg);
+    Ok(Value::Null)
+}
+
+pub(crate) fn finish_selection_export(app: &mut CadApp) {
+    let Some(pending) = &app.selection_export else { return };
+    let same_command = app.session.commands_started == pending.command && app.session.state().is_ok_and(|s| s.uid == pending.document);
+    if same_command && app.session.prompting() {
+        return;
+    }
+    let finished = same_command && app.session.last_finished.is_some_and(|(command, _)| command == pending.command);
+    app.selection_export = None;
+    if !finished {
+        return;
+    }
+    let handles = app.session.selection();
+    if handles.is_empty() {
+        app.set_status(crate::i18n::t("No CAD objects were selected."));
+    } else if let Err(error) = save_selected_objects(app, handles) {
+        app.set_status(error);
+    }
+}
+
+fn save_selected_objects(app: &mut CadApp, handles: Vec<cadcraft_doc::Handle>) -> Result<Value, String> {
+    let stem = drawing_stem(app);
+    app.pick_then(Pick::Save(format!("{stem}-selection.dwg")), move |app, path| {
+        let result = app.run("export.selection", json!({ "path": path, "handles": handles }));
+        match &result {
+            Ok(value) => app.set_status(if value["notSaved"].is_object() {
+                crate::i18n::t("Exported with omissions. See the command history.")
+            } else {
+                crate::i18n::t("Exported selected objects.")
+            }),
+            Err(error) => app.set_status(error),
+        }
+        result
+    })
+    .unwrap_or_else(|| no_picker(app, "export.selection", r#"export.selection {"path":"selection.dwg"}"#))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
