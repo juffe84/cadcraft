@@ -1,5 +1,9 @@
 //! CADCraft's import policy on top of the Rust LAS/LAZ decoder.
 #[cfg(not(target_arch = "wasm32"))]
+mod export;
+#[cfg(not(target_arch = "wasm32"))]
+pub use export::export_laz;
+#[cfg(not(target_arch = "wasm32"))]
 mod progressive;
 #[cfg(not(target_arch = "wasm32"))]
 pub use progressive::{read_progressive, read_progressive_cached, read_progressive_with_preview, read_with_overview_progress};

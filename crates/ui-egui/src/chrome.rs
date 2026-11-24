@@ -507,7 +507,10 @@ pub fn status_bar(app: &mut CadApp, ui: &mut egui::Ui) {
         // A transient message occupies the same bounded readout slot as coordinates.
         // Ellipsis and a tooltip keep either value readable without covering layout tabs.
         let message = app.status.as_ref().filter(|(_, at)| crate::now_ms() - at < 5000.0).map(|(message, _)| message);
-        let readout = message.cloned().or(coord);
+        let message = message.map(String::as_str);
+        #[cfg(not(target_arch = "wasm32"))]
+        let message = message.or_else(|| app.laz_export.is_some().then(|| crate::i18n::t("Exporting point cloud...")));
+        let readout = message.map(str::to_owned).or(coord);
         if let Some(text) = readout {
             let left = x + 8.0;
             let width = (coord_right - left).max(0.0);

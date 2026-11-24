@@ -302,6 +302,8 @@ pub struct CadApp {
     pub status: Option<(String, f64)>,
     /// Drawings being read on worker threads ([`opening`]).
     pub opening: opening::Opening,
+    #[cfg(not(target_arch = "wasm32"))]
+    laz_export: Option<Receiver<Result<Value, String>>>,
     pub integrated_titlebar: bool,
     control_rx: Option<Receiver<ControlRequest>>,
     /// Fresh surface and identity snapshot (see [`capture`]).
@@ -397,6 +399,8 @@ impl CadApp {
             cmd: cmdline::CmdLine::default(),
             status: None,
             opening: opening::Opening::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            laz_export: None,
             integrated_titlebar: false,
             control_rx: None,
             capture_geometry: None,
@@ -939,6 +943,8 @@ impl CadApp {
         self.drain_control(ctx);
         self.finish_pick(ctx);
         self.finish_opening();
+        #[cfg(not(target_arch = "wasm32"))]
+        exchange::poll_laz_export(self, ctx);
         // Finishing an open switches to the new drawing.
         capture::note_identity(self, ctx);
         capture::drain(self, ctx);

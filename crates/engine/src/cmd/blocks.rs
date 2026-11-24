@@ -59,6 +59,7 @@ pub fn specs() -> Vec<CommandSpec> {
         attedit::attedit_spec(),
         attedit::dash_attedit_spec(),
         wblock::wblock_spec(),
+        wblock::export_selection_spec(),
         wblock::dash_wblock_spec(),
         CommandSpec::new("base", "Base", run_base).menu(&["Draw", "Block", "Base"]).params("{at: [x,y]}"),
         CommandSpec::new("blocks.dynamic", "Dynamic Block Data", run_dynamic)

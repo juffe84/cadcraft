@@ -19,6 +19,39 @@ pub(super) fn wblock_spec() -> CommandSpec {
     CommandSpec::new("wblock", "Write Block", run_wblock).alias(&["w"]).params("{path, name? | handles?, base?}")
 }
 
+pub(super) fn export_selection_spec() -> CommandSpec {
+    CommandSpec::new("export.selection", "Export Selected Objects...", export_selection)
+        .menu(&["File", "Export Selected Objects..."])
+        .params("{path: output .dwg or .dxf, handles?: selected CAD object handles}")
+        .noundo()
+}
+
+fn export_selection(s: &mut Session, p: &Value) -> Result<Value> {
+    const ID: &str = "export.selection";
+    if cfg!(target_arch = "wasm32") {
+        return Err(bad(ID, NO_FILES));
+    }
+    let path = str_param(p, "path").ok_or_else(|| bad(ID, "a .dwg or .dxf output path is required"))?;
+    let ext = std::path::Path::new(path).extension().and_then(|ext| ext.to_str()).unwrap_or_default();
+    if !["dwg", "dxf"].iter().any(|format| ext.eq_ignore_ascii_case(format)) {
+        return Err(bad(ID, "the output file must have a .dwg or .dxf extension"));
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    crate::file_access::check_write(path).map_err(|e| bad(ID, e))?;
+    if let Some(source) = s.state()?.path.as_ref()
+        && let (Ok(source), Ok(output)) = (std::fs::canonicalize(source), std::fs::canonicalize(path))
+        && source == output
+    {
+        return Err(bad(ID, "choose a different file name from the source drawing"));
+    }
+    let handles = targets(s, p)?;
+    let doc = s.doc()?;
+    if handles.is_empty() || handles.iter().any(|&h| doc.entity(h).is_none()) {
+        return Err(bad(ID, "select CAD objects before exporting"));
+    }
+    run_wblock(s, &json!({ "path": path, "handles": handles }))
+}
+
 /// -WBLOCK erases the objects it writes, whatever its mOde option says: AutoCAD 2024 does, and
 /// keeps "Object conversion=Delete" as the setting. OOPS brings them back, as after ERASE.
 pub(super) fn dash_wblock_spec() -> CommandSpec {
@@ -99,7 +132,7 @@ fn write(s: &Session, cmd: &str, path: &str, what: Source) -> Result<(usize, usi
         }
         Source::Objects(hs, base) => {
             let m = Mat3::translate(-base);
-            with_objects(src, hs.iter().filter_map(|h| src.entity(*h)).map(|e| moved(e, &m)))
+            with_objects(src, hs.iter().filter_map(|h| src.entity(*h)).map(|e| if base == Vec2::ZERO { (**e).clone() } else { moved(e, &m) }))
         }
     };
     let hooks = super::super::file::io().ok_or_else(|| bad(cmd, "file formats are not available in this build"))?;

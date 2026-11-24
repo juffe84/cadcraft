@@ -157,6 +157,9 @@ impl eframe::App for App {
 
 /// File format hooks for the engine (it stays I/O-agnostic).
 pub fn install_io() {
+    cadcraft_engine::cmd::file::cloud_export::set_writer(|input, output, removals| {
+        cadcraft_io::point_cloud::export_laz(input, output, removals).map_err(|e| e.to_string())
+    });
     cadcraft_engine::cmd::file::set_point_cloud_reader(|file, step, progress| {
         let cache = if cadcraft_engine::file_access::current().is_none() {
             cadcraft_engine::settings_dir::current().map(|dir| dir.join("point-cloud-cache"))
@@ -210,6 +213,7 @@ fn filters(pick: &Pick) -> Vec<(&'static str, Vec<&'static str>)> {
             (i18n::t("Point clouds (LAS, LAZ)"), vec!["las", "laz"]),
             (i18n::t("All files"), vec!["*"]),
         ],
+        Pick::Save(name) if name.to_ascii_lowercase().ends_with(".laz") => vec![(i18n::t("Point cloud (LAZ)"), vec!["laz"])],
         Pick::Save(name) => filters_for_save(name).iter().map(|(label, ext)| (i18n::t(label), vec![*ext])).collect(),
         Pick::Lisp(_) => vec![(i18n::t("AutoLISP (LSP)"), vec!["lsp"]), (i18n::t("All files"), vec!["*"])],
         Pick::Pgp(_) => vec![(i18n::t("Alias files (PGP)"), vec!["pgp"])],

@@ -24,6 +24,8 @@ pub const FILES: &[&str] = &[
     "datalinkupdate",
     "eattext",
     "export",
+    "export.selection",
+    "pointcloud.export",
     "exportpdf",
     "hatch",
     "hatch.patterns",

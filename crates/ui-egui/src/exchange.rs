@@ -18,6 +18,33 @@ pub fn route(app: &mut CadApp, id: &str) -> Result<Value, String> {
     let stem = std::path::Path::new(&title).file_stem().map(|s| s.to_string_lossy().to_string()).filter(|s| !s.is_empty());
     let stem = stem.unwrap_or_else(|| "Drawing".into());
     match id {
+        "pointcloud.export" => {
+            let command = cadcraft_engine::find_command(id).ok_or_else(|| id.to_owned())?;
+            (command.enabled)(&app.session).inspect_err(|e| app.set_status(e))?;
+            app.pick_then(Pick::Save(format!("{stem}-edited.laz")), start_laz_export)
+                .unwrap_or_else(|| no_picker(app, id, r#"pointcloud.export {"path":"edited.laz"}"#))
+        }
+        "export.selection" => {
+            let handles = app.session.selection();
+            if handles.is_empty() {
+                let msg = crate::i18n::t("Select CAD objects before exporting.");
+                app.set_status(msg);
+                return Err(msg.into());
+            }
+            app.pick_then(Pick::Save(format!("{stem}-selection.dwg")), move |app, path| {
+                let result = app.run("export.selection", json!({ "path": path, "handles": handles }));
+                match &result {
+                    Ok(value) => app.set_status(if value["notSaved"].is_object() {
+                        crate::i18n::t("Exported with omissions. See the command history.")
+                    } else {
+                        crate::i18n::t("Exported selected objects.")
+                    }),
+                    Err(error) => app.set_status(error),
+                }
+                result
+            })
+            .unwrap_or_else(|| no_picker(app, id, r#"export.selection {"path":"selection.dwg"}"#))
+        }
         "preview" | "pre" => {
             PREVIEW_GEN.fetch_add(1, Ordering::Relaxed);
             app.ui.dialog = Some("preview".into());
@@ -33,6 +60,49 @@ pub fn route(app: &mut CadApp, id: &str) -> Result<Value, String> {
             .pick_then(Pick::Save(format!("{stem}.svg")), |app, path| app.run("export", json!({ "path": path })))
             .unwrap_or_else(|| no_picker(app, "EXPORT", r#"export {"format": "svg"}"#)),
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn start_laz_export(app: &mut CadApp, path: String) -> Result<Value, String> {
+    if app.laz_export.is_some() {
+        return Err(crate::i18n::t("A point cloud export is already running.").into());
+    }
+    let job = cadcraft_engine::cmd::file::cloud_export::prepare(&app.session, &path).map_err(|e| e.to_string())?;
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("cadcraft-laz-export".into())
+        .spawn(move || {
+            let _ = sender.send(job.write().map_err(|e| e.to_string()));
+        })
+        .map_err(|e| e.to_string())?;
+    app.laz_export = Some(receiver);
+    app.set_status(crate::i18n::t("Exporting point cloud..."));
+    Ok(Value::Null)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn start_laz_export(_app: &mut CadApp, _path: String) -> Result<Value, String> {
+    Err(crate::i18n::t("LAZ export requires the desktop app or CLI.").into())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn poll_laz_export(app: &mut CadApp, ctx: &egui::Context) {
+    use std::sync::mpsc::TryRecvError;
+    let Some(receiver) = &app.laz_export else { return };
+    let status = match receiver.try_recv() {
+        Ok(Ok(result)) => crate::i18n::t("Exported {count} points to {path}")
+            .replace("{count}", &result["points"].to_string())
+            .replace("{path}", result["path"].as_str().unwrap_or_default()),
+        Ok(Err(error)) => error,
+        Err(TryRecvError::Disconnected) => crate::i18n::t("Point cloud export stopped.").into(),
+        Err(TryRecvError::Empty) => {
+            ctx.request_repaint_after(std::time::Duration::from_millis(250));
+            return;
+        }
+    };
+    app.laz_export = None;
+    app.session.echo(status.clone());
+    app.set_status(status);
 }
 
 fn no_picker(app: &mut CadApp, name: &str, example: &str) -> Result<Value, String> {

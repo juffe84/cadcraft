@@ -121,6 +121,7 @@ fn proxies_lost(d: &Drawing, version: Version) -> std::collections::BTreeMap<Str
     }
 }
 
+pub mod cloud_export;
 /// COMPARE (drawing comparison).
 pub mod compare;
 
@@ -344,6 +345,8 @@ fn file_name(path: &str) -> String {
 /// [`finish_open`] on the thread that owns the session.
 pub struct ReadFile {
     drawing: Drawing,
+    #[cfg(not(target_arch = "wasm32"))]
+    cloud_file: Option<cloud_export::CloudFile>,
     binary_dxf: bool,
     name: String,
     path: Option<String>,
@@ -376,8 +379,9 @@ pub fn read_file_with_progress(
                 && let Some(read) = POINT_CLOUD_READER.get()
             {
                 let file = crate::capped_read::open_regular(path).map_err(|e| bad("open", format!("{shown}: {e}")))?;
+                let cloud_file = cloud_export::CloudFile::new(path, &file).map_err(|e| bad("open", e.to_string()))?;
                 let drawing = read(std::io::BufReader::new(file), preview_step, progress).map_err(|e| bad("open", format!("{shown}: {e}")))?;
-                return Ok(ReadFile { drawing, binary_dxf: false, name: text_path.to_string(), path: None });
+                return Ok(ReadFile { drawing, cloud_file: Some(cloud_file), binary_dxf: false, name: text_path.to_string(), path: None });
             }
             if preview_step != 0 {
                 return Err(bad("open", "previewStep requires the native LAS/LAZ reader"));
@@ -407,8 +411,14 @@ pub(crate) fn cloud_preview_step(value: &Value, command: &str) -> Result<u16> {
 
 /// Add a [`read_file`] result to the session as the active drawing: the fast half of OPEN.
 pub fn finish_open(s: &mut Session, f: ReadFile) -> Result<Value> {
-    let ReadFile { drawing, binary_dxf, name, path } = f;
+    #[cfg(not(target_arch = "wasm32"))]
+    let cloud_file = f.cloud_file;
+    let ReadFile { drawing, binary_dxf, name, path, .. } = f;
     let i = add_read(s, drawing, binary_dxf, &name, path);
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(state) = s.docs.get_mut(i) {
+        state.cloud_file = cloud_file;
+    }
     super::blocks::xref::after_open(s, i);
     super::image::after_open(s, i);
     Ok(opened(s, i, true))
@@ -437,7 +447,14 @@ fn read_bytes(bytes: &[u8], name: &str, path: Option<String>) -> Result<ReadFile
             }
         }
     }
-    Ok(ReadFile { drawing, binary_dxf: craft_dxf::is_binary(bytes), name: name.to_string(), path })
+    Ok(ReadFile {
+        drawing,
+        #[cfg(not(target_arch = "wasm32"))]
+        cloud_file: None,
+        binary_dxf: craft_dxf::is_binary(bytes),
+        name: name.to_string(),
+        path,
+    })
 }
 
 fn add_read(s: &mut Session, drawing: Drawing, binary_dxf: bool, name: &str, path: Option<String>) -> usize {
@@ -454,7 +471,7 @@ fn add_read(s: &mut Session, drawing: Drawing, binary_dxf: bool, name: &str, pat
 }
 
 pub(crate) fn open_bytes(s: &mut Session, bytes: &[u8], name: &str, path: Option<String>) -> Result<usize> {
-    let ReadFile { drawing, binary_dxf, name, path } = read_bytes(bytes, name, path)?;
+    let ReadFile { drawing, binary_dxf, name, path, .. } = read_bytes(bytes, name, path)?;
     Ok(add_read(s, drawing, binary_dxf, &name, path))
 }
 

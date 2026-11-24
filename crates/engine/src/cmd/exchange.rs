@@ -39,7 +39,7 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("export", "Export...", run_export)
             .menu(&["File", "Export..."])
             .alias(&["exp"])
-            .params("{path? (else returns base64 `data`), format?: dxf|dwg|svg|png|pdf (default: the path's extension)} → {format, bytes, path? | data}")
+            .params("{path? (else returns base64 `data`), format?: dxf|dwg|svg|png|pdf|laz (LAZ requires path) (default: the path's extension)} → {format, bytes, path? | data}")
             .noundo(),
         CommandSpec::new("preview", "Plot Preview", run_preview)
             .menu(&["File", "Plot Preview"])
@@ -76,6 +76,11 @@ pub fn specs() -> Vec<CommandSpec> {
             .noundo(),
         CommandSpec::new("pointcloud.snap", "Pick point cloud point", run_cloud_snap)
             .params("{point: [x,y], aperture: drawing units} → {point: [x,y,z] | null}")
+            .noundo(),
+        CommandSpec::new("pointcloud.export", "Export Point Cloud...", super::file::cloud_export::run)
+            .menu(&["File", "Export Point Cloud..."])
+            .enabled(super::file::cloud_export::enabled)
+            .params("{path: output .laz file} → {path, points, removedPoints}")
             .noundo(),
         CommandSpec::new("pointcloud.select", "Select cloud points", run_cloud_select)
             .params("{min: [x,y], max: [x,y]} | {region: {origin: {x,y,z}, planes: [[a,b,c,d]; 5]}} | {enabled: bool}")
@@ -321,14 +326,17 @@ pub(super) fn deliver_file(cmd: &str, path: &str, bytes: &[u8], hook: Option<sup
 // ---------- EXPORT ----------
 
 fn run_export(s: &mut Session, p: &Value) -> Result<Value> {
-    let hooks = io().ok_or_else(|| bad("export", "file formats are not available in this build"))?;
     let path = str_param(p, "path");
     let format = match str_param(p, "format") {
         Some(f) => f.trim().trim_start_matches('.').to_ascii_lowercase(),
         None => path.map(extension).unwrap_or_default(),
     };
+    if format == "laz" {
+        return super::file::cloud_export::run(s, p);
+    }
+    let hooks = io().ok_or_else(|| bad("export", "file formats are not available in this build"))?;
     if !EXPORT_FORMATS.contains(&format.as_str()) {
-        return Err(bad("export", "`format` must be dxf, dwg, svg, png or pdf (or give a `path` with one of those extensions)"));
+        return Err(bad("export", "`format` must be dxf, dwg, svg, png, pdf or laz (or give a `path` with one of those extensions)"));
     }
     let file = format!("export.{format}");
     let bytes = (hooks.write)(s.doc()?, &file).map_err(|e| bad("export", e))?;
