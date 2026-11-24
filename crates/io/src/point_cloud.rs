@@ -2,7 +2,7 @@
 #[cfg(not(target_arch = "wasm32"))]
 mod progressive;
 #[cfg(not(target_arch = "wasm32"))]
-pub use progressive::read_progressive;
+pub use progressive::{read_progressive, read_progressive_cached};
 
 use super::{IoError, Result};
 use cadcraft_doc::Drawing;
