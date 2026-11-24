@@ -231,10 +231,9 @@ fn run_cloud_snap(s: &mut Session, p: &Value) -> Result<Value> {
     let extent = Bounds2::new(point, point).expand(aperture);
     let options = DetailOptions { radius: 0.0, radius_factor: 0.0, ..s.settings.cloud_detail_options() };
     let snapshot = cloud.detail.as_ref().map(|source| source.0.view_with(extent, options)).unwrap_or_default();
-    let shown = snapshot.points.as_deref().unwrap_or(cloud);
     let mut nearest = None;
     let mut distance = aperture;
-    for layer in snapshot.overview.as_deref().into_iter().chain(std::iter::once(shown)) {
+    for layer in snapshot.layers(cloud) {
         layer.visible(extent, usize::MAX, |sample| {
             let d = sample.position.xy().dist(point);
             if d <= distance {

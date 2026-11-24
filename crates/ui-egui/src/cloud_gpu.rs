@@ -4,12 +4,14 @@ use cadcraft_geom::{Bounds2, Vec3};
 use egui::{Color32, Rect};
 use egui_wgpu::wgpu;
 use egui_wgpu::wgpu::util::DeviceExt;
-use std::collections::VecDeque;
+use std::collections::HashMap;
 use std::ops::Range;
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex, Weak};
 
 const POINT_BYTES: usize = 16;
-const CLOUD_BUFFER_BUDGET: u64 = 512 << 20;
+const CLOUD_BUFFER_BUDGET: u64 = 1 << 30;
+const UPLOAD_PER_FRAME: u64 = 24 << 20;
+const MOVING_STRIDE: u32 = 4;
 
 const SHADER: &str = r#"
 struct View {
@@ -45,14 +47,18 @@ struct Output {
 struct Resources {
     plan: wgpu::RenderPipeline,
     orbit: wgpu::RenderPipeline,
-    views: [(wgpu::BindGroup, wgpu::Buffer); 2],
-    resident: VecDeque<Resident>,
+    orbit_moving: wgpu::RenderPipeline,
+    bindings: wgpu::BindGroupLayout,
+    resident: HashMap<usize, Resident>,
+    frame: u64,
     linear: bool,
 }
 
 struct Resident {
     cloud: Weak<PointCloud>,
     color: Color32,
+    origin: Vec3,
+    last_used: u64,
     buffer: wgpu::Buffer,
     blocks: Vec<(Bounds2, Range<u32>)>,
 }
@@ -70,26 +76,12 @@ pub fn install(rs: &egui_wgpu::RenderState, target: crate::gpu::GpuTarget) {
             count: None,
         }],
     });
-    let views = std::array::from_fn(|_| {
-        let uniform = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("cloud view"),
-            size: 80,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("cloud"),
-            layout: &bindings,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() }],
-        });
-        (bind, uniform)
-    });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("cloud"),
         bind_group_layouts: &[Some(&bindings)],
         immediate_size: 0,
     });
-    let pipeline = |with_depth| {
+    let pipeline = |with_depth, stride| {
         const ATTRS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Unorm8x4];
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("cloud"),
@@ -98,7 +90,11 @@ pub fn install(rs: &egui_wgpu::RenderState, target: crate::gpu::GpuTarget) {
                 module: &shader,
                 entry_point: Some("vs"),
                 compilation_options: Default::default(),
-                buffers: &[Some(wgpu::VertexBufferLayout { array_stride: 16, step_mode: wgpu::VertexStepMode::Instance, attributes: &ATTRS })],
+                buffers: &[Some(wgpu::VertexBufferLayout {
+                    array_stride: POINT_BYTES as u64 * u64::from(stride),
+                    step_mode: wgpu::VertexStepMode::Instance,
+                    attributes: &ATTRS,
+                })],
             },
             primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleStrip, ..Default::default() },
             depth_stencil: Some(wgpu::DepthStencilState {
@@ -120,10 +116,12 @@ pub fn install(rs: &egui_wgpu::RenderState, target: crate::gpu::GpuTarget) {
         })
     };
     rs.renderer.write().callback_resources.insert(Resources {
-        plan: pipeline(false),
-        orbit: pipeline(true),
-        views,
-        resident: VecDeque::new(),
+        plan: pipeline(false, 1),
+        orbit: pipeline(true, 1),
+        orbit_moving: pipeline(true, MOVING_STRIDE),
+        bindings,
+        resident: HashMap::new(),
+        frame: 0,
         linear: target.format.is_srgb(),
     });
 }
@@ -175,24 +173,40 @@ impl Camera {
     }
 }
 
-pub fn paint(painter: &egui::Painter, rect: Rect, clouds: impl IntoIterator<Item = Arc<PointCloud>>, camera: &Camera, size: f32, fallback: Color32) {
-    let layers = clouds.into_iter().map(|cloud| Layer::new(rect, cloud, camera, size)).collect();
-    painter.add(egui_wgpu::Callback::new_paint_callback(rect, Callback { layers, fallback, orbit: camera.depth.is_some(), bounds: camera.bounds }));
-}
-
-struct Layer {
-    cloud: Arc<PointCloud>,
-    rows: [[f32; 4]; 5],
-}
-
-impl Layer {
-    fn new(rect: Rect, cloud: Arc<PointCloud>, camera: &Camera, size: f32) -> Self {
-        let w = rect.width().max(1.0);
-        let h = rect.height().max(1.0);
-        let [x, y, z, weight] = camera.rows(rect, origin(&cloud));
-        let rows = [x, y, z, weight, [size / w, size / h, 0.0, 0.0]];
-        Self { cloud, rows }
-    }
+pub fn paint(
+    painter: &egui::Painter,
+    rect: Rect,
+    clouds: impl IntoIterator<Item = Arc<PointCloud>>,
+    camera: &Camera,
+    size: f32,
+    fallback: Color32,
+    moving: bool,
+) {
+    let clouds: Vec<_> = clouds.into_iter().collect();
+    let Some(base) = clouds.first() else { return };
+    let origin = origin(base);
+    let [x, y, z, weight] = camera.rows(rect, origin);
+    let rows = [x, y, z, weight, [size / rect.width().max(1.0), size / rect.height().max(1.0), 0.0, 0.0]];
+    let pixels = (rect.width() * rect.height() * painter.ctx().pixels_per_point().powi(2)).max(1.0);
+    let stride = if moving && clouds.iter().map(|cloud| cloud.points().len()).sum::<usize>() > (pixels * 6.0) as usize {
+        // Dense close-ups can cover a pixel many times. Reuse the full buffers
+        // with fewer instances during motion and draw them all when it stops.
+        MOVING_STRIDE
+    } else {
+        1
+    };
+    let callback = Callback {
+        clouds,
+        origin,
+        rows,
+        view: Mutex::new(None),
+        fallback,
+        orbit: camera.depth.is_some(),
+        stride,
+        bounds: camera.bounds,
+        ctx: painter.ctx().clone(),
+    };
+    painter.add(egui_wgpu::Callback::new_paint_callback(rect, callback));
 }
 
 fn origin(cloud: &PointCloud) -> Vec3 {
@@ -201,82 +215,92 @@ fn origin(cloud: &PointCloud) -> Vec3 {
 }
 
 struct Callback {
-    layers: Vec<Layer>,
+    clouds: Vec<Arc<PointCloud>>,
+    origin: Vec3,
+    rows: [[f32; 4]; 5],
+    view: Mutex<Option<wgpu::BindGroup>>,
     fallback: Color32,
     orbit: bool,
+    stride: u32,
     bounds: Bounds2,
+    ctx: egui::Context,
 }
 
 impl egui_wgpu::CallbackTrait for Callback {
     fn prepare(
         &self,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        _: &wgpu::Queue,
         _: &egui_wgpu::ScreenDescriptor,
         _: &mut wgpu::CommandEncoder,
         resources: &mut egui_wgpu::CallbackResources,
     ) -> Vec<wgpu::CommandBuffer> {
         let Some(res) = resources.get_mut::<Resources>() else { return Vec::new() };
-        for (layer, (_, uniform)) in self.layers.iter().zip(&res.views) {
-            let cloud = &layer.cloud;
-            let weak = Arc::downgrade(cloud);
-            if let Some(index) = res.resident.iter().position(|old| Weak::ptr_eq(&old.cloud, &weak) && old.color == self.fallback) {
-                if let Some(cached) = res.resident.remove(index) {
-                    res.resident.push_back(cached);
-                }
-            } else {
-                let origin = origin(cloud);
-                let mut vertices = Vec::with_capacity(cloud.points().len() * POINT_BYTES);
-                let mut blocks = Vec::new();
-                const BLOCK: usize = 8_192;
-                for (index, points) in cloud.points().chunks(BLOCK).enumerate() {
-                    let bounds = Bounds2::from_points(points.iter().map(|p| p.position.xy()));
-                    let first = index * BLOCK;
-                    blocks.push((bounds, first as u32..(first + points.len()) as u32));
-                    for point in points {
-                        let p = point.position - origin;
-                        for value in [p.x, p.y, p.z] {
-                            vertices.extend_from_slice(&(value as f32).to_le_bytes());
-                        }
-                        let color = if cloud.has_rgb {
-                            let [r, g, b] = point.rgb.map(|value| if cloud.rgb_is_8_bit { value as u8 } else { (value >> 8) as u8 });
-                            [r, g, b, 255]
-                        } else {
-                            self.fallback.to_array()
-                        };
-                        vertices.extend_from_slice(&color);
-                    }
-                }
-                while res.resident.len() >= 3
-                    || res.resident.iter().map(|entry| entry.buffer.size()).sum::<u64>() + vertices.len() as u64 > CLOUD_BUFFER_BUDGET
-                {
-                    // Keep the cache bounded even when an explicitly sampled overview is large.
-                    if res.resident.pop_front().is_none() {
-                        break;
-                    }
-                }
-                let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                    label: Some("cloud points"),
-                    contents: &vertices,
-                    usage: wgpu::BufferUsages::VERTEX,
-                });
-                res.resident.push_back(Resident { cloud: weak, color: self.fallback, buffer, blocks });
+        res.resident.retain(|_, block| block.cloud.strong_count() != 0);
+        let mut resident_bytes: u64 = res.resident.values().map(|block| block.buffer.size()).sum();
+        res.frame = res.frame.wrapping_add(1);
+        let mut uploaded = 0;
+        for cloud in self.clouds.iter().filter(|cloud| cloud.bounds().intersects(&self.bounds)) {
+            let key = Arc::as_ptr(cloud) as usize;
+            if let Some(block) = res.resident.get_mut(&key)
+                && block.origin == self.origin
+                && block.color == self.fallback
+            {
+                block.last_used = res.frame;
+                continue;
             }
-            let mut rows = layer.rows;
-            rows[4][2] = f32::from(res.linear);
-            let bytes: Vec<_> = rows.into_iter().flatten().flat_map(f32::to_le_bytes).collect();
-            queue.write_buffer(uniform, 0, &bytes);
+            let bytes = (cloud.points().len() * POINT_BYTES) as u64;
+            if uploaded != 0 && uploaded + bytes > UPLOAD_PER_FRAME {
+                self.ctx.request_repaint_after(std::time::Duration::from_millis(16));
+                break;
+            }
+            if let Some(old) = res.resident.remove(&key) {
+                resident_bytes -= old.buffer.size();
+            }
+            while resident_bytes + bytes > CLOUD_BUFFER_BUDGET {
+                let Some(old) = res.resident.iter().min_by_key(|(_, block)| block.last_used).map(|(&key, _)| key) else { break };
+                if let Some(block) = res.resident.remove(&old) {
+                    resident_bytes -= block.buffer.size();
+                }
+            }
+            let block = upload(device, cloud, self.origin, self.fallback, res.frame);
+            resident_bytes += block.buffer.size();
+            res.resident.insert(key, block);
+            uploaded += bytes;
         }
+        let mut rows = self.rows;
+        rows[4][2] = f32::from(res.linear);
+        let bytes: Vec<_> = rows.into_iter().flatten().flat_map(f32::to_le_bytes).collect();
+        let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("cloud view"),
+            contents: &bytes,
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("cloud view"),
+            layout: &res.bindings,
+            entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() }],
+        });
+        *self.view.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(bind);
         Vec::new()
     }
 
     fn paint(&self, _: egui::PaintCallbackInfo, pass: &mut wgpu::RenderPass<'static>, resources: &egui_wgpu::CallbackResources) {
         let Some(res) = resources.get::<Resources>() else { return };
-        pass.set_pipeline(if self.orbit { &res.orbit } else { &res.plan });
-        for (layer, (bind, _)) in self.layers.iter().zip(&res.views) {
-            let weak = Arc::downgrade(&layer.cloud);
-            let Some(points) = res.resident.iter().find(|entry| Weak::ptr_eq(&entry.cloud, &weak) && entry.color == self.fallback) else { continue };
-            pass.set_bind_group(0, bind, &[]);
+        let view = self.view.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(bind) = view.as_ref() else { return };
+        let pipeline = match (self.orbit, self.stride) {
+            (true, MOVING_STRIDE) => &res.orbit_moving,
+            (true, _) => &res.orbit,
+            (false, _) => &res.plan,
+        };
+        pass.set_pipeline(pipeline);
+        pass.set_bind_group(0, bind, &[]);
+        for cloud in self.clouds.iter().filter(|cloud| cloud.bounds().intersects(&self.bounds)) {
+            let Some(points) = res.resident.get(&(Arc::as_ptr(cloud) as usize)) else { continue };
+            if points.origin != self.origin || points.color != self.fallback {
+                continue;
+            }
             pass.set_vertex_buffer(0, points.buffer.slice(..));
             let mut span: Option<Range<u32>> = None;
             for (extent, range) in &points.blocks {
@@ -288,14 +312,48 @@ impl egui_wgpu::CallbackTrait for Callback {
                 {
                     old.end = range.end;
                 } else if let Some(old) = span.replace(range.clone()) {
-                    pass.draw(0..4, old);
+                    pass.draw(0..4, instance_range(old, self.stride));
                 }
             }
             if let Some(span) = span {
-                pass.draw(0..4, span);
+                pass.draw(0..4, instance_range(span, self.stride));
             }
         }
     }
+}
+
+fn instance_range(points: Range<u32>, stride: u32) -> Range<u32> {
+    points.start.div_ceil(stride)..points.end.div_ceil(stride)
+}
+
+fn upload(device: &wgpu::Device, cloud: &Arc<PointCloud>, origin: Vec3, fallback: Color32, frame: u64) -> Resident {
+    let mut vertices = Vec::with_capacity(cloud.points().len() * POINT_BYTES);
+    let mut blocks = Vec::new();
+    const BLOCK: usize = 2_048;
+    for (index, points) in cloud.points().chunks(BLOCK).enumerate() {
+        let bounds = Bounds2::from_points(points.iter().map(|p| p.position.xy()));
+        let first = index * BLOCK;
+        blocks.push((bounds, first as u32..(first + points.len()) as u32));
+        for point in points {
+            let p = point.position - origin;
+            for value in [p.x, p.y, p.z] {
+                vertices.extend_from_slice(&(value as f32).to_le_bytes());
+            }
+            let color = if cloud.has_rgb {
+                let [r, g, b] = point.rgb.map(|value| if cloud.rgb_is_8_bit { value as u8 } else { (value >> 8) as u8 });
+                [r, g, b, 255]
+            } else {
+                fallback.to_array()
+            };
+            vertices.extend_from_slice(&color);
+        }
+    }
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("cloud points"),
+        contents: &vertices,
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    Resident { cloud: Arc::downgrade(cloud), color: fallback, origin, last_used: frame, buffer, blocks }
 }
 
 #[cfg(test)]
@@ -336,13 +394,6 @@ mod tests {
         let near = cloud(points(1.0, [255; 3]));
         let far = cloud(points(-1.0, [0; 3]));
         let bounds = near.bounds();
-        let rows = |depth| [[0.02, 0.0, 0.0, 0.0], [0.0, 0.02, 0.0, 0.0], [0.0, 0.0, -0.1, depth], [0.0, 0.0, 0.0, 1.0], [0.1, 0.1, 0.0, 0.0]];
-        let callback = Callback {
-            layers: vec![Layer { cloud: near, rows: rows(0.4) }, Layer { cloud: far, rows: rows(0.6) }],
-            fallback: Color32::WHITE,
-            orbit: true,
-            bounds,
-        };
         let rect = Rect::from_min_size(egui::Pos2::ZERO, egui::Vec2::splat(SIZE as f32));
         let camera = Camera {
             center: Vec3::ZERO,
@@ -352,6 +403,18 @@ mod tests {
             depth: Some(5.0),
             eye: None,
             bounds,
+        };
+        let [x, y, z, weight] = camera.rows(rect, Vec3::ZERO);
+        let mut callback = Callback {
+            clouds: vec![near, far],
+            origin: Vec3::ZERO,
+            rows: [x, y, z, weight, [0.1, 0.1, 0.0, 0.0]],
+            view: Mutex::new(None),
+            fallback: Color32::WHITE,
+            orbit: true,
+            stride: 1,
+            bounds,
+            ctx: egui::Context::default(),
         };
         let mut drawing = cadcraft_doc::Drawing::new_metric();
         let points = [Vec3::new(-25.0, -25.0, 0.0), Vec3::new(25.0, -25.0, 0.0), Vec3::new(0.0, 25.0, 0.0), Vec3::new(0.0, 25.0, 0.0)];
@@ -390,6 +453,10 @@ mod tests {
         let mut renderer = rs.renderer.write();
         let screen = ScreenDescriptor { size_in_pixels: [SIZE, SIZE], pixels_per_point: 1.0 };
         let _ = callback.prepare(device, &rs.queue, &screen, &mut encoder, &mut renderer.callback_resources);
+        let key = Arc::as_ptr(&callback.clouds[0]) as usize;
+        let buffer = renderer.callback_resources.get::<Resources>().unwrap().resident[&key].buffer.clone();
+        let _ = callback.prepare(device, &rs.queue, &screen, &mut encoder, &mut renderer.callback_resources);
+        assert_eq!(renderer.callback_resources.get::<Resources>().unwrap().resident[&key].buffer, buffer);
         let _ = model.prepare(device, &rs.queue, &screen, &mut encoder, &mut renderer.callback_resources);
         {
             let mut pass = encoder
@@ -410,6 +477,8 @@ mod tests {
                 .forget_lifetime();
             let info = || egui::PaintCallbackInfo { viewport: rect, clip_rect: rect, pixels_per_point: 1.0, screen_size_px: [SIZE, SIZE] };
             callback.paint(info(), &mut pass, &renderer.callback_resources);
+            callback.stride = MOVING_STRIDE;
+            callback.paint(info(), &mut pass, &renderer.callback_resources);
             model.paint(info(), &mut pass, &renderer.callback_resources);
         }
         let readback = device.create_buffer(&wgpu::BufferDescriptor {
@@ -429,6 +498,7 @@ mod tests {
         rs.queue.submit([encoder.finish()]);
         readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(10)) }).unwrap();
+        assert!(faults.take().is_none());
         let pixels = readback.slice(..).get_mapped_range().unwrap();
         let center = (SIZE as usize / 2) * (SIZE as usize + 1) * 4;
         assert!(pixels[center..center + 3].iter().all(|c| *c > 200));

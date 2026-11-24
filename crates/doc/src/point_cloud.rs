@@ -120,12 +120,27 @@ pub struct CloudView {
     pub points: Option<Arc<PointCloud>>,
     /// Stable coarse points drawn underneath a separate detailed layer.
     pub overview: Option<Arc<PointCloud>>,
+    /// Full-resolution chunks in the view, with stable identities across requests.
+    pub blocks: Vec<Arc<PointCloud>>,
+    pub block_streaming: bool,
+    pub detail_limited: bool,
     /// Retained detail points once the current request finishes.
     pub detail_count: Option<usize>,
     /// The coarse preview is still being refined. Detail may already be available.
     pub indexing: bool,
     pub pending: bool,
     pub failed: bool,
+}
+
+impl CloudView {
+    pub fn layers<'a>(&'a self, root: &'a Arc<PointCloud>) -> impl Iterator<Item = &'a Arc<PointCloud>> {
+        let overview = self.overview.as_ref().or_else(|| (self.indexing && self.points.is_some()).then_some(root));
+        overview
+            .into_iter()
+            .chain(std::iter::once(self.points.as_ref().unwrap_or(root)))
+            .chain(&self.blocks)
+            .filter(|cloud| !cloud.points().is_empty())
+    }
 }
 
 /// Controls for native streaming. Zero delegates the setting to the reader.

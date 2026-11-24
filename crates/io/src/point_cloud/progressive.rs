@@ -22,6 +22,7 @@ const DETAIL_BUDGET: usize = 500_000;
 // Orthographic view height at a 2,000-unit camera distance with a 45° field of view.
 const DETAIL_VIEW_HEIGHT: f64 = 4_000.0 * (std::f64::consts::SQRT_2 - 1.0);
 
+mod block_stream;
 mod cache;
 use cache::IndexCache;
 
@@ -141,7 +142,7 @@ fn attach_worker(
     cloud.detail = Some(DetailSource(bridge.clone()));
     let cloud = Arc::new(cloud);
     if indexed_extent.is_some() {
-        bridge.state().overview = Overview::Root(Arc::downgrade(&cloud));
+        bridge.state().overview = Overview::Root;
     }
     let weak = Arc::downgrade(&bridge);
     std::thread::Builder::new()
@@ -425,7 +426,7 @@ impl Request {
 enum Overview {
     #[default]
     Building,
-    Root(Weak<PointCloud>),
+    Root,
     Refined(Arc<PointCloud>),
 }
 
@@ -435,6 +436,7 @@ struct State {
     details: VecDeque<(Request, Arc<PointCloud>)>,
     partial: Option<(Request, Arc<PointCloud>)>,
     overview: Overview,
+    blocks: block_stream::Resident,
     failed: bool,
 }
 
@@ -451,6 +453,9 @@ impl Bridge {
     }
 
     fn snapshot(&self, state: &State, bounds: Bounds2) -> CloudView {
+        if matches!(state.overview, Overview::Root) {
+            return state.blocks.snapshot(state.wanted, bounds, state.failed);
+        }
         let details = || state.details.iter().rev().filter(|(request, _)| state.wanted.is_none_or(|wanted| request.same_radius(wanted)));
         let detail = details()
             .find(|(request, _)| state.wanted == Some(*request) && request.region.intersects(&bounds))
@@ -463,8 +468,7 @@ impl Bridge {
         let partial = state.partial.as_ref().filter(|(request, _)| state.wanted == Some(*request) && request.region.intersects(&bounds));
         let overlay = partial.or(detail).map(|(_, cloud)| cloud.clone());
         let overview = overlay.as_ref().and_then(|_| match &state.overview {
-            Overview::Building => None,
-            Overview::Root(root) => root.upgrade(),
+            Overview::Building | Overview::Root => None,
             Overview::Refined(cloud) => Some(cloud.clone()),
         });
         let points = overlay.or_else(|| match &state.overview {
@@ -472,25 +476,36 @@ impl Bridge {
             _ => None,
         });
         let indexing = matches!(state.overview, Overview::Building);
-        CloudView { points, overview, detail_count, indexing, pending: !state.failed && (indexing || !complete), failed: state.failed }
+        CloudView {
+            points,
+            overview,
+            detail_count,
+            indexing,
+            pending: !state.failed && (indexing || !complete),
+            failed: state.failed,
+            ..Default::default()
+        }
     }
 }
 
 impl CloudDetails for Bridge {
     fn view_with(&self, bounds: Bounds2, options: DetailOptions) -> CloudView {
         let mut state = self.state();
-        let zoomed_in = if options.radius_factor > 0.0 && matches!(state.overview, Overview::Root(_)) {
+        let block_streaming = matches!(state.overview, Overview::Root);
+        let zoomed_in = if options.radius_factor > 0.0 && block_streaming {
             bounds.height() <= DETAIL_VIEW_HEIGHT
         } else {
             bounds.width() < 0.65 * self.extent.width() || bounds.height() < 0.65 * self.extent.height()
         };
         let close = zoomed_in && bounds.intersects(&self.extent);
         if !close {
-            state.wanted = None;
+            if state.wanted.take().is_some() && block_streaming {
+                let _ = self.wake.try_send(());
+            }
             state.partial = None;
         } else if !state.failed {
             let next = Request::new(bounds, options);
-            let cached = state.details.iter().rposition(|(old, _)| old.covers_request(next));
+            let cached = if block_streaming { None } else { state.details.iter().rposition(|(old, _)| old.covers_request(next)) };
             if let Some(index) = cached
                 && let Some(detail) = state.details.remove(index)
             {
@@ -686,7 +701,7 @@ fn read_complete(mut source: Source, cache: Option<IndexCache>, stride: usize, p
         cloud.extent = cloud.extent.union(&extent);
     }
     let count = source.count;
-    let cloud = attach_worker(cloud, Some(extent), move |bridge, wake| run_queries(&mut source, &query_index, &bridge, wake, None))?;
+    let cloud = attach_worker(cloud, Some(extent), move |bridge, wake| block_stream::run(&mut source, &query_index, &bridge, wake))?;
     if let Some((cache, file)) = save {
         cache.save_in_background(&file, index, cloud.clone());
     }
@@ -1056,18 +1071,27 @@ mod tests {
         assert!(!source.current(cloud.bounds()).indexing);
         let area = Bounds2::new(Vec2::new(75_000.0, 0.0), Vec2::new(75_020.0, 9.0));
         let _ = source.view(area);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        loop {
-            let view = source.current(area);
-            assert!(!view.failed);
-            if !view.pending {
-                assert!(Arc::ptr_eq(view.overview.as_ref().unwrap(), &cloud));
-                assert!(view.points.unwrap().points().iter().any(|point| point.position.x == 75_001.0));
-                break;
+        let ready = |area| {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let view = source.current(area);
+                assert!(!view.failed);
+                if !view.pending {
+                    return view;
+                }
+                assert!(Instant::now() < deadline, "the complete overview could not stream detail");
+                std::thread::sleep(Duration::from_millis(10));
             }
-            assert!(Instant::now() < deadline, "the complete overview could not stream detail");
-            std::thread::sleep(Duration::from_millis(10));
-        }
+        };
+        let overview_and_blocks = ready(area);
+        assert!(overview_and_blocks.layers(&cloud).any(|base| Arc::ptr_eq(base, &cloud)));
+        let block = &overview_and_blocks.blocks[0];
+        assert!(block.points().iter().any(|point| point.position.x == 75_001.0));
+        assert!(block.points().iter().any(|point| !area.contains(point.position.xy())));
+        let panned = Bounds2::new(Vec2::new(75_015.0, 0.0), Vec2::new(75_035.0, 9.0));
+        let _ = source.view(panned);
+        assert!(ready(panned).blocks.iter().any(|other| Arc::ptr_eq(block, other)));
+        drop(overview_and_blocks);
         drop(cloud);
 
         // The preview can seed real detail even before the full index exists.

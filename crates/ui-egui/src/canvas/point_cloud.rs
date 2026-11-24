@@ -87,7 +87,9 @@ fn controls(app: &mut CadApp, ui: &mut egui::Ui) {
         } else if status.pending {
             ui.label(crate::i18n::t("Loading point cloud detail…"));
         } else if let Some(count) = status.detail_count {
-            let message = if count == 0 {
+            let message = if status.detail_limited {
+                crate::i18n::t("Detail memory limit: {count} points").replace("{count}", &count.to_string())
+            } else if count == 0 {
                 crate::i18n::t("No detail points in this area").to_string()
             } else {
                 crate::i18n::t("Detail: {count} points").replace("{count}", &count.to_string())
@@ -130,8 +132,7 @@ fn view(cloud: &PointCloud, bounds: Bounds2, app: &CadApp, request: bool) -> Clo
 }
 
 pub(super) fn layers<'a>(snapshot: &'a CloudView, root: &'a Arc<PointCloud>) -> impl Iterator<Item = &'a Arc<PointCloud>> {
-    let overview = snapshot.overview.as_ref().or_else(|| (snapshot.indexing && snapshot.points.is_some()).then_some(root));
-    overview.into_iter().chain(std::iter::once(snapshot.points.as_ref().unwrap_or(root))).filter(|cloud| !cloud.points().is_empty())
+    snapshot.layers(root)
 }
 
 pub(super) fn paint_plan(app: &CadApp, painter: &egui::Painter, xf: &Xf, request: bool) {
@@ -159,14 +160,16 @@ pub(super) fn paint_plan(app: &CadApp, painter: &egui::Painter, xf: &Xf, request
             &camera,
             app.session.settings.point_cloud_size,
             Tokens::get().canvas_ink,
+            false,
         );
         return;
     }
     let mut mesh = egui::Mesh::default();
     let size = egui::Vec2::splat(app.session.settings.point_cloud_size);
     let fallback = Tokens::get().canvas_ink;
+    let limit = sample_budget(xf.rect).div_ceil(layers(&snapshot, cloud).count().max(1));
     for shown in layers(&snapshot, cloud) {
-        shown.visible(bounds, sample_budget(xf.rect), |point| {
+        shown.visible(bounds, limit, |point| {
             let screen = xf.to_screen(point.position.xy());
             if xf.rect.contains(screen) {
                 mesh.add_colored_rect(Rect::from_center_size(screen, size), color(shown, point, fallback));
@@ -183,8 +186,9 @@ pub(super) fn snap_visible(app: &CadApp, xf: &Xf, raw: Vec2, aperture: f64) -> O
     let mut nearest = None;
     let mut distance = aperture.max(f64::from(app.session.settings.point_cloud_size) * 0.5 / xf.scale).powi(2);
     let gpu = layers(&snapshot, cloud).all(|shown| crate::cloud_gpu::available(app.canvas.gpu, shown));
+    let fallback_limit = sample_budget(xf.rect).div_ceil(layers(&snapshot, cloud).count().max(1));
     for shown in layers(&snapshot, cloud) {
-        let (pick, limit) = if gpu { (Bounds2::new(raw, raw).expand(distance.sqrt()), usize::MAX) } else { (bounds, sample_budget(xf.rect)) };
+        let (pick, limit) = if gpu { (Bounds2::new(raw, raw).expand(distance.sqrt()), usize::MAX) } else { (bounds, fallback_limit) };
         shown.visible(pick, limit, |point| {
             let xy = point.position.xy();
             let delta = xy - raw;
@@ -362,8 +366,12 @@ impl OrbitFrame {
         accepts: impl Fn(Vec3) -> bool,
     ) -> Option<Vec3> {
         let mut best: Option<SurfaceHit> = None;
+        let clouds: Vec<_> = clouds.collect();
+        let wide_limit = limit.div_ceil(clouds.len().max(1));
         for cloud in clouds {
-            cloud.visible(self.pick_bounds(cloud.z_range, cursor, radius), limit, |p| {
+            let bounds = self.pick_bounds(cloud.z_range, cursor, radius);
+            let limit = if bounds == self.bounds { wide_limit } else { limit };
+            cloud.visible(bounds, limit, |p| {
                 if !accepts(p.position) {
                     return;
                 }
@@ -468,6 +476,9 @@ fn detail_view(
     }
     let Some(mut state) = state else { return snapshot };
     if dragging || now - state.changed_at < 0.12 {
+        if snapshot.block_streaming {
+            let _ = view(root, frame.detail_bounds(state.center_surface), app, true);
+        }
         app.canvas.cloud_orbit_focus = Some(state);
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(120));
         return snapshot;
@@ -728,7 +739,7 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
         if snapshot.pending {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(70));
         }
-        paint_cloud_in_orbit(app, &painter, &frame, root, snapshot);
+        paint_cloud_in_orbit(app, &painter, &frame, root, snapshot, dragging || updated);
     }
     // The model wins depth ties with the underlying cloud samples used for drawing.
     if let Some(model) = &model {
@@ -737,17 +748,18 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     super::orbit_draft::draw(app, &painter, &frame, &response, model.as_ref(), shown, dragging);
 }
 
-fn paint_cloud_in_orbit(app: &CadApp, painter: &egui::Painter, frame: &OrbitFrame, root: &Arc<PointCloud>, snapshot: &CloudView) {
+fn paint_cloud_in_orbit(app: &CadApp, painter: &egui::Painter, frame: &OrbitFrame, root: &Arc<PointCloud>, snapshot: &CloudView, moving: bool) {
     let rect = frame.rect;
     let fallback = Tokens::get().canvas_ink;
     let size = app.session.settings.point_cloud_size;
     if layers(snapshot, root).all(|shown| crate::cloud_gpu::available(app.canvas.gpu, shown)) {
-        crate::cloud_gpu::paint(painter, rect, layers(snapshot, root).cloned(), &frame.camera, size, fallback);
+        crate::cloud_gpu::paint(painter, rect, layers(snapshot, root).cloned(), &frame.camera, size, fallback, moving);
         return;
     }
     let mut projected = Vec::new();
+    let limit = sample_budget(rect).div_ceil(layers(snapshot, root).count().max(1));
     for shown in layers(snapshot, root) {
-        shown.visible(frame.bounds, sample_budget(rect), |point| {
+        shown.visible(frame.bounds, limit, |point| {
             let (at, depth) = frame.project(point.position);
             if rect.contains(at) {
                 projected.push((depth, at, color(shown, point, fallback)));
