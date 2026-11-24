@@ -90,8 +90,14 @@ fn entity_parts(b: &mut Builder, ctx: &Ctx, e: &Entity) {
     let tol = b.opts.tolerance / ctx.xf.scale_factor().max(1e-12);
     let lw = if b.opts.lineweights { lw } else { 0.0 };
     let elevation;
-    let ctx = if b.opts.spatial {
+    let ctx = if b.opts.spatial || b.snaps_only {
         super::spatial::snaps(b, ctx, e);
+        if b.snaps_only {
+            if let EntityKind::Insert(ins) = &e.kind {
+                insert(b, ctx, e, ins, rgb, own);
+            }
+            return;
+        }
         if super::spatial::draw(b, ctx, e, rgb, lw, tol) {
             return;
         }

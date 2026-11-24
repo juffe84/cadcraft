@@ -87,13 +87,18 @@ pub(crate) fn insert(b: &mut Builder, ctx: &Ctx, e: &Entity, ins: &cadcraft_doc:
                     b.list.expanded = part.list.expanded;
                     b.list.truncated |= part.list.truncated;
                     append_clipped_keep(&mut b.list, &part.list, &if *inverted { Clip::Outside(region) } else { Clip::Poly(region) });
-                    xclip_frame(b, ctx, region, rgb);
+                    if !b.snaps_only {
+                        xclip_frame(b, ctx, region, rgb);
+                    }
                 }
                 if stop {
                     break 'copies;
                 }
             }
         }
+    }
+    if b.snaps_only {
+        return;
     }
     // Attributes are cut by the reference's clip too.
     let attr_clip = ctx.d.block(&ins.block).and_then(|blk| xclip_region(ins, &ctx.xf.then_before(ins.transform(blk.base.xy()))));

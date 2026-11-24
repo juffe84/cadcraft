@@ -137,6 +137,7 @@ struct Builder<'a> {
     points: &'a std::sync::atomic::AtomicUsize,
     /// The most points the build may hold: [`MAX_DISPLAY_POINTS`] (less in tests).
     max_points: usize,
+    snaps_only: bool,
 }
 
 /// Upper bound on the block contents drawn per display list (each block reference, MINSERT copy
@@ -428,6 +429,7 @@ impl<'a> Builder<'a> {
             transparency: self.transparency,
             points: self.points,
             max_points: self.max_points,
+            snaps_only: self.snaps_only,
         }
     }
     /// Take one unit of the block-expansion budget; false once it is spent, or once the build
@@ -493,7 +495,7 @@ mod viewports;
 
 pub use dim_draw::{dim_text, dimension_in};
 pub use display::{DImage, DPrim, DisplayList, Heights, Kind, MAX_TRANSPARENCY, NO_LAYER, PlotText, SpatialSnap, VIEWPORT_CONTENT, alpha};
-pub use pipeline::{Options, build, build_entities, build_plot};
+pub use pipeline::{Options, build, build_entities, build_plot, build_spatial_snaps};
 use props::{default_lineweight, resolve_common};
 use text_entity::text_style;
 pub use text_entity::{layout_mtext_entity, place_text_entity, style_font, text_align};

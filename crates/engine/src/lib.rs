@@ -104,6 +104,9 @@ pub struct Session {
     pub last_point: Vec2,
     last_spatial_point: Option<Vec3>,
     spatial_input: Option<Vec3>,
+    /// Working-plane projection of object snaps (OSNAPZ), for this session only.
+    pub(crate) osnapz: bool,
+    pub spatial_cursor: Option<Vec3>,
     draft_height: Option<f64>,
     /// AREA and PERIMETER: the last area AREA or MEASUREGEOM measured (in their Add and Subtract
     /// modes the running total) and that area's perimeter. Not saved, as in AutoCAD.
@@ -200,6 +203,8 @@ impl Session {
             last_point: Vec2::ZERO,
             last_spatial_point: None,
             spatial_input: None,
+            osnapz: false,
+            spatial_cursor: None,
             draft_height: None,
             area: 0.0,
             perimeter: 0.0,

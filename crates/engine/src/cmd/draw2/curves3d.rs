@@ -45,9 +45,9 @@ impl Interactive for Poly3dM {
     }
     fn prompt(&self, _s: &Session) -> Prompt {
         match self.pts.len() {
-            0 => Prompt::new("Specify start point of polyline", Accept::POINT),
-            1 | 2 => Prompt::new("Specify endpoint of line", Accept::POINT).kw(&["Undo"]).base_opt(self.pts.last().map(|p| p.xy())),
-            _ => Prompt::new("Specify endpoint of line", Accept::POINT).kw(&["Close", "Undo"]).base_opt(self.pts.last().map(|p| p.xy())),
+            0 => Prompt::new("Specify start point of 3D polyline (X,Y,Z)", Accept::POINT),
+            1 | 2 => Prompt::new("Specify next point (X,Y,Z)", Accept::POINT).kw(&["Undo"]).base3_opt(self.pts.last().copied()),
+            _ => Prompt::new("Specify next point (X,Y,Z)", Accept::POINT).kw(&["Close", "Undo"]).base3_opt(self.pts.last().copied()),
         }
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
@@ -62,6 +62,9 @@ impl Interactive for Poly3dM {
             }
             Input::Keyword(k) if k == "Undo" => {
                 self.pts.pop();
+                if let Some(&last) = self.pts.last() {
+                    s.note_point3(last);
+                }
                 self.sync(s, false)?;
                 Ok(Step::Continue)
             }

@@ -5,8 +5,8 @@
 //!   default to polar as in AutoCAD; DYNPIFORMAT = 1 makes them Cartesian).
 //! - `40,` locks X = 40 and moves to Y; `40<` locks the distance and moves to the angle. A locked
 //!   value holds the cursor.
-//! - Tab types the separator for the format on show, so `40` Tab `90` reads `40<90`; Tab after the
-//!   second value locks it too (both boxes show a lock and the cursor sits on the point).
+//! - Tab types the separator for the format on show, so `40` Tab `90` reads `40<90`. Spatial
+//!   Cartesian entries advance to Z with a second Tab. Tab after the final value locks it.
 //! - Enter sends the entry with `@` in front when it is measured from the last point (relative is
 //!   the default; DYNPICOORDS = 1 makes it absolute), and fills an empty box from the cursor.
 //! - A plain number and Enter stays direct distance entry; `@`/`#` entries, keywords and command
@@ -17,7 +17,7 @@
 //! Scripts, the control channel and MCP never pass through here, so they keep the plain
 //! command-line rules.
 
-use cadcraft_geom::Vec2;
+use cadcraft_geom::{Vec2, Vec3};
 
 /// How the boxes read the point.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -50,6 +50,8 @@ pub struct Frame {
     pub absolute: bool,
     /// The UCS the boxes read and show values in (the engine reads the sent text in it too).
     pub ucs: cadcraft_engine::ucs::UcsFrame,
+    /// The world reference point of a spatial drawing prompt.
+    pub spatial: Option<Vec3>,
 }
 
 impl Frame {
@@ -68,6 +70,14 @@ impl Frame {
     /// Whether values are offsets from the last point.
     pub fn relative(&self) -> bool {
         self.base.is_some() && !self.absolute
+    }
+
+    pub fn live_xyz(&self, point: Vec3) -> Vec3 {
+        self.ucs.to_ucs3(point) - self.origin_xyz()
+    }
+
+    fn origin_xyz(&self) -> Vec3 {
+        self.spatial.filter(|_| self.relative()).map_or(Vec3::ZERO, |base| self.ucs.to_ucs3(base))
     }
 
     /// The live (X, Y) or (distance, angle in radians) of `cursor` (a world point), in the UCS.
@@ -90,6 +100,8 @@ pub struct Entry<'a> {
     pub split: bool,
     /// Text in the second box (Y or angle).
     pub second: &'a str,
+    /// The third field, once the separator after Y was entered.
+    pub third: Option<&'a str>,
 }
 
 impl Entry<'_> {
@@ -108,24 +120,38 @@ impl Entry<'_> {
             Format::Polar => cadcraft_engine::units::parse_angle(t),
         }
     }
+
+    pub fn third_value(&self) -> Option<f64> {
+        self.third.and_then(cadcraft_engine::units::parse_distance)
+    }
+
+    pub fn has_z(&self, frame: &Frame) -> bool {
+        self.format == Format::Cartesian && frame.spatial.is_some()
+    }
 }
 
 /// Read `text` as a pointer-input entry, or `None` when it is something else (an explicit
-/// `@`/`#` entry, a keyword, a command name, a 3D point).
+/// `@`/`#` entry, a keyword, a command name, or a 3D point at a planar prompt).
 pub fn parse<'a>(text: &'a str, frame: &Frame) -> Option<Entry<'a>> {
     let t = text.trim();
     if t.starts_with('@') || t.starts_with('#') {
         return None;
     }
     let entry = if let Some((a, b)) = t.split_once(',') {
-        Entry { format: Format::Cartesian, first: a.trim(), split: true, second: b.trim() }
+        let (second, third) = if let Some((y, z)) = b.split_once(',') {
+            frame.spatial?;
+            (y.trim(), Some(z.trim()))
+        } else {
+            (b.trim(), None)
+        };
+        Entry { format: Format::Cartesian, first: a.trim(), split: true, second, third }
     } else if let Some((a, b)) = t.split_once('<') {
-        Entry { format: Format::Polar, first: a.trim(), split: true, second: b.trim() }
+        Entry { format: Format::Polar, first: a.trim(), split: true, second: b.trim(), third: None }
     } else {
-        Entry { format: frame.default_format(), first: t, split: false, second: "" }
+        Entry { format: frame.default_format(), first: t, split: false, second: "", third: None }
     };
     let number_or_empty = |s: &str| s.is_empty() || cadcraft_engine::units::parse_distance(s).is_some();
-    if !number_or_empty(entry.first) || entry.second.contains([',', '<']) {
+    if !number_or_empty(entry.first) || entry.second.contains([',', '<']) || entry.third.is_some_and(|z| !number_or_empty(z)) {
         return None;
     }
     if !entry.second.is_empty() && entry.second_value().is_none() {
@@ -136,12 +162,28 @@ pub fn parse<'a>(text: &'a str, frame: &Frame) -> Option<Entry<'a>> {
 
 /// What Tab types: the separator for the format on show, when the first box is still active.
 pub fn tab_separator(text: &str, frame: &Frame) -> Option<char> {
-    parse(text, frame).filter(|e| !e.split).map(|e| e.format.separator())
+    let entry = parse(text, frame)?;
+    (!entry.split || (entry.has_z(frame) && entry.third.is_none())).then(|| entry.format.separator())
 }
 
-/// Whether Tab locks the second value too: both values are typed.
-pub fn can_lock_second(text: &str, frame: &Frame) -> bool {
-    parse(text, frame).is_some_and(|e| e.split && e.first_locked().is_some() && e.second_value().is_some())
+/// Whether Tab locks the final value.
+pub fn can_lock_last(text: &str, frame: &Frame) -> bool {
+    parse(text, frame)
+        .is_some_and(|e| if e.has_z(frame) { e.third_value().is_some() } else { e.split && e.first_locked().is_some() && e.second_value().is_some() })
+}
+
+/// Apply a spatial Cartesian entry to the world-space cursor. Placing the point commits the
+/// value in the active field as well as the values locked by separators.
+pub fn resolve_xyz(entry: &Entry<'_>, frame: &Frame, cursor: Vec3, complete: bool) -> Option<Vec3> {
+    if !entry.has_z(frame) || !entry.split {
+        return None;
+    }
+    let live = frame.live_xyz(cursor);
+    let x = entry.first_locked().unwrap_or(live.x);
+    let y = if complete || entry.third.is_some() { entry.second_value().unwrap_or(live.y) } else { live.y };
+    let z = entry.third_value().unwrap_or(live.z);
+    let point = frame.ucs.to_wcs3(frame.origin_xyz() + Vec3::new(x, y, z));
+    point.is_finite().then_some(point)
 }
 
 /// Hold the cursor to the locked values: the first one once a separator follows it, and both
@@ -353,10 +395,10 @@ mod tests {
         let base = Vec2::new(1.0, 1.0);
         let f = second_point(base);
         // Only once both values are typed.
-        assert!(!can_lock_second("5", &f));
-        assert!(!can_lock_second("5<", &f));
-        assert!(can_lock_second("5<90", &f));
-        assert!(can_lock_second("3,4", &f));
+        assert!(!can_lock_last("5", &f));
+        assert!(!can_lock_last("5<", &f));
+        assert!(can_lock_last("5<90", &f));
+        assert!(can_lock_last("3,4", &f));
         let e = parse("5<90", &f).unwrap();
         // Unlocked, the typed angle doesn't hold the cursor; locked, the cursor sits on the point.
         assert!(close(Some(constrain(&e, &f, Vec2::new(100.0, 1.0), false)), Vec2::new(6.0, 1.0)));

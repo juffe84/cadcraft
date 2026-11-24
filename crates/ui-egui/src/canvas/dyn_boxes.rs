@@ -1,5 +1,5 @@
 use super::widgets::draw_lock;
-use super::{CadApp, Pos2, Rect, Shape, Stroke, Tokens, Vec2, pos2, vec2};
+use super::{CadApp, Pos2, Rect, Shape, Stroke, Tokens, pos2, vec2};
 
 /// The Dynamic Input tooltip beside the cursor, styled like the command line. At a point prompt
 /// it shows the pair of value boxes, a view of the command-line text (see [`crate::dyninput`]);
@@ -25,7 +25,17 @@ pub(super) fn dynamic_input(app: &mut CadApp, p: &egui::Painter, hover: Pos2, fi
         && let Some(c) = app.canvas.cursor
     {
         let message = if show_prompt { crate::i18n::t(&prompt.message) } else { "" };
-        let r = dynamic_input_boxes(p, at, message, &f, &e, c, app.cmd.second_locked(), options, length_units(&app.session));
+        let r = dynamic_input_boxes(
+            p,
+            at,
+            message,
+            &f,
+            &e,
+            app.canvas.draft_cursor.unwrap_or_else(|| c.to3(0.0)),
+            app.cmd.second_locked(),
+            options,
+            length_units(&app.session),
+        );
         options_menu(app, p, r, hover);
         return;
     }
@@ -113,7 +123,11 @@ fn options_menu(app: &mut CadApp, p: &egui::Painter, r: Rect, hover: Pos2) {
 /// The tooltip background, matching the command line bar; returns its rectangle.
 fn tooltip_frame(p: &egui::Painter, at: Pos2, size: egui::Vec2) -> Rect {
     let t = Tokens::get();
-    let r = Rect::from_min_size(at + vec2(18.0, -size.y - 14.0), size);
+    let clip = p.clip_rect();
+    let x = (at.x + 18.0).min(clip.right() - size.x).max(clip.left());
+    let above = at.y - size.y - 14.0;
+    let y = if above >= clip.top() { above } else { (at.y + 14.0).min(clip.bottom() - size.y).max(clip.top()) };
+    let r = Rect::from_min_size(pos2(x, y), size);
     p.rect_filled(r, 3.0, t.cmd_bg);
     p.rect_stroke(r, 3.0, Stroke::new(1.0, t.cmd_border), egui::StrokeKind::Inside);
     r
@@ -130,8 +144,8 @@ fn dynamic_input_boxes(
     message: &str,
     f: &crate::dyninput::Frame,
     e: &crate::dyninput::Entry<'_>,
-    cursor: Vec2,
-    second_locked: bool,
+    cursor: cadcraft_geom::Vec3,
+    last_locked: bool,
     options: bool,
     (lu, lp): (i64, i64),
 ) -> Rect {
@@ -139,7 +153,8 @@ fn dynamic_input_boxes(
     let t = Tokens::get();
     let font = crate::theme::small();
     let dist = |v: f64| cadcraft_engine::units::format_distance(v, lu, lp);
-    let (live_first, live_second) = f.live(e.format, cursor);
+    let xyz = e.has_z(f).then(|| f.live_xyz(cursor));
+    let (live_first, live_second) = xyz.map_or_else(|| f.live(e.format, cursor.xy()), |p| (p.x, p.y));
     let live_second = match e.format {
         Format::Cartesian => dist(live_second),
         Format::Polar => format!("{}°", (live_second.to_degrees() * 10.0).round() / 10.0),
@@ -149,7 +164,7 @@ fn dynamic_input_boxes(
         Format::Polar => ("", "<"),
     };
     // (label, text, typed, locked, active)
-    let cells = [
+    let mut cells = vec![
         (
             label_first,
             if e.first.is_empty() { dist(live_first) } else { e.first.to_owned() },
@@ -161,10 +176,14 @@ fn dynamic_input_boxes(
             label_second,
             if e.second.is_empty() { live_second } else { e.second.to_owned() },
             !e.second.is_empty(),
-            second_locked,
-            e.split && !second_locked,
+            if xyz.is_some() { e.third.is_some() && e.second_value().is_some() } else { last_locked },
+            e.split && if xyz.is_some() { e.third.is_none() } else { !last_locked },
         ),
     ];
+    if let Some(xyz) = xyz {
+        let z = e.third.unwrap_or_default();
+        cells.push(("Z", if z.is_empty() { dist(xyz.z) } else { z.to_owned() }, !z.is_empty(), last_locked, e.third.is_some() && !last_locked));
+    }
 
     let msg = p.layout_no_wrap(message.to_owned(), font.clone(), t.text_dim);
     let marker = p.layout_no_wrap(if f.relative() { "@".to_owned() } else { String::new() }, font.clone(), t.text_faint);

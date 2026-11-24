@@ -27,8 +27,8 @@ pub struct CmdLine {
     resize_from: Option<(f32, usize)>,
     /// The Dynamic Input options menu at the cursor (Down Arrow at a prompt with keywords).
     pub options: Option<crate::dyninput::OptionsMenu>,
-    /// The text whose second Dynamic Input value Tab locked; the lock holds while it is unchanged.
-    locked_second: Option<String>,
+    /// The text whose last Dynamic Input value Tab locked; the lock holds while it is unchanged.
+    locked_last: Option<String>,
     /// Where the options menu's rows were drawn last frame (screen), for clicks on them.
     pub option_rows: Vec<(Rect, String)>,
     /// Where the Dynamic Input tooltip stays while the options menu is open.
@@ -57,8 +57,10 @@ pub fn dyn_frame(app: &CadApp) -> Option<crate::dyninput::Frame> {
         return None;
     }
     let p = app.session.current_prompt().filter(cadcraft_engine::pointmod::accepts)?;
-    let ucs = app.session.input_ucs();
-    Some(crate::dyninput::Frame { base: p.base, cartesian: st.dynpi_cartesian, absolute: st.dynpi_absolute, ucs })
+    let spatial = app.session.spatial_draft_reference();
+    let ucs = if spatial.is_some() { app.session.ucs() } else { app.session.input_ucs() };
+    let cartesian = st.dynpi_cartesian || app.session.running.as_ref().is_some_and(|r| r.id == "3dpoly");
+    Some(crate::dyninput::Frame { base: p.base, cartesian, absolute: st.dynpi_absolute, ucs, spatial })
 }
 
 /// Take Tab away from egui before it moves keyboard focus to the next widget (which would leave
@@ -99,10 +101,9 @@ fn tab(app: &mut CadApp) {
     {
         app.cmd.buffer.push(sep);
     } else if let Some(f) = dyn_frame(app)
-        && crate::dyninput::can_lock_second(&app.cmd.buffer, &f)
+        && crate::dyninput::can_lock_last(&app.cmd.buffer, &f)
     {
-        // Both values typed: Tab locks the second one as well.
-        app.cmd.locked_second = Some(app.cmd.buffer.clone());
+        app.cmd.locked_last = Some(app.cmd.buffer.clone());
     } else if let Some(s) = suggestions_in(&app.session, &app.cmd.buffer).first() {
         app.cmd.buffer = s.id.clone();
     }
@@ -207,7 +208,7 @@ impl CmdLine {
 
     /// Tab locked the second Dynamic Input value and nothing was typed since.
     pub fn second_locked(&self) -> bool {
-        self.locked_second.as_deref() == Some(self.buffer.as_str())
+        self.locked_last.as_deref() == Some(self.buffer.as_str())
     }
 
     /// The options menu row under `at` (screen), if the menu is open.
@@ -441,13 +442,22 @@ pub fn submit(app: &mut CadApp) {
     if let Some(f) = dyn_frame(app) {
         let cursor = app.canvas.cursor.unwrap_or(app.session.cursor);
         let last = app.session.last_point;
-        let done = crate::dyninput::parse(&app.cmd.buffer, &f).and_then(|e| crate::dyninput::complete(&e, &f, cursor, last));
+        let done = crate::dyninput::parse(&app.cmd.buffer, &f).and_then(|e| {
+            if e.has_z(&f) {
+                let cursor = app.canvas.draft_cursor.or_else(|| app.session.spatial_point_at_xy(cursor))?;
+                let point = crate::dyninput::resolve_xyz(&e, &f, cursor, true)?;
+                let point = f.ucs.to_ucs3(point);
+                Some(format!("#{},{},{}", point.x, point.y, point.z))
+            } else {
+                crate::dyninput::complete(&e, &f, cursor, last)
+            }
+        });
         if let Some(text) = done {
             app.cmd.buffer = text;
         }
     }
     let text = std::mem::take(&mut app.cmd.buffer);
-    app.cmd.locked_second = None;
+    app.cmd.locked_last = None;
     app.cmd.history_pos = None;
     if !text.trim().is_empty() && !app.session.prompting() {
         app.cmd.history.push(text.clone());

@@ -81,6 +81,7 @@ pub fn viewport_content(d: &Drawing, space: &Space, handle: Handle, area: Bounds
         transparency: 0,
         points: &points,
         max_points: MAX_DISPLAY_POINTS,
+        snaps_only: false,
     };
     contents(&mut b, d, vp, area, &Clip::Rect(area), paper::unit_mm_of(d, handle));
     b.list
@@ -135,6 +136,7 @@ fn contents(b: &mut Builder, d: &Drawing, vp: &cadcraft_doc::Viewport, area: Bou
         transparency: 0,
         points: b.points,
         max_points: b.max_points,
+        snaps_only: false,
     };
     #[cfg(not(target_arch = "wasm32"))]
     let parallel = !b.plotting && b.styles.is_none() && d.model.len() >= 2 * PARALLEL_CHUNK;
@@ -160,6 +162,7 @@ fn contents(b: &mut Builder, d: &Drawing, vp: &cadcraft_doc::Viewport, area: Bou
                         transparency: 0,
                         points,
                         max_points,
+                        snaps_only: false,
                     };
                     let c = ctx();
                     for me in chunk.iter().filter(|me| seen(me)) {

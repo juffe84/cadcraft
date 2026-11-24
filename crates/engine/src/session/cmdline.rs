@@ -108,7 +108,7 @@ impl Session {
                 lisp::value::Value::Str(s) => self.typed_token(&s, false),
                 other => match other.as_point() {
                     // A point from LISP is in the current UCS, as typed coordinates are.
-                    Some(p) => self.input(Input::Point(self.input_ucs().to_wcs(Vec2::new(p[0], p[1])))),
+                    Some(p) => self.input_ucs_point(p, other.iter().nth(2).is_some()),
                     None => {
                         self.echo(format!("Invalid input: {}", lisp::value::to_text(&other, true)));
                         Ok(())
@@ -147,8 +147,11 @@ impl Session {
             return self.input(Input::Keyword(k));
         }
         if prompt.accept.point {
-            if self.running.as_ref().is_some_and(|r| r.spatial_drafting())
-                && let Some(point) = prompt::parse_point3_in(tt, self.last_point3(), self.ucs())
+            if tt == "@" && self.spatial_draft_reference().is_some() {
+                return self.input_point3(self.last_point3());
+            }
+            if let Some(reference) = self.spatial_draft_reference()
+                && let Some(point) = prompt::parse_cartesian3(tt, self.last_point3(), self.ucs(), Some(reference))
             {
                 self.last_polar = None;
                 return self.input_point3(point);
@@ -169,6 +172,15 @@ impl Session {
             if let (Some(base), Some(dist)) = (prompt.base, units::parse_distance(tt))
                 && !prompt.accept.number
             {
+                if self.spatial_draft_reference().is_some()
+                    && let Some(z) = prompt.base_z
+                    && let Some(cursor) = self.spatial_cursor.filter(|p| p.xy() == self.cursor).or_else(|| self.spatial_point_at_xy(self.cursor))
+                {
+                    let base = base.to3(z);
+                    let dir = (cursor - base).normalized();
+                    let dir = if dir == cadcraft_geom::Vec3::ZERO { self.ucs().x } else { dir };
+                    return self.input_point3(base + dir * dist);
+                }
                 let mut c = self.cursor;
                 if self.settings.orthomode && !prompt.corner {
                     c = snap::iso::constrain(&self.drafting_settings(), base, c);

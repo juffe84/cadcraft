@@ -248,6 +248,58 @@ fn dynamic_input_distance_follows_the_drawing_units() {
     assert!(text.contains(&format!("   {}  <", arch(c.len()))), "no {} in:\n{text}", arch(c.len()));
 }
 
+#[test]
+fn plan_3dpoly_tabs_to_z_and_can_pick_an_elevated_line_endpoint() {
+    use cadcraft_geom::Vec3;
+    let mut session = cadcraft_engine::Session::empty();
+    session.open_drawing(cadcraft_doc::Drawing::new_metric(), "Model", None);
+    let target = Vec3::new(12.0, 13.0, 23.0);
+    session.execute("line", &serde_json::json!({"points": [[target.x, target.y, target.z], [18, 16, 24]]})).unwrap();
+    session.execute("view.set", &serde_json::json!({"center": [target.x, target.y], "height": 80.0})).unwrap();
+    session.settings.osmode = cadcraft_engine::snap::mode::END;
+    let mut app = CadApp::new(session, Default::default());
+    let ctx = egui::Context::default();
+    let center = pos2(700.0, 450.0);
+    painted_text(&mut app, &ctx, center);
+    app.session.start("3dpoly").unwrap();
+    let text = painted_text(&mut app, &ctx, center);
+    assert!(text.lines().any(|line| line == "Z"), "{text}");
+    let enter = egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+    let text = |s: &str| egui::Event::Text(s.into());
+    let frame = |app: &mut CadApp, events| {
+        let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))), events, ..Default::default() };
+        ctx.run_ui(raw, |ui| {
+            app.logic(ui.ctx());
+            app.ui(ui);
+        })
+        .textures_delta
+        .clear();
+    };
+    frame(&mut app, vec![text("1"), text("\t"), text("2"), text("\t"), text("3"), enter]);
+    assert_eq!(app.session.last_point3(), Vec3::new(1.0, 2.0, 3.0));
+    let at = app.canvas.xf.unwrap().to_screen(target.xy());
+    frame(&mut app, vec![egui::Event::PointerMoved(at)]);
+    assert_eq!(app.canvas.draft_cursor, Some(target), "pointer {at:?}, canvas {:?}, prompt {:?}", app.canvas.rect, app.session.current_prompt());
+    for pressed in [true, false] {
+        frame(
+            &mut app,
+            vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE }],
+        );
+    }
+    app.session.execute("setvar", &serde_json::json!({"name": "OSNAPZ", "value": 1})).unwrap();
+    app.session.execute("setvar", &serde_json::json!({"name": "ELEVATION", "value": 8.0})).unwrap();
+    frame(&mut app, vec![egui::Event::PointerMoved(at)]);
+    let projected = target.xy().to3(8.0);
+    assert_eq!(app.canvas.draft_cursor, Some(projected));
+    frame(
+        &mut app,
+        vec![egui::Event::PointerButton { pos: at, button: egui::PointerButton::Primary, pressed: true, modifiers: egui::Modifiers::NONE }],
+    );
+    let drawing = app.session.doc().unwrap();
+    assert!(matches!(&drawing.model.iter().last().unwrap().kind, cadcraft_doc::EntityKind::Polyline3d(line)
+        if line.points == [Vec3::new(1.0, 2.0, 3.0), target, projected]));
+}
+
 /// A hot grip whose object was hidden since (HIDEOBJECTS, a layer turned off) is no longer
 /// painted, so clicking another hot grip must not stretch the hidden object along with it.
 #[test]

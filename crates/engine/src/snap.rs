@@ -8,8 +8,10 @@ mod viewport;
 pub use viewport::ViewportPoint;
 
 use cadcraft_doc::{Drawing, EntityKind, Insert, MAX_BLOCK_DEPTH, Prim, Space};
-use cadcraft_geom::{Bounds2, Circle, EPS, Ellipse, Mat3, PI, Segment, Vec2, intersect_ext};
+use cadcraft_geom::{Bounds2, Circle, EPS, Ellipse, Mat3, PI, Segment, Vec2, Vec3, intersect_ext};
 use serde::Serialize;
+
+mod spatial;
 
 /// OSMODE bits.
 pub mod mode {
@@ -62,12 +64,19 @@ pub struct SnapHit {
     /// curve) until the other end of the line is known. See [`resolve_deferred`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deferred: Option<Deferred>,
+    /// Known source elevation for a sampled point.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub world_z: Option<f64>,
 }
 
 impl SnapHit {
     /// A pick on an original point shown in a point-cloud preview.
     pub fn point_cloud(point: Vec2) -> Self {
         Self { name: "Point cloud point", ..Self::plain(mode::NOD, point) }
+    }
+
+    pub fn cloud_sample(point: Vec3) -> Self {
+        Self { world_z: Some(point.z), ..Self::point_cloud(point.xy()) }
     }
 
     /// The command input a pick at this snap gives: a deferred snap or a plain point.
@@ -80,7 +89,7 @@ impl SnapHit {
 
     /// A fixed point provided by a view's geometric snap query.
     pub fn plain(mode: u32, point: Vec2) -> SnapHit {
-        SnapHit { point, mode, name: name_of(mode), viewport: None, deferred: None }
+        SnapHit { point, mode, name: name_of(mode), viewport: None, deferred: None, world_z: None }
     }
 
     /// Where this hit sorts among the candidates near a cursor: specific snaps by distance
@@ -614,7 +623,7 @@ fn finish(
             }
         }
         if let Some((_, p)) = nb {
-            hits.push(SnapHit { point: p, mode: mode::NEA, name: "Nearest", viewport: None, deferred: None });
+            hits.push(SnapHit::plain(mode::NEA, p));
         }
     }
     ranked(hits, cursor, aperture)
@@ -954,7 +963,7 @@ fn deferred_hits(prims: &[Prim], cursor: Vec2, aperture: f64, osmode: u32, clip:
             SnapCurve::Line { .. } => &[(mode::PER, "Deferred Perpendicular")],
         };
         for &(m, name) in modes.iter().filter(|(m, _)| osmode & m != 0) {
-            hits.push(SnapHit { point: at, mode: m, name, viewport: None, deferred: Some(Deferred { mode: m, curve, at }) });
+            hits.push(SnapHit { name, deferred: Some(Deferred { mode: m, curve, at }), ..SnapHit::plain(m, at) });
         }
     }
     hits

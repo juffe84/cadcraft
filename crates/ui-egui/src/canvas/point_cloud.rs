@@ -153,7 +153,7 @@ pub(super) fn paint_plan(app: &CadApp, painter: &egui::Painter, xf: &Xf, request
     painter.add(Shape::mesh(mesh));
 }
 
-pub(super) fn snap_visible(app: &CadApp, xf: &Xf, raw: Vec2, aperture: f64) -> Option<Vec2> {
+pub(super) fn snap_visible(app: &CadApp, xf: &Xf, raw: Vec2, aperture: f64) -> Option<Vec3> {
     let cloud = cloud(app)?;
     let bounds = xf.world_bounds();
     let snapshot = view(cloud, bounds, app, false);
@@ -166,9 +166,9 @@ pub(super) fn snap_visible(app: &CadApp, xf: &Xf, raw: Vec2, aperture: f64) -> O
             let xy = point.position.xy();
             let delta = xy - raw;
             let d = delta.dot(delta);
-            if d <= distance && xf.rect.contains(xf.to_screen(xy)) {
+            if (d < distance || (d == distance && nearest.is_none_or(|p: Vec3| p.z < point.position.z))) && xf.rect.contains(xf.to_screen(xy)) {
                 distance = d;
-                nearest = Some(xy);
+                nearest = Some(point.position);
             }
         });
     }
@@ -272,14 +272,19 @@ impl OrbitFrame {
 
     /// A view ray meeting the horizontal drafting plane at the current elevation.
     pub(super) fn on_draft_plane(&self, at: egui::Pos2, z: f64) -> Option<Vec3> {
+        self.on_plane(at, Vec3::new(0.0, 0.0, z), Vec3::Z).map(|p| p.xy().to3(z))
+    }
+
+    pub(super) fn on_plane(&self, at: egui::Pos2, reference: Vec3, normal: Vec3) -> Option<Vec3> {
         let origin = self.ray_origin(at);
         let direction = self.ray_direction(at);
-        if direction.z.abs() <= 1e-9 {
+        let den = direction.dot(normal);
+        if den.abs() <= 1e-9 {
             return None;
         }
-        let depth = (z - origin.z) / direction.z;
+        let depth = (reference - origin).dot(normal) / den;
         let p = origin + direction * depth;
-        (p.is_finite() && self.camera.weight(depth) > 0.01).then_some(p.xy().to3(z))
+        (p.is_finite() && self.camera.weight(depth) > 0.01).then_some(p)
     }
 
     /// Locate a screen pixel on the plane at the depth of a visible sample.
@@ -559,6 +564,8 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     app.canvas.cursor = None;
     app.canvas.snap = None;
     app.canvas.orbit_cursor = None;
+    app.canvas.draft_cursor = None;
+    app.session.spatial_cursor = None;
     let label = if model.is_none() && root.is_some() { "Point cloud 3D view" } else { "Model 3D view" };
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Image, true, crate::i18n::t(label)));
     crate::control::record_widget(ui, &response, label, "image", None);
@@ -982,7 +989,7 @@ mod tests {
         let app = CadApp::new(session, Default::default());
         let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(100.0, 100.0));
         let xf = Xf { rect, center: xy, scale: 2.0, twist: 0.0 };
-        assert_eq!(snap_visible(&app, &xf, xy + Vec2::X, 2.0), Some(xy));
+        assert_eq!(snap_visible(&app, &xf, xy + Vec2::X, 2.0), Some(point.position));
         assert_eq!(snap_visible(&app, &xf, xy + Vec2::X * 4.0, 2.0), None);
 
         let mut harness =

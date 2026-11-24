@@ -93,8 +93,8 @@ impl Interactive for LineM {
         match self.pts.len() {
             0 if self.first.is_some() => Prompt::new("Specify next point", Accept::POINT).kw(&["Undo"]).deferred(),
             0 => Prompt::new("Specify first point", Accept::POINT).deferred(),
-            1 | 2 => Prompt::new("Specify next point", Accept::POINT).kw(&["Undo"]).base_opt(self.pts.last().map(|p| p.xy())),
-            _ => Prompt::new("Specify next point", Accept::POINT).kw(&["Close", "Undo"]).base_opt(self.pts.last().map(|p| p.xy())),
+            1 | 2 => Prompt::new("Specify next point", Accept::POINT).kw(&["Undo"]).base3_opt(self.pts.last().copied()),
+            _ => Prompt::new("Specify next point", Accept::POINT).kw(&["Close", "Undo"]).base3_opt(self.pts.last().copied()),
         }
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
@@ -153,6 +153,9 @@ impl Interactive for LineM {
                     s.doc_mut()?.remove_entity(h);
                 }
                 self.pts.pop();
+                if let Some(&last) = self.pts.last() {
+                    s.note_point3(last);
+                }
                 Ok(Step::Continue)
             }
             Input::Keyword(k) if k == "Close" => {

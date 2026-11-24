@@ -164,8 +164,8 @@ pub(super) fn effective_point(app: &mut CadApp, raw: Vec2, xf: &Xf, ctx: &egui::
         && let Some(point) = super::point_cloud::snap_visible(app, xf, raw, q.aperture)
     {
         app.canvas.track = None;
-        app.canvas.snap = Some(snap::SnapHit::point_cloud(point));
-        return point;
+        app.canvas.snap = Some(snap::SnapHit::cloud_sample(point));
+        return point.xy();
     }
     r.point
 }
@@ -216,7 +216,7 @@ pub(super) fn override_cursor(app: &mut CadApp, raw: Vec2, xf: &Xf) {
             cands.get(i % cands.len().max(1)).copied()
         }
         None => snap::osnap(&st.doc, &st.edit_space(), raw, ap, osmode, base, deferred).or_else(|| {
-            (osmode & snap::mode::NOD != 0).then(|| super::point_cloud::snap_visible(app, xf, raw, ap)).flatten().map(snap::SnapHit::point_cloud)
+            (osmode & snap::mode::NOD != 0).then(|| super::point_cloud::snap_visible(app, xf, raw, ap)).flatten().map(snap::SnapHit::cloud_sample)
         }),
     };
     let p = match (hit, app.canvas.snap) {

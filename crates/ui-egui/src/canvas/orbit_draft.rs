@@ -5,7 +5,7 @@ use cadcraft_doc::{
     Handle,
     point_cloud::{CloudView, PointCloud},
 };
-use cadcraft_engine::{Input, Session, snap};
+use cadcraft_engine::{Session, snap};
 use cadcraft_geom::Vec3;
 use cadcraft_render::{Kind, Options};
 use egui::{Painter, Pos2, Response, Stroke};
@@ -33,8 +33,8 @@ fn point_at(session: &Session, frame: &OrbitFrame, model: Option<&Model>, clouds
     let plane = session.orbit_draft_plane();
     let query = Query::new(session);
     if let Some((position, mode)) = model.and_then(|model| query.find(model, frame, at)) {
-        let hit = snap::SnapHit::plain(mode, position.xy());
-        return Some(DraftPoint { position, snap: Some(hit) });
+        let hit = snap::SnapHit { world_z: Some(position.z), ..snap::SnapHit::plain(mode, position.xy()) };
+        return Some(DraftPoint { position: session.project_spatial_snap(position), snap: Some(hit) });
     }
     if plane.cloud_snap
         && session.settings.point_cloud_snap
@@ -44,11 +44,15 @@ fn point_at(session: &Session, frame: &OrbitFrame, model: Option<&Model>, clouds
         let size = session.settings.point_cloud_size;
         let aperture = query.radius.max(size * 0.5);
         if let Some(position) = frame.pick_where(layers(snapshot, root), at, 160_000, aperture, size, |p| query.accepts(p)) {
-            let hit = snap::SnapHit::point_cloud(position.xy());
-            return Some(DraftPoint { position, snap: Some(hit) });
+            let hit = snap::SnapHit::cloud_sample(position);
+            return Some(DraftPoint { position: session.project_spatial_snap(position), snap: Some(hit) });
         }
     }
-    let position = frame.on_draft_plane(at, plane.height)?;
+    let reference = session.spatial_draft_reference();
+    let position = match reference {
+        Some(reference) => frame.on_plane(at, reference, session.ucs().z()),
+        None => frame.on_draft_plane(at, plane.height),
+    }?;
     Some(DraftPoint { position: session.constrain_orbit_point(position, shift), snap: None })
 }
 
@@ -88,7 +92,9 @@ pub(super) fn draw(
                 if mode == 0 && app.session.snap_override().is_some_and(|requested| requested != 0) {
                     app.session.echo(crate::i18n::t("No object snap found."));
                 } else if let Some(hit) = hit {
-                    let result = app.session.input_picked_point3(hit.position, mode);
+                    app.canvas.draft_cursor = Some(hit.position);
+                    app.canvas.snap = hit.snap;
+                    let result = super::place_command_point(app, hit.position.xy(), crate::cmdline::dyn_frame(app));
                     report(&mut app.session, result);
                 } else {
                     app.session.echo(crate::i18n::t("The drawing plane is edge-on. Tilt the view or snap to a point."));
@@ -105,9 +111,7 @@ pub(super) fn draw(
         }
     }
     if response.secondary_clicked() && app.session.prompting() {
-        if let Err(error) = app.session.input(Input::Enter) {
-            app.session.echo(error.to_string());
-        }
+        crate::cmdline::submit(app);
         painter.ctx().request_repaint();
     }
     let Some(at) = hover.filter(|at| on_canvas(*at)) else { return };
@@ -124,18 +128,29 @@ pub(super) fn draw(
         }
         return;
     }
-    let Some(hit) = point_at(&app.session, frame, model, clouds, at, shift) else { return };
+    let Some(mut hit) = point_at(&app.session, frame, model, clouds, at, shift) else { return };
+    if let Some(f) = crate::cmdline::dyn_frame(app)
+        && let Some(e) = crate::dyninput::parse(&app.cmd.buffer, &f)
+        && let Some(point) = crate::dyninput::resolve_xyz(&e, &f, hit.position, false)
+    {
+        hit = DraftPoint { position: point, snap: None };
+    }
     app.canvas.orbit_cursor = Some(hit);
+    app.canvas.draft_cursor = Some(hit.position);
+    app.session.spatial_cursor = Some(hit.position);
     app.canvas.cursor = Some(hit.position.xy());
     app.session.cursor = hit.position.xy();
-    let target = frame.project(hit.position).0;
     if let Some(snap) = hit.snap {
         app.canvas.snap = Some(snap);
+        let target = frame.project(snap.point.to3(snap.world_z.unwrap_or(hit.position.z))).0;
         cursor::draw_snap_marker(painter, target, &snap);
     } else {
         painter.ctx().set_cursor_icon(egui::CursorIcon::Crosshair);
     }
     preview(&app.session, painter, frame, hit.position);
+    if app.cmd.options.is_none() && app.session.spatial_draft_reference().is_some() {
+        super::dyn_boxes::dynamic_input(app, painter, at, false);
+    }
 }
 
 fn picked(session: &Session, frame: &OrbitFrame, model: Option<&Model>, at: Pos2) -> Option<(Handle, Vec3)> {

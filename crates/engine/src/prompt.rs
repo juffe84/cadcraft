@@ -74,6 +74,9 @@ pub struct Prompt {
     pub accept: Accept,
     /// Rubber-band origin (for direct distance entry, ortho and polar).
     pub base: Option<Vec2>,
+    /// Height of a spatial rubber-band origin.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_z: Option<f64>,
     /// The command resolves deferred tangent/perpendicular snaps ([`Input::Deferred`]) at this
     /// prompt (a point with no base yet, e.g. the first point of a line). Elsewhere a deferred
     /// pick arrives as the plain point it was picked at.
@@ -174,6 +177,12 @@ impl Prompt {
     }
     pub fn base_opt(mut self, p: Option<Vec2>) -> Self {
         self.base = p;
+        self
+    }
+
+    pub fn base3_opt(mut self, point: Option<Vec3>) -> Self {
+        self.base = point.map(Vec3::xy);
+        self.base_z = point.map(|p| p.z);
         self
     }
     /// The base is a window's first corner (the `corner` field).
@@ -476,16 +485,31 @@ pub fn parse_point_in(text: &str, last: Vec2, angles: &crate::units::AngleSettin
 
 /// Explicit Cartesian XYZ input. Two-component and polar entries keep their existing grammar.
 pub(crate) fn parse_point3_in(text: &str, last: Vec3, ucs: crate::ucs::UcsFrame) -> Option<Vec3> {
+    parse_cartesian3(text, last, ucs, None)
+}
+
+pub(crate) fn parse_cartesian3(text: &str, last: Vec3, ucs: crate::ucs::UcsFrame, default: Option<Vec3>) -> Option<Vec3> {
     let input = text.trim();
     let (world_first, input) = input.strip_prefix('*').map_or((false, input), |rest| (true, rest.trim_start()));
     let (relative, input) = input.strip_prefix('@').map_or((false, input.trim_start_matches('#').trim_start()), |rest| (true, rest.trim_start()));
     let (world, input) = input.strip_prefix('*').map_or((world_first, input), |rest| (true, rest.trim_start()));
+    let frame = if world { crate::ucs::UcsFrame::WORLD } else { ucs };
     let mut parts = input.split(',').map(crate::units::parse_distance);
-    let p = Vec3::new(parts.next()??, parts.next()??, parts.next()??);
+    let (x, y) = (parts.next()??, parts.next()??);
+    let z = match parts.next() {
+        Some(z) => z?,
+        None => {
+            if relative {
+                default.map(|_| 0.0)?
+            } else {
+                frame.to_ucs3(default?).z
+            }
+        }
+    };
+    let p = Vec3::new(x, y, z);
     if parts.next().is_some() {
         return None;
     }
-    let frame = if world { crate::ucs::UcsFrame::WORLD } else { ucs };
     let p = frame.to_wcs3(if relative { frame.to_ucs3(last) + p } else { p });
     p.is_finite().then_some(p)
 }

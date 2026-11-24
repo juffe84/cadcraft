@@ -26,7 +26,7 @@ pub(crate) fn snaps(builder: &mut Builder, ctx: &Ctx, e: &Entity) {
     use SpatialSnap::*;
     let world = |p: Vec3| lifted(ctx.xf.apply(p.xy()), ctx.z_offset + ctx.z_scale * p.z);
     let mut add = |snap: SpatialSnap| {
-        if snap.positions().iter().all(|p| p.is_finite()) {
+        if snap.positions().iter().all(|p| p.is_finite()) && (!builder.snaps_only || builder.charge(1)) {
             builder.list.spatial_snaps.push(snap);
         }
     };
@@ -57,6 +57,8 @@ pub(crate) fn snaps(builder: &mut Builder, ctx: &Ctx, e: &Entity) {
             }
         }
         EntityKind::Point(p) => add(Node(world(p.p))),
+        EntityKind::Text(t) => add(Insertion(world(lifted(t.justify_point(), elevation(&e.kind))))),
+        EntityKind::MText(t) => add(Insertion(world(t.insert))),
         EntityKind::Insert(p) => add(Insertion(world(p.insert))),
         EntityKind::Face3d(f) => {
             for (a, b) in f.visible_edges() {

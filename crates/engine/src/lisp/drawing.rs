@@ -118,8 +118,11 @@ pub fn command(ctx: &mut Ctx<'_>, a: Vec<Value>) -> Result<Flow, LispError> {
             Value::Cons(_) => {
                 if let Some(p) = arg.as_point() {
                     // A routine's points are in the current UCS, as typed ones are.
-                    let w = ctx.s.input_ucs().to_wcs(Vec2::new(p[0], p[1]));
-                    feed(ctx.s, Input::Point(w));
+                    if ctx.s.running.is_some()
+                        && let Err(e) = ctx.s.input_ucs_point(p, arg.iter().nth(2).is_some())
+                    {
+                        ctx.s.echo(e.to_string());
+                    }
                 } else if let Value::Ename(h) = arg.car() {
                     // An `entsel` result: (ename point).
                     // The pick point is what `entsel` gave: a UCS point, like the ones above.

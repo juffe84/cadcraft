@@ -132,6 +132,7 @@ pub(crate) fn build_space_within(d: &Drawing, space: &Space, opts: &Options, plo
         transparency: 0,
         points: &points,
         max_points,
+        snaps_only: false,
     };
     if let Space::Paper(name) = space {
         b.list.sheet = paper::sheet(d, name);
@@ -193,6 +194,7 @@ fn build_parallel(b: &mut Builder, d: &Drawing, store: &cadcraft_doc::EntityStor
                 transparency: 0,
                 points,
                 max_points,
+                snaps_only: false,
             };
             for e in chunk {
                 entity(&mut part, &top_ctx(d, Mat3::IDENTITY, e.handle, &[], &[]), e);
@@ -245,6 +247,15 @@ pub fn build_entities<'a, I: IntoIterator<Item = &'a Entity>>(d: &Drawing, ents:
     } else {
         opts
     };
+    build_loose(d, ents, opts, false)
+}
+
+/// Exact spatial snap features of the supplied entities, including transformed block contents.
+pub fn build_spatial_snaps<'a>(d: &Drawing, ents: impl IntoIterator<Item = &'a Entity>) -> Vec<crate::SpatialSnap> {
+    build_loose(d, ents, &Options::default(), true).spatial_snaps
+}
+
+fn build_loose<'a>(d: &Drawing, ents: impl IntoIterator<Item = &'a Entity>, opts: &Options, snaps_only: bool) -> DisplayList {
     let points = std::sync::atomic::AtomicUsize::new(0);
     let mut b = Builder {
         list: DisplayList::new(opts.spatial),
@@ -255,7 +266,8 @@ pub fn build_entities<'a, I: IntoIterator<Item = &'a Entity>>(d: &Drawing, ents:
         shared_budget: None,
         transparency: 0,
         points: &points,
-        max_points: MAX_DISPLAY_POINTS,
+        max_points: if snaps_only { 40_000 } else { MAX_DISPLAY_POINTS },
+        snaps_only,
     };
     for e in ents {
         entity(&mut b, &top_ctx(d, Mat3::IDENTITY, e.handle, &[], &[]), e);

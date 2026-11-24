@@ -126,6 +126,7 @@ pub struct CanvasState {
     cloud_orbit_focus: Option<point_cloud::OrbitFocus>,
     orbit_scene: orbit_scene::Scene,
     pub(crate) orbit_cursor: Option<orbit_draft::DraftPoint>,
+    pub(crate) draft_cursor: Option<cadcraft_geom::Vec3>,
     pub(crate) orbit_keyboard_focus: bool,
     /// The mesh last handed to the GPU (see [`crate::gpu::CanvasCallback::key`]).
     mesh_key: Option<u64>,
@@ -972,18 +973,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
             if mods.ctrl && app.session.running.as_ref().is_some_and(|r| r.id == "grip") {
                 let _ = app.session.input(Input::Keyword("Copy".into()));
             }
-            // Clicking places the point; a value typed into the Dynamic Input boxes is used up.
-            if let Some(f) = dyn_frame
-                && crate::dyninput::parse(&app.cmd.buffer, &f).is_some()
-            {
-                app.cmd.buffer.clear();
-            }
-            // Preserve a snap's viewport origin for DIST, and its deferred curve where needed.
-            let result = match app.canvas.snap {
-                Some(hit) => app.session.input_snapped(hit),
-                None => app.session.input(Input::Point(p)),
-            };
-            if let Err(e) = result {
+            if let Err(e) = place_command_point(app, p, dyn_frame) {
                 app.session.echo(e.to_string());
             }
         } else if let Some(g) = crate::dyngrips::at(app, &xf, hover_pos) {
@@ -1047,11 +1037,13 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
 /// Put the cursor at `raw` (world, `None` off the canvas): snaps, ortho and polar, a locked
 /// Dynamic Input value and typed grip dimensions applied (`app.canvas.cursor`, `.snap`, `.track`).
 fn track_cursor(app: &mut CadApp, raw: Option<Vec2>, xf: &Xf, ctx: &egui::Context, dyn_frame: Option<crate::dyninput::Frame>) {
+    app.canvas.draft_cursor = None;
     if let Some(w) = raw {
         let mut eff = effective_point(app, w, xf, ctx);
         // A locked Dynamic Input value (`40,` or `40<` typed) holds the cursor and overrides snaps.
         if let Some(f) = dyn_frame
             && let Some(e) = crate::dyninput::parse(&app.cmd.buffer, &f)
+            && !e.has_z(&f)
             && e.first_locked().is_some()
         {
             eff = crate::dyninput::constrain(&e, &f, eff, app.cmd.second_locked());
@@ -1079,10 +1071,59 @@ fn track_cursor(app: &mut CadApp, raw: Option<Vec2>, xf: &Xf, ctx: &egui::Contex
             app.canvas.snap = None;
             app.session.cursor_deferred = None;
         }
+        if let Some(p) = app.canvas.cursor {
+            let picked = app.canvas.snap.and_then(|hit| app.session.plan_snap_xyz(hit, app.session.settings.aperture / xf.scale));
+            let mut raw = p;
+            if picked.is_none() && app.canvas.snap.is_some_and(|hit| hit.mode == snap::mode::INT) && app.session.spatial_draft_reference().is_some() {
+                // A crossing in plan is not necessarily an intersection in space.
+                app.canvas.snap = None;
+                raw = w;
+            }
+            app.canvas.draft_cursor = picked.or_else(|| app.session.spatial_point_at_xy(raw));
+            if let Some(point) = app.canvas.draft_cursor {
+                app.canvas.cursor = Some(point.xy());
+                app.session.cursor = point.xy();
+            }
+        }
+        if let Some(point) = app.canvas.draft_cursor
+            && let Some(f) = dyn_frame
+            && let Some(e) = crate::dyninput::parse(&app.cmd.buffer, &f)
+            && let Some(held) = crate::dyninput::resolve_xyz(&e, &f, point, false)
+        {
+            app.canvas.draft_cursor = Some(held);
+            app.canvas.cursor = Some(held.xy());
+            app.session.cursor = held.xy();
+            app.canvas.snap = None;
+            app.canvas.track = None;
+            app.session.cursor_deferred = None;
+        }
     } else {
         app.canvas.cursor = None;
+        app.canvas.draft_cursor = None;
         app.canvas.snap = None;
         app.session.cursor_deferred = None;
+    }
+    app.session.spatial_cursor = app.canvas.draft_cursor;
+}
+
+fn place_command_point(app: &mut CadApp, point: Vec2, frame: Option<crate::dyninput::Frame>) -> cadcraft_engine::Result<()> {
+    let entry = frame.as_ref().and_then(|frame| crate::dyninput::parse(&app.cmd.buffer, frame).map(|entry| (frame, entry)));
+    let typed = app.canvas.draft_cursor.and_then(|p| entry.as_ref().and_then(|(frame, entry)| crate::dyninput::resolve_xyz(entry, frame, p, true)));
+    if entry.is_some() {
+        app.cmd.buffer.clear();
+    }
+    if let Some(point) = typed {
+        return app.session.input_point3(point);
+    }
+    if app.canvas.draft_cursor.is_some() && app.canvas.snap.is_none() && app.session.snap_override().is_some_and(|mode| mode != 0) {
+        app.session.echo(crate::i18n::t("No object snap found."));
+        return Ok(());
+    }
+    match (app.canvas.snap, app.canvas.draft_cursor) {
+        (Some(hit), Some(point)) if hit.deferred.is_none() && hit.viewport.is_none() => app.session.input_picked_point3(point, hit.mode),
+        (Some(hit), _) => app.session.input_snapped(hit),
+        (None, Some(point)) => app.session.input_point3(point),
+        (None, None) => app.session.input(Input::Point(point)),
     }
 }
 
@@ -1113,18 +1154,7 @@ fn press_at(app: &mut CadApp, xf: &Xf, ctx: &egui::Context, pos: Pos2, mods: egu
         if mods.ctrl && app.session.running.as_ref().is_some_and(|r| r.id == "grip") {
             let _ = app.session.input(Input::Keyword("Copy".into()));
         }
-        // Clicking places the point; a value typed into the Dynamic Input boxes is used up.
-        if let Some(f) = dyn_frame
-            && crate::dyninput::parse(&app.cmd.buffer, &f).is_some()
-        {
-            app.cmd.buffer.clear();
-        }
-        // Preserve a snap's viewport origin for DIST, and its deferred curve where needed.
-        let result = match app.canvas.snap {
-            Some(hit) => app.session.input_snapped(hit),
-            None => app.session.input(Input::Point(p)),
-        };
-        if let Err(e) = result {
+        if let Err(e) = place_command_point(app, p, dyn_frame) {
             app.session.echo(e.to_string());
         }
     } else if let Err(e) = app.session.idle_click(raw, mods.shift) {

@@ -56,8 +56,7 @@ impl Axes {
         self.letters(false)
     }
 
-    /// The filtered coordinates of `first` with the rest from `second` (Z is not stored: there
-    /// is no 3D yet, so a Z taken from either point is dropped).
+    /// The filtered XY coordinates of `first` with the rest from `second`.
     pub fn combine(self, first: Vec2, second: Vec2) -> Vec2 {
         Vec2::new(if self.x { first.x } else { second.x }, if self.y { first.y } else { second.y })
     }
@@ -68,17 +67,22 @@ impl Axes {
         let r = ucs.to_wcs(self.combine(ucs.to_ucs(first), ucs.to_ucs(second)));
         if r.is_finite() { r } else { self.combine(first, second) }
     }
+
+    fn combine3_in(self, ucs: &crate::ucs::UcsFrame, first: cadcraft_geom::Vec3, second: cadcraft_geom::Vec3) -> cadcraft_geom::Vec3 {
+        let (a, b) = (ucs.to_ucs3(first), ucs.to_ucs3(second));
+        ucs.to_wcs3(self.combine(a.xy(), b.xy()).to3(if self.z { a.z } else { b.z }))
+    }
 }
 
 /// A pending point modifier.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Frame {
     /// `FROM`: the base point once given, then the offset point.
-    From { base: Option<Vec2> },
+    From { base: Option<cadcraft_geom::Vec3> },
     /// `M2P`/`MTP`: the first point once given, then the second.
-    Mid { first: Option<Vec2> },
+    Mid { first: Option<cadcraft_geom::Vec3> },
     /// A point filter: the point to take `keep` from once given, then the rest.
-    Filter { keep: Axes, first: Option<Vec2> },
+    Filter { keep: Axes, first: Option<cadcraft_geom::Vec3> },
     /// `<a`: the next point lies on the line through `base` in direction `dir` (a unit vector).
     Angle { base: Vec2, dir: Vec2 },
     /// An object snap override for the next point only: one [`mode`] bit, or 0 for `NON` (no
@@ -152,11 +156,14 @@ impl Session {
         let point = Accept::POINT;
         self.point_mods.iter().fold(cmd, |p, f| match *f {
             Frame::From { base: None } => Prompt::new("Base point", point),
-            Frame::From { base: Some(b) } => Prompt::new("<Offset>", point).base(b),
+            Frame::From { base: Some(b) } => Prompt::new("<Offset>", point).base3_opt(Some(b)),
             Frame::Mid { first: None } => Prompt::new("First point of mid", point),
-            Frame::Mid { first: Some(f) } => Prompt::new("Second point of mid", point).base(f),
-            Frame::Filter { keep, first: None } => Prompt::new(format!("{} of", keep.name()), point).base_opt(p.base),
-            Frame::Filter { keep, first: Some(_) } => Prompt::new(format!("(need {})", keep.need()), point).base_opt(p.base),
+            Frame::Mid { first: Some(f) } => Prompt::new("Second point of mid", point).base3_opt(Some(f)),
+            Frame::Filter { keep, first } => Prompt {
+                base: p.base,
+                base_z: p.base_z,
+                ..Prompt::new(if first.is_none() { format!("{} of", keep.name()) } else { format!("(need {})", keep.need()) }, point)
+            },
             Frame::TempTrack => Prompt::new("Specify temporary OTRACK point", point),
             Frame::Track { last: None } => Prompt::new("First tracking point", point),
             Frame::Track { last: Some(l) } => Prompt::new("Next point (Press ENTER to end tracking)", point).base(l),
@@ -300,26 +307,41 @@ impl Session {
 
     /// A point given while modifiers are pending: complete the top frame, and when it has its
     /// point, hand that to the frame (or command) below.
-    pub(crate) fn modifier_point(&mut self, mut p: Vec2) -> Result<()> {
+    pub(crate) fn modifier_point(&mut self, p: Vec2) -> Result<()> {
         if !p.is_finite() {
             self.echo("Invalid point.");
             return Ok(());
         }
+        let spatial = self.spatial_draft_reference().is_some();
+        let mut position = if spatial {
+            self.spatial_input.filter(|v| v.xy() == p).or_else(|| self.spatial_point_at_xy(p)).unwrap_or_else(|| p.to3(0.0))
+        } else {
+            p.to3(0.0)
+        };
         while let Some(top) = self.point_mods.pop() {
+            let p = position.xy();
             match top {
                 Frame::From { base: None } => {
-                    self.point_mods.push(Frame::From { base: Some(p) });
+                    self.point_mods.push(Frame::From { base: Some(position) });
                     // `@dx,dy` at "<Offset>:" is measured from the base point.
-                    self.last_point = p;
+                    if spatial {
+                        self.note_point3(position);
+                    } else {
+                        self.last_point = p;
+                    }
                     return Ok(());
                 }
                 Frame::Mid { first: None } => {
-                    self.point_mods.push(Frame::Mid { first: Some(p) });
-                    self.last_point = p;
+                    self.point_mods.push(Frame::Mid { first: Some(position) });
+                    if spatial {
+                        self.note_point3(position);
+                    } else {
+                        self.last_point = p;
+                    }
                     return Ok(());
                 }
                 Frame::Filter { keep, first: None } => {
-                    self.point_mods.push(Frame::Filter { keep, first: Some(p) });
+                    self.point_mods.push(Frame::Filter { keep, first: Some(position) });
                     return Ok(());
                 }
                 Frame::TempTrack => {
@@ -336,9 +358,12 @@ impl Session {
                 }
                 // The offset point is already measured from the base (`@` reads the last point).
                 Frame::From { base: Some(_) } => {}
-                Frame::Mid { first: Some(f) } => p = (f + p) * 0.5,
-                Frame::Filter { keep, first: Some(f) } => p = keep.combine_in(&self.input_ucs(), f, p),
-                Frame::Angle { base, dir } => p = base + dir * (p - base).dot(dir),
+                Frame::Mid { first: Some(f) } => position = f + (position - f) * 0.5,
+                Frame::Filter { keep, first: Some(f) } => {
+                    position =
+                        if spatial { keep.combine3_in(&self.ucs(), f, position) } else { keep.combine_in(&self.input_ucs(), f.xy(), p).to3(0.0) }
+                }
+                Frame::Angle { base, dir } => position = (base + dir * (p - base).dot(dir)).to3(position.z),
                 Frame::Snap { mode: 0 } => {}
                 Frame::Snap { mode } => {
                     // Snap the point with this mode alone, within the aperture.
@@ -351,7 +376,7 @@ impl Session {
                     let hit = crate::snap::osnap(self.doc()?, &space, p, aperture, mode | hatch, base, deferred);
                     match hit {
                         Some(h) if self.point_mods.is_empty() => return self.input_snapped(h),
-                        Some(h) => p = h.point,
+                        Some(h) => position = self.plan_snap_xyz(h, aperture).unwrap_or_else(|| h.point.to3(position.z)),
                         None => {
                             self.echo(format!("No {} found for specified point.", snap_name(mode)));
                             return Ok(());
@@ -361,7 +386,14 @@ impl Session {
             }
         }
         self.point_mods.clear();
-        self.feed(Some(Input::Point(p)))
+        if spatial {
+            let previous = self.spatial_input.replace(position);
+            let result = self.feed(Some(Input::Point(position.xy())));
+            self.spatial_input = previous;
+            result
+        } else {
+            self.feed(Some(Input::Point(position.xy())))
+        }
     }
 }
 

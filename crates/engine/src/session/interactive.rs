@@ -153,6 +153,9 @@ impl Session {
     /// Feed an object-snap pick, retaining its viewport origin for measurements. Point modifiers
     /// that combine or constrain coordinates produce ordinary drawing-space points.
     pub fn input_snapped(&mut self, hit: snap::SnapHit) -> Result<()> {
+        if let Some(position) = self.plan_snap_xyz(hit, self.pixel_size() * self.settings.aperture.max(1.0)) {
+            return self.input_picked_point3(position, hit.mode);
+        }
         let source = hit.viewport.filter(|_| self.point_mods.iter().all(|f| matches!(f, pointmod::Frame::Snap { mode } if *mode != 0)));
         let previous = std::mem::replace(&mut self.picked_viewport, source);
         let result = self.input(hit.input());
@@ -178,6 +181,17 @@ impl Session {
         self.input_picked_point3(point, 0)
     }
 
+    pub(crate) fn input_ucs_point(&mut self, [x, y, z]: [f64; 3], explicit_z: bool) -> Result<()> {
+        let xy = Vec2::new(x, y);
+        if let Some(reference) = self.spatial_draft_reference() {
+            let frame = self.ucs();
+            let z = if explicit_z { z } else { frame.to_ucs3(reference).z };
+            self.input_point3(frame.to_wcs3(xy.to3(z)))
+        } else {
+            self.input(Input::Point(self.input_ucs().to_wcs(xy)))
+        }
+    }
+
     /// Feed an orbit pick whose snap mode was resolved in the spatial view.
     pub fn input_picked_point3(&mut self, point: Vec3, mode: u32) -> Result<()> {
         if !point.is_finite() || point.x.abs().max(point.y.abs()).max(point.z.abs()) > 1e12 {
@@ -200,6 +214,44 @@ impl Session {
         self.last_spatial_point.filter(|p| p.xy() == self.last_point).unwrap_or_else(|| self.last_point.to3(0.0))
     }
 
+    pub(crate) fn note_point3(&mut self, point: Vec3) {
+        self.last_point = point.xy();
+        self.last_spatial_point = Some(point);
+    }
+
+    /// A point on the working plane for the active spatial drawing prompt.
+    pub fn spatial_draft_reference(&self) -> Option<Vec3> {
+        if !self.running.as_ref().is_some_and(|run| run.spatial_drafting()) {
+            return None;
+        }
+        let prompt = self.current_prompt()?;
+        if !crate::pointmod::accepts(&prompt) {
+            return None;
+        }
+        Some(prompt.base.zip(prompt.base_z).map_or_else(|| self.ucs().to_wcs3(Vec3::new(0.0, 0.0, self.draft_elevation())), |(base, z)| base.to3(z)))
+    }
+
+    fn draft_elevation(&self) -> f64 {
+        self.doc().ok().map(|d| d.header.f64("ELEVATION", 0.0)).filter(|z| z.is_finite()).unwrap_or(0.0)
+    }
+
+    /// Apply the session's object-snap plane projection to a spatial snap.
+    pub fn project_spatial_snap(&self, point: Vec3) -> Vec3 {
+        if !self.osnapz || self.spatial_draft_reference().is_none() {
+            return point;
+        }
+        let frame = self.ucs();
+        frame.to_wcs3(frame.to_ucs3(point).xy().to3(self.draft_elevation()))
+    }
+
+    /// An unsnapped plan-view pick on the spatial drafting plane.
+    pub fn spatial_point_at_xy(&self, point: Vec2) -> Option<Vec3> {
+        let reference = self.spatial_draft_reference()?;
+        let normal = self.ucs().z();
+        let height = if normal.z.abs() > 1e-9 { reference.z - (point - reference.xy()).dot(normal.xy()) / normal.z } else { reference.z };
+        Some(point.to3(height))
+    }
+
     fn orbit_default_height(&self) -> f64 {
         self.doc().ok().map(|d| d.header.f64("ELEVATION", 0.0) + self.input_ucs().origin.z).filter(|z| z.is_finite()).unwrap_or(0.0)
     }
@@ -217,18 +269,27 @@ impl Session {
     pub fn constrain_orbit_point(&self, raw: Vec3, shift: bool) -> Vec3 {
         let Ok(doc) = self.doc() else { return raw };
         let space = self.space();
-        let settings = self.drafting_settings();
-        let (mut point, grid) = crate::snap::iso::grid_snap(doc, &space, settings.clone(), raw.xy());
+        let mut settings = self.drafting_settings();
+        let frame = self.ucs();
+        let tilted = self.spatial_draft_reference().is_some() && !frame.is_planar();
+        let point = if tilted { frame.to_ucs3(raw) } else { raw };
+        if tilted {
+            settings.ucs_angle = 0.0;
+        }
+        let (mut xy, grid) = crate::snap::iso::grid_snap(doc, &space, settings.clone(), point.xy());
         if grid.snapmode && !grid.polarsnap {
-            let (origin, angle) = crate::snap::grid_frame_in(doc, &space);
-            point = crate::snap::grid_snap(point, doc.header.snap_unit(), origin, angle);
+            let (origin, angle) = if tilted { (Vec2::ZERO, 0.0) } else { crate::snap::grid_frame_in(doc, &space) };
+            xy = crate::snap::grid_snap(xy, doc.header.snap_unit(), origin, angle);
         }
         if settings.orthomode ^ shift
-            && let Some(base) = self.current_prompt().filter(|p| !p.corner).and_then(|p| p.base)
+            && let Some(prompt) = self.current_prompt().filter(|p| !p.corner)
+            && let Some(base) = prompt.base
         {
-            point = crate::snap::iso::ortho(&settings, base, point);
+            let base = if tilted { frame.to_ucs3(base.to3(prompt.base_z.unwrap_or(raw.z))).xy() } else { base };
+            xy = crate::snap::iso::ortho(&settings, base, xy);
         }
-        point.to3(raw.z)
+        let p = xy.to3(point.z);
+        if tilted { frame.to_wcs3(p) } else { p }
     }
 
     pub(crate) fn place_on_drafting_plane(&self, entity: &mut EntityKind) {
@@ -413,12 +474,17 @@ impl Session {
 
     pub(crate) fn feed(&mut self, input: Option<Input>) -> Result<()> {
         let base = if matches!(input, Some(Input::Point(_))) { self.current_prompt().and_then(|p| p.base) } else { None };
+        let implicit = match &input {
+            Some(Input::Point(p)) if self.spatial_input.is_none_or(|v| v.xy() != *p) => self.spatial_point_at_xy(*p),
+            _ => None,
+        };
         let Some(mut run) = self.running.take() else { return Ok(()) };
         let in_orbit =
             self.state().is_ok_and(|state| state.orbit.is_some() && state.space == cadcraft_doc::Space::Model && state.block_editor().is_none());
         let point = if let Some(Input::Point(p)) = &input {
             self.spatial_input
                 .filter(|v| v.xy() == *p)
+                .or(implicit)
                 .or_else(|| (in_orbit && (run.spatial_drafting() || run.planar_drafting())).then(|| p.to3(self.orbit_default_height())))
         } else {
             None
@@ -746,6 +812,18 @@ mod tests {
     use super::*;
     use cadcraft_doc::Space;
     use serde_json::json;
+
+    #[test]
+    fn absolute_and_relative_3dpoly_points_keep_elevation_and_modifier_heights_in_plan() {
+        let mut s = Session::empty();
+        s.open_drawing(Drawing::new_metric(), "Model", None);
+        s.execute("setvar", &json!({"name": "ELEVATION", "value": 7.0})).unwrap();
+        s.cmdline("3dpoly 1,2 @0,0,10 3,4 15,16,90 u @2,0,3 .z 0,0,40 9,10,0 m2p 12,14,40 16,18,60 c").unwrap();
+        let expected = [[1.0, 2.0, 7.0], [1.0, 2.0, 17.0], [3.0, 4.0, 17.0], [5.0, 4.0, 20.0], [9.0, 10.0, 40.0], [14.0, 16.0, 50.0]]
+            .map(|[x, y, z]| Vec3::new(x, y, z));
+        assert!(matches!(&s.doc().unwrap().model.iter().last().unwrap().kind,
+            EntityKind::Polyline3d(poly) if poly.closed && poly.points == expected));
+    }
 
     #[test]
     fn orbit_drafting_keeps_spatial_points_and_updates_a_planar_polyline_at_its_first_height() {
