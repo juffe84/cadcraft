@@ -52,6 +52,7 @@ pub mod blocks_palette;
 mod cloud_gpu;
 pub mod dyngrips;
 pub mod dyninput;
+mod earthwork;
 pub mod gpu;
 pub mod grip_dyn;
 pub mod i18n;
@@ -70,6 +71,7 @@ pub mod plotstyles;
 pub mod quick;
 pub mod save_loss;
 pub mod shortcut_menus;
+mod terrain_display;
 pub mod theme;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod updates_ui;
@@ -175,13 +177,12 @@ impl SaveFormat {
         SaveFormat::ALL.into_iter().find(|f| f.as_str().eq_ignore_ascii_case(s.trim().trim_start_matches('.')))
     }
 
-    /// The name Save As suggests: this format's extension, replacing a drawing's own (DWG, DXF or
-    /// DWT, from a drawing opened from a file); any other extension is kept.
+    /// The name Save As suggests, replacing a drawing or LandXML extension with the save format.
     pub fn suggested_name(self, title: Option<&str>) -> String {
         let Some(t) = title.map(str::trim).filter(|t| !t.is_empty()) else { return format!("Drawing.{}", self.as_str()) };
         let path = std::path::Path::new(t);
         match path.extension().and_then(|e| e.to_str()) {
-            Some(e) if ["dwg", "dxf", "dwt"].iter().any(|d| d.eq_ignore_ascii_case(e)) => {
+            Some(e) if cadcraft_doc::Format::from_path(path).is_some_and(|f| f.is_drawing() || f == cadcraft_doc::Format::LandXml) => {
                 // the extension is ASCII, so this is a char boundary
                 let stem = t.get(..t.len().saturating_sub(e.len() + 1)).unwrap_or(t);
                 format!("{stem}.{}", self.as_str())
@@ -381,6 +382,8 @@ pub struct CadApp {
     pub bedit: bedit::State,
     /// The Write Block dialog ([`wblock`]).
     pub wblock: wblock::State,
+    earthwork: Option<earthwork::State>,
+    terrain_display_focus: bool,
     /// A file dialog shown with [`Services::start_pick`]: its answer, and what to do with it.
     pending_pick: Option<PendingPick>,
     /// The startup update check and its prompt (desktop; [`updates_ui`]).
@@ -449,6 +452,8 @@ impl CadApp {
             hatch_dlg: None,
             bedit: bedit::State::default(),
             wblock: wblock::State::default(),
+            earthwork: None,
+            terrain_display_focus: false,
             #[cfg(not(target_arch = "wasm32"))]
             updates_rt: updates_ui::Runtime::default(),
             pending_pick: None,
@@ -1042,7 +1047,11 @@ impl CadApp {
     /// (egui's `Modal` blocks only the
     /// main window). The app's other dialogs are ordinary windows that leave the drawing usable.
     pub fn shows_modal(&self) -> bool {
-        self.close_prompt().is_some() || self.save_loss.is_some() || !self.recovery.items.is_empty() || self.opening.prompting()
+        self.close_prompt().is_some()
+            || self.save_loss.is_some()
+            || !self.recovery.items.is_empty()
+            || self.opening.prompting()
+            || self.ui.dialog.as_deref() == Some(terrain_display::DIALOG)
     }
 
     /// Input hook: refresh the raw surface snapshot, put in keys forwarded from floating panels'
@@ -1530,6 +1539,7 @@ mod tests {
         assert_eq!(SaveFormat::Dxf.suggested_name(Some("Floorplan.DWG")), "Floorplan.dxf");
         assert_eq!(SaveFormat::Dxf.suggested_name(Some("Floorplan.dxf")), "Floorplan.dxf");
         assert_eq!(SaveFormat::Dwg.suggested_name(Some("Title block.dwt")), "Title block.dwg");
+        assert_eq!(SaveFormat::Dwg.suggested_name(Some("Terrain.mm.xml")), "Terrain.mm.dwg");
         assert_eq!(SaveFormat::Dwg.suggested_name(Some("v1.2 plan.Dxf")), "v1.2 plan.dwg");
         assert_eq!(SaveFormat::Dwg.suggested_name(Some("平面図.dxf")), "平面図.dwg");
         assert_eq!(SaveFormat::Dwg.suggested_name(Some(".dxf")), ".dxf.dwg", "a dot file has no extension");

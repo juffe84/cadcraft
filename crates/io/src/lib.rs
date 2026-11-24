@@ -1,4 +1,4 @@
-//! CADCraft file formats: DXF/DWG read, SVG/SVGZ and LAS/LAZ import, SVG/PNG/PDF export.
+//! CADCraft file formats: DXF/DWG read, SVG/SVGZ, LAS/LAZ and LandXML import, SVG/PNG/PDF export.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
@@ -17,6 +17,7 @@ mod dxf_read;
 mod dxf_table;
 mod dxf_write;
 mod dxf_xref;
+mod landxml;
 pub mod pdf;
 pub mod plotter;
 pub mod point_cloud;
@@ -91,7 +92,7 @@ fn ext(name: impl AsRef<Path>) -> String {
 }
 
 /// Read a drawing; the format comes from the content (DXF ASCII/binary, DWG) or the name
-/// (SVG, gzip-compressed SVGZ, and LAS/LAZ point clouds).
+/// (SVG, gzip-compressed SVGZ, LAS/LAZ point clouds, and LandXML terrain).
 pub fn read(bytes: &[u8], name: impl AsRef<Path>) -> Result<Drawing> {
     read_source(bytes, name.as_ref()).map(|(d, _)| d)
 }
@@ -112,6 +113,7 @@ pub(crate) fn read_source(bytes: &[u8], name: &Path) -> Result<(Drawing, Option<
     }
     let d = match (Format::from_path(name), ext(name).as_str()) {
         (Some(Format::Svg | Format::Svgz), _) => svg_read::read(bytes),
+        (Some(Format::LandXml), _) => landxml::read(bytes),
         (Some(Format::Dxf), _) => dxf_read::read(bytes),
         (_, e) if bytes.len() > 4 => dxf_read::read(bytes).map_err(|_| IoError::Unsupported(e.to_string())),
         (_, e) => Err(IoError::Unsupported(e.to_string())),

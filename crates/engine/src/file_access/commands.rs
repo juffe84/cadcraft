@@ -75,6 +75,12 @@ pub const REFUSED: &[(&str, &str)] = &[
 pub const NO_FILES: &[&str] = &[
     "tin",
     "tin.contours",
+    "tin.elevation",
+    "tin.movevertex",
+    "tin.removetriangles",
+    "tin.clip",
+    "tin.cuthole",
+    "tin.surfaces",
     "tin.volumes",
     "ucs",
     "ucs.3point",

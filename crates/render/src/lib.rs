@@ -21,6 +21,7 @@ mod plotstyle;
 mod point;
 pub mod raster;
 mod spatial;
+mod terrain;
 mod text;
 mod tolerance;
 pub mod units;
@@ -35,6 +36,7 @@ pub use dim::{ArrowGeom, Arrowhead, DimGeometry, DimText, LineRole, arrowhead, d
 pub use fill::triangulate_evenodd;
 pub use hatch::{fill_loops as hatch_fill_loops, pattern_swatch};
 pub use paper::{PAPER_SIZES, PaperSize, Sheet, paper_size, sheet};
+pub use terrain::{TerrainColor, TerrainLegend, TerrainStyle};
 pub use tolerance::{gdt_points, tolerance_in};
 
 /// A resolved colour: its RGB, whether it is colour 7, and its index colour (0 = a true
@@ -138,6 +140,7 @@ struct Builder<'a> {
     /// The most points the build may hold: [`MAX_DISPLAY_POINTS`] (less in tests).
     max_points: usize,
     snaps_only: bool,
+    terrain: Option<&'a terrain::TerrainDisplay>,
 }
 
 /// Upper bound on the block contents drawn per display list (each block reference, MINSERT copy
@@ -430,6 +433,7 @@ impl<'a> Builder<'a> {
             points: self.points,
             max_points: self.max_points,
             snaps_only: self.snaps_only,
+            terrain: self.terrain,
         }
     }
     /// Take one unit of the block-expansion budget; false once it is spent, or once the build

@@ -337,6 +337,11 @@ pub(super) struct Scene {
 }
 
 impl Scene {
+    pub fn terrain_legend(&self, document: u64) -> Option<&cadcraft_render::TerrainLegend> {
+        let (key, model) = self.ready.as_ref()?;
+        (key.0 == document).then_some(model.list.terrain_legend.as_ref()).flatten()
+    }
+
     pub fn framing(&mut self, document: u64, fit_revision: u64, extent: Extent) -> Extent {
         if let Some((uid, fit, reference)) = self.frame
             && uid == document
@@ -358,7 +363,10 @@ pub(super) fn model(app: &mut CadApp, ctx: &egui::Context, height: f64) -> Optio
     let pixels = (state.view().height / (height * orbit.zoom)).max(1e-7);
     let band = pixels.log2().floor() as i32;
     let transparent = app.session.settings.transparency_display;
-    let key = (state.uid, state.revision, band, 0, orbit.wireframe, transparent, Arc::as_ptr(&state.doc) as usize, super::list::font_generation());
+    let style = state.terrain_style;
+    let style_key = i32::from(style.bands) | (i32::from(style.transparency) << 8) | (i32::from(style.edges) << 16) | ((style.color as i32) << 17);
+    let key =
+        (state.uid, state.revision, band, style_key, orbit.wireframe, transparent, Arc::as_ptr(&state.doc) as usize, super::list::font_generation());
     let scene = &mut app.canvas.orbit_scene;
     if scene.ready.as_ref().is_some_and(|(k, _)| k == &key) {
         return scene.ready.as_ref().map(|(_, model)| model.clone());
@@ -381,6 +389,7 @@ pub(super) fn model(app: &mut CadApp, ctx: &egui::Context, height: f64) -> Optio
     let opts = Options {
         spatial: true,
         fill: !orbit.wireframe,
+        terrain: style,
         on_screen: true,
         transparency: transparent,
         tolerance: 2.0_f64.powi(band) * 0.5,

@@ -49,6 +49,8 @@ pub struct Options {
     pub cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// Retain model heights for the orbit camera.
     pub spatial: bool,
+    /// Interactive appearance of tagged model-space terrain in spatial lists.
+    pub terrain: crate::TerrainStyle,
 }
 
 impl Options {
@@ -75,6 +77,7 @@ impl Default for Options {
             on_screen: false,
             cancel: None,
             spatial: false,
+            terrain: crate::TerrainStyle::default(),
         }
     }
 }
@@ -121,6 +124,7 @@ fn build_space(d: &Drawing, space: &Space, opts: &Options, plotting: bool) -> Di
 pub(crate) fn build_space_within(d: &Drawing, space: &Space, opts: &Options, plotting: bool, max_points: usize) -> DisplayList {
     let opts = &with_point_view(d, space, opts);
     let styler = style_table(d, space, opts, plotting).map(|t| plotstyle::Styler::new(d, t));
+    let terrain = if !plotting && *space == Space::Model { crate::terrain::TerrainDisplay::new(d, opts) } else { None };
     let points = std::sync::atomic::AtomicUsize::new(0);
     let mut b = Builder {
         list: DisplayList::new(opts.spatial),
@@ -133,7 +137,9 @@ pub(crate) fn build_space_within(d: &Drawing, space: &Space, opts: &Options, plo
         points: &points,
         max_points,
         snaps_only: false,
+        terrain: terrain.as_ref(),
     };
+    b.list.terrain_legend = terrain.as_ref().and_then(crate::terrain::TerrainDisplay::legend);
     if let Space::Paper(name) = space {
         b.list.sheet = paper::sheet(d, name);
     }
@@ -195,6 +201,7 @@ fn build_parallel(b: &mut Builder, d: &Drawing, store: &cadcraft_doc::EntityStor
                 points,
                 max_points,
                 snaps_only: false,
+                terrain: b.terrain,
             };
             for e in chunk {
                 entity(&mut part, &top_ctx(d, Mat3::IDENTITY, e.handle, &[], &[]), e);
@@ -268,6 +275,7 @@ fn build_loose<'a>(d: &Drawing, ents: impl IntoIterator<Item = &'a Entity>, opts
         points: &points,
         max_points: if snaps_only { 40_000 } else { MAX_DISPLAY_POINTS },
         snaps_only,
+        terrain: None,
     };
     for e in ents {
         entity(&mut b, &top_ctx(d, Mat3::IDENTITY, e.handle, &[], &[]), e);

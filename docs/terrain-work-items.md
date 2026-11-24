@@ -9,9 +9,12 @@ triangular 3DFACEs in model space. Work can be reviewed and tested independently
 | Generate terrain contours | Implemented | `TIN.CONTOURS` writes joined 3D polylines and can label index contours. Verify a contour crossing two triangles remains continuous. |
 | Compare existing and design terrain | Implemented | `TIN.VOLUMES` compares two named groups and reports cut, fill, net fill and overlapping area in drawing units. |
 | Persist the triangle surface | Implemented as standard CAD entities | Save as DWG or DXF and reopen with the grouped faces and their coordinates intact. |
-| Edit terrain points and constraints | Pending | Add, remove or change a sample and rebuild neighboring triangles while keeping constraints. |
-| Add terrain analysis and display styles | Pending | Provide elevation and slope bands, slope arrows, watershed analysis and selectable display of triangles, contours and points. |
-| LandXML surface interchange | Pending | Round-trip named TIN vertices, faces, units and boundaries in LandXML. |
+| Edit an existing terrain mesh | Implemented | Change a shared point elevation or position, erase a set of triangles, and cut to a closed boundary or remove a hole while preserving sampled heights. |
+| Edit source constraints and rebuild terrain | Pending | Retain and edit point membership, breaklines and boundary definitions for rebuilding the surface. |
+| Display terrain in 3D | Implemented | Switch between drawing colors, elevation bands and slope bands. Adjust surface transparency and triangle edges. |
+| Add terrain analysis and display options | Pending | Provide slope arrows, watershed analysis and independent display of contours and points. |
+| LandXML surface import | Implemented | Open a LandXML or Inframodel file and verify the named TIN groups, original XYZ coordinates and drawing units. |
+| LandXML surface export | Pending | Write named TIN vertices, faces, units and boundaries in LandXML. |
 | Survey-specific inputs and native surface metadata | Pending | Read survey point files and COGO objects directly and preserve surface definitions and edit history separately from baked faces. |
 
 ## Try the implemented commands
@@ -32,3 +35,27 @@ unit between levels. The JSON form also lets you configure index labels.
 Each XY location needs one elevation. Split crossing constraints at a shared
 XYZ vertex. Cut and fill are computed over the common XY footprint of two
 surfaces. Areas outside that footprint contribute no volume.
+
+Open **Draw → Terrain → Measure Terrain Earthwork** and choose the existing
+and design surfaces from the two menus. The picker includes unnamed groups
+such as `*A1` and lists only groups of triangular model-space faces.
+
+Open a LandXML TIN through **File → Open** using the **LandXML terrain (XML, LANDXML)** filter.
+The imported surfaces are named groups available to the terrain tools. Use **Save As** to keep the drawing as DWG or DXF.
+
+Open **View → Terrain Display...** to choose elevation bands, slope bands or the drawing's colors. Changing a setting from the plan opens the terrain in 3D Orbit from above.
+The legend shows the elevation range in drawing units or slopes from 0° to 90°.
+Band count, transparency and triangle edges are configurable for the current drawing's orbit view.
+
+
+Use **Draw → Terrain → Edit Surface** to edit an existing TIN. When more than one
+surface is open in the same drawing, pick a face to choose its surface or use the
+**Name** prompt. Use Endpoint snap to choose a vertex and enter its new elevation
+or position. An XY move leaves the vertex at the same height. A move that folds
+or overlaps the mesh is refused. **Remove Surface Triangles** selects individual
+triangles and applies the selection on Enter.
+
+For clipping or cutting a hole, choose a closed straight-segment 2D or 3D
+polyline. The plan outline cuts crossing faces and takes the new vertex heights
+from the existing TIN. The boundary polyline stays in the drawing. The resulting
+faces are a mesh edit and can be reverted with Undo.

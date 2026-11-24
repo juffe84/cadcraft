@@ -8,6 +8,9 @@ use crate::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 
 use super::machines::{SelOutcome, SelectPhase};
 
+mod edit;
+pub(crate) use edit::MOVE_VERTEX;
+
 const BUILD: &str = "tin";
 const CONTOURS: &str = "tin.contours";
 const VOLUMES: &str = "tin.volumes";
@@ -15,7 +18,7 @@ const MAX_VERTICES: usize = 50_000;
 const MAX_CONTOURS: usize = 100_000;
 
 pub fn specs() -> Vec<CommandSpec> {
-    vec![
+    let mut commands = vec![
         CommandSpec::new(BUILD, "Build Terrain Surface", build)
             .menu(&["Draw", "Terrain", "Build Terrain Surface"])
             .params("{points?: [[x,y,z]], handles?: POINT, LINE and 3D polyline handles, breaklines?: [[[x,y,z]]], outer?: [[x,y,z]], holes?: [[[x,y,z]]], name?: group name}")
@@ -26,13 +29,19 @@ pub fn specs() -> Vec<CommandSpec> {
             .params("{handles?: triangle face handles, group?: terrain group name, interval?: contour interval (default 1), majorEvery?: number of intervals per index contour (default 5), labelHeight?: height of index labels}")
             .enabled(model_space)
             .interactive(|_| Ok(Box::new(ContourPrompt::default()))),
+        CommandSpec::new("tin.surfaces", "List Terrain Surfaces", list_surfaces)
+            .params("{} -> {surfaces: [triangle group names]}")
+            .enabled(model_space)
+            .noundo(),
         CommandSpec::new(VOLUMES, "Measure Terrain Earthwork", volumes)
             .menu(&["Draw", "Terrain", "Measure Terrain Earthwork"])
             .params("{existing: terrain group name, design: terrain group name} -> {cut, fill, netFill, overlapArea}")
             .enabled(model_space)
             .interactive(|_| Ok(Box::new(VolumePrompt::default())))
             .noundo(),
-    ]
+    ];
+    commands.extend(edit::specs());
+    commands
 }
 
 #[derive(Default)]
@@ -171,7 +180,7 @@ fn build(s: &mut Session, p: &Value) -> Result<Value> {
             .into_iter()
             .map(|[a, b, c]| s.add_entity(EntityKind::Face3d(Face3d { corners: [a, b, c, c], hidden_edges: 0 })))
             .collect::<Result<Vec<_>>>()?;
-        let group = super::groups::create(s, str_param(p, "name"), "TIN terrain surface", &handles, true)?;
+        let group = super::groups::create(s, str_param(p, "name"), cadcraft_doc::TIN_GROUP_DESCRIPTION, &handles, true)?;
         s.set_selection(handles.clone());
         Ok(
             json!({ "group": group, "triangles": handles.len(), "handles": hex(&handles), "message": format!("Created terrain group {group} with {} triangles.", handles.len()) }),
@@ -187,6 +196,29 @@ fn hex(handles: &[Handle]) -> Vec<String> {
     handles.iter().map(|handle| handle.hex()).collect()
 }
 
+fn triangle(kind: &EntityKind) -> Option<terrain::Triangle> {
+    match kind {
+        EntityKind::Face3d(Face3d { corners: [a, b, c, d], .. }) if c == d => Some([*a, *b, *c]),
+        _ => None,
+    }
+}
+
+fn list_surfaces(s: &mut Session, _: &Value) -> Result<Value> {
+    let doc = s.doc()?;
+    let mut names: Vec<_> = doc
+        .groups
+        .iter()
+        .filter(|g| {
+            !g.members.is_empty()
+                && g.members.len() <= MAX_VERTICES * 2
+                && g.members.iter().all(|&h| doc.model.get(h).is_some_and(|entity| triangle(&entity.kind).is_some()))
+        })
+        .map(|group| group.name.as_str())
+        .collect();
+    names.sort_unstable_by_key(|name| name.to_ascii_lowercase());
+    Ok(json!({ "surfaces": names }))
+}
+
 fn faces(s: &Session, p: &Value) -> Result<Vec<terrain::Triangle>> {
     let doc = s.doc()?;
     let handles = if let Some(name) = str_param(p, "group") {
@@ -199,9 +231,10 @@ fn faces(s: &Session, p: &Value) -> Result<Vec<terrain::Triangle>> {
     }
     handles
         .into_iter()
-        .map(|handle| match doc.entity(handle).map(|entity| &entity.kind) {
-            Some(EntityKind::Face3d(Face3d { corners: [a, b, c, d], .. })) if c == d => Ok([*a, *b, *c]),
-            _ => Err(bad(CONTOURS, "The selection must contain only triangular 3D faces.")),
+        .map(|handle| {
+            doc.entity(handle)
+                .and_then(|entity| triangle(&entity.kind))
+                .ok_or_else(|| bad(CONTOURS, "The selection must contain only triangular 3D faces."))
         })
         .collect()
 }

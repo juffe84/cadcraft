@@ -1009,6 +1009,9 @@ impl LayerState {
     }
 }
 
+/// Group description identifying a TIN built by CADCraft or imported from terrain data.
+pub const TIN_GROUP_DESCRIPTION: &str = "TIN terrain surface";
+
 /// A named group of entities (GROUP).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Group {

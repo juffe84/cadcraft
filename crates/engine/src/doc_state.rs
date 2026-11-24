@@ -41,6 +41,8 @@ pub struct DocState {
     pub view_history: Vec<View>,
     /// Model-space inspection camera, separate from the drawing view.
     pub orbit: Option<OrbitView>,
+    /// Terrain appearance for this drawing, retained when orbit is closed.
+    pub terrain_style: cadcraft_render::TerrainStyle,
     pub uid: u64,
     /// The drawing is saved as binary DXF (it was opened from one, or last saved as one).
     pub binary_dxf: bool,
@@ -103,6 +105,7 @@ impl DocState {
             views: Vec::new(),
             view_history: Vec::new(),
             orbit: None,
+            terrain_style: cadcraft_render::TerrainStyle::default(),
             uid: NEXT_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             binary_dxf: false,
             block_edit: None,

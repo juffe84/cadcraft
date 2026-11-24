@@ -5,9 +5,13 @@ use spade::{ConstrainedDelaunayTriangulation, HasPosition, Point2, Triangulation
 
 use crate::{Vec2, Vec3, point_in_polygon};
 
+mod edit;
+pub use edit::{MAX_BOUNDARY_POINTS, clip_surface, signed_area2};
+
 pub type Triangle = [Vec3; 3];
 type Key = [u64; 3];
 
+#[derive(Clone)]
 struct Sample(Vec3);
 
 impl HasPosition for Sample {

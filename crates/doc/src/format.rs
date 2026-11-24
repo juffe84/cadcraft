@@ -12,13 +12,15 @@ pub enum Format {
     Svgz,
     Las,
     Laz,
+    /// A LandXML or Inframodel terrain file.
+    LandXml,
     Png,
     Pdf,
 }
 
 impl Format {
     /// The formats a drawing can be read from by name. DXF and DWG are also recognised by content.
-    pub const READ: &'static [Format] = &[Format::Dxf, Format::Dwg, Format::Svg, Format::Svgz, Format::Las, Format::Laz];
+    pub const READ: &'static [Format] = &[Format::Dxf, Format::Dwg, Format::Svg, Format::Svgz, Format::Las, Format::Laz, Format::LandXml];
     /// The formats a drawing can be written to.
     pub const WRITE: &'static [Format] = &[Format::Dxf, Format::Dwg, Format::Dwt, Format::Svg, Format::Png, Format::Pdf];
 
@@ -34,6 +36,7 @@ impl Format {
             "svgz" => Format::Svgz,
             "las" => Format::Las,
             "laz" => Format::Laz,
+            "xml" | "landxml" => Format::LandXml,
             "png" => Format::Png,
             "pdf" => Format::Pdf,
             _ => return None,
@@ -50,6 +53,7 @@ impl Format {
             Format::Svgz => "svgz",
             Format::Las => "las",
             Format::Laz => "laz",
+            Format::LandXml => "xml",
             Format::Png => "png",
             Format::Pdf => "pdf",
         }
@@ -105,6 +109,6 @@ mod tests {
         assert!(Format::WRITE.iter().filter(|f| f.is_image()).count() == 3 && !Format::Svgz.is_image());
         assert!(Format::Dwt.drops_unknown() && Format::Dwg.drops_unknown() && !Format::Dxf.drops_unknown());
         assert!(Format::Dwt.is_drawing() && !Format::Pdf.is_drawing());
-        assert_eq!(Format::list(Format::READ), "dxf, dwg, svg, svgz, las, laz");
+        assert_eq!(Format::list(Format::READ), "dxf, dwg, svg, svgz, las, laz, xml");
     }
 }

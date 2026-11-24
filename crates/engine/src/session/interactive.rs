@@ -222,7 +222,11 @@ impl Session {
     /// The frame for pointer input and implicit heights in spatial drawing commands.
     /// Ordinary plan-view LINE and POINT retain the planar UCS fallback.
     pub fn spatial_draft_ucs(&self) -> crate::ucs::UcsFrame {
-        if self.running.as_ref().is_some_and(|run| run.id == "3dpoly") || self.in_model_orbit() { self.ucs() } else { self.input_ucs() }
+        if self.running.as_ref().is_some_and(|run| matches!(run.id.as_str(), "3dpoly" | crate::cmd::terrain::MOVE_VERTEX)) || self.in_model_orbit() {
+            self.ucs()
+        } else {
+            self.input_ucs()
+        }
     }
 
     fn in_model_orbit(&self) -> bool {

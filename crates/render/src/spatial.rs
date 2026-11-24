@@ -210,6 +210,9 @@ fn path(b: &mut Builder, ctx: &Ctx, color: Ink, lw: f32, points: &[Vec3], thickn
 
 fn draw_face(b: &mut Builder, ctx: &Ctx, color: Ink, lw: f32, face: &cadcraft_doc::Face3d) {
     let [a, c, d, f] = face.corners;
+    if super::terrain::draw(b, ctx, color, lw, face) {
+        return;
+    }
     if b.opts.fill {
         b.tris3(ctx, color, &[a, c, d, a, d, f]);
     }

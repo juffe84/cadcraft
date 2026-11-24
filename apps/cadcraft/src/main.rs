@@ -223,6 +223,7 @@ fn filters(pick: &Pick) -> Vec<(&'static str, Vec<&'static str>)> {
             (i18n::t("Drawings (DWG, DXF)"), vec!["dwg", "dxf", "dwt"]),
             (i18n::t("SVG drawings (SVG, SVGZ)"), vec!["svg", "svgz"]),
             (i18n::t("Point clouds (LAS, LAZ)"), vec!["las", "laz"]),
+            (i18n::t("LandXML terrain (XML, LANDXML)"), vec!["xml", "landxml"]),
             (i18n::t("All files"), vec!["*"]),
         ],
         Pick::Save(name) if name.to_ascii_lowercase().ends_with(".laz") => vec![(i18n::t("Point cloud (LAZ)"), vec!["laz"])],

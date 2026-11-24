@@ -279,7 +279,12 @@ pub fn cmdline_state(app: &CadApp) -> Value {
 pub fn inspect(app: &CadApp, ctx: &egui::Context) -> Value {
     let r = ctx.content_rect();
     let view = app.session.state().map(|s| s.view()).ok();
-    let orbit = app.session.state().ok().filter(|s| s.space == cadcraft_doc::Space::Model && s.block_editor().is_none()).and_then(|s| s.orbit);
+    let orbit = app
+        .session
+        .state()
+        .ok()
+        .filter(|s| s.space == cadcraft_doc::Space::Model && s.block_editor().is_none())
+        .and_then(|s| Some((s.orbit?, s.terrain_style)));
     json!({
         "ui": serde_json::to_value(&app.ui).unwrap_or_default(),
         "theme": if app.shown_theme() == egui::Theme::Light { "light" } else { "dark" },
@@ -288,8 +293,9 @@ pub fn inspect(app: &CadApp, ctx: &egui::Context) -> Value {
         "canvasRect": app.canvas.rect.map(|c| json!([c.left(), c.top(), c.width(), c.height()])),
         "window": [r.width(), r.height()],
         "view": view.map(|v| json!({"center": [v.center.x, v.center.y], "height": v.height})),
-        "orbit": orbit.map(|o| json!({"yaw": o.yaw, "tilt": o.tilt, "zoom": o.zoom, "pan": [o.pan.x, o.pan.y],
-            "pivot": o.pivot.map(|p| [p.x, p.y, p.z]), "fit": o.fit, "perspective": o.perspective, "wireframe": o.wireframe})),
+        "orbit": orbit.map(|(o, style)| json!({"yaw": o.yaw, "tilt": o.tilt, "zoom": o.zoom, "pan": [o.pan.x, o.pan.y],
+            "pivot": o.pivot.map(|p| [p.x, p.y, p.z]), "fit": o.fit, "perspective": o.perspective, "wireframe": o.wireframe, "terrainColor": style.color.name(), "terrainBands": style.bands,
+            "terrainTransparency": style.transparency, "terrainEdges": style.edges})),
         "cursor": app.canvas.cursor.map(|c| [c.x, c.y]),
         "draftCursor": app.canvas.draft_cursor.map(|c| [c.x, c.y, c.z]),
         "orbitCursor": app.canvas.orbit_cursor.map(|c| json!({"point": [c.position.x, c.position.y, c.position.z], "cloudSnap": c.cloud_snap(), "snap": c.snap.map(|s| s.name)})),

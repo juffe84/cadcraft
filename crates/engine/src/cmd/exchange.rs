@@ -67,7 +67,7 @@ pub fn specs() -> Vec<CommandSpec> {
         .noundo(),
         CommandSpec::new("3dorbit", "Orbit", run_orbit)
             .alias(&["3do", "orbit"])
-            .params("{enabled?: bool, yaw?: radians, tilt?: radians, zoom?: factor, pivot?: [x,y,z], pan?: [x,y], fit?: bool, perspective?: bool, wireframe?: bool, view?: top|bottom|front|back|left|right|isometric}; with no arguments toggles the model orbit camera")
+            .params("{enabled?: bool, yaw?: radians, tilt?: radians, zoom?: factor, pivot?: [x,y,z], pan?: [x,y], fit?: bool, perspective?: bool, wireframe?: bool, terrainColor?: drawing|elevation|slope, terrainBands?: 2..16, terrainTransparency?: 0..90, terrainEdges?: bool, view?: top|bottom|front|back|left|right|isometric}; with no arguments toggles the model orbit camera")
             .noundo()
             .transparent(),
         CommandSpec::new("pointcloud.settings", "Point cloud display", run_cloud_settings)
@@ -131,7 +131,23 @@ fn run_orbit(s: &mut Session, p: &Value) -> Result<Value> {
         return Err(EngineError::Other("3DORBIT requires the Model tab outside the Block Editor.".into()));
     }
     let before = state.orbit.unwrap_or_default();
-    let adjust = ["yaw", "tilt", "zoom", "pivot", "pan", "fit", "perspective", "wireframe", "view"].iter().any(|key| p.get(key).is_some());
+    let adjust = [
+        "yaw",
+        "tilt",
+        "zoom",
+        "pivot",
+        "pan",
+        "fit",
+        "perspective",
+        "wireframe",
+        "view",
+        "terrainColor",
+        "terrainBands",
+        "terrainTransparency",
+        "terrainEdges",
+    ]
+    .iter()
+    .any(|key| p.get(key).is_some());
     let flag =
         |key: &str, fallback| p.get(key).map_or(Ok(fallback), |v| v.as_bool().ok_or_else(|| bad("3dorbit", format!("{key} must be a boolean"))));
     let fit_requested = flag("fit", false)?;
@@ -176,6 +192,28 @@ fn run_orbit(s: &mut Session, p: &Value) -> Result<Value> {
             .filter(|p| p.is_finite() && p.x.abs().max(p.y.abs()) <= 1e12)
             .ok_or_else(|| bad("3dorbit", "pan must be a finite [x,y] within the drawing range"))
     })?;
+    use cadcraft_render::TerrainColor;
+    let terrain_color = match p.get("terrainColor").map(Value::as_str) {
+        None => state.terrain_style.color,
+        Some(Some("drawing")) => TerrainColor::Drawing,
+        Some(Some("elevation")) => TerrainColor::Elevation,
+        Some(Some("slope")) => TerrainColor::Slope,
+        _ => return Err(bad("3dorbit", "terrainColor must be drawing, elevation, or slope")),
+    };
+    let bounded = |key: &str, default: u8, min: u8, max: u8| {
+        p.get(key).map_or(Ok(default), |v| {
+            v.as_u64()
+                .and_then(|value| u8::try_from(value).ok())
+                .filter(|value| (min..=max).contains(value))
+                .ok_or_else(|| bad("3dorbit", format!("{key} must be an integer between {min} and {max}")))
+        })
+    };
+    let terrain = cadcraft_render::TerrainStyle {
+        color: terrain_color,
+        bands: bounded("terrainBands", state.terrain_style.bands, 2, 16)?,
+        transparency: bounded("terrainTransparency", state.terrain_style.transparency, 0, 90)?,
+        edges: flag("terrainEdges", state.terrain_style.edges)?,
+    };
     let tilt_limit = std::f64::consts::PI;
     let camera = crate::OrbitView {
         yaw: angle("yaw", yaw)?.rem_euclid(std::f64::consts::TAU),
@@ -189,9 +227,11 @@ fn run_orbit(s: &mut Session, p: &Value) -> Result<Value> {
         wireframe: flag("wireframe", before.wireframe)?,
     };
     state.orbit = enabled.then_some(camera);
+    state.terrain_style = terrain;
     Ok(json!({ "enabled": enabled, "yaw": camera.yaw, "tilt": camera.tilt, "zoom": camera.zoom,
         "pan": [pan.x, pan.y], "pivot": pivot.map(|p| [p.x, p.y, p.z]),
-        "fit": camera.fit, "perspective": camera.perspective, "wireframe": camera.wireframe }))
+        "fit": camera.fit, "perspective": camera.perspective, "wireframe": camera.wireframe,
+        "terrainColor": terrain.color.name(), "terrainBands": terrain.bands, "terrainTransparency": terrain.transparency, "terrainEdges": terrain.edges }))
 }
 
 fn run_cloud_settings(s: &mut Session, p: &Value) -> Result<Value> {
@@ -1164,6 +1204,14 @@ mod tests {
         assert!(s.state().unwrap().orbit.unwrap().tilt.cos().abs() < 1e-12);
         assert!(s.execute("3dorbit", &json!({ "fit": "later" })).is_err());
         assert!(s.state().unwrap().orbit.unwrap().perspective);
+        s.execute("3dorbit", &json!({"terrainColor": "slope", "terrainTransparency": 45, "terrainBands": 10, "terrainEdges": false})).unwrap();
+        assert!(s.execute("3dorbit", &json!({"terrainColor": "elevation", "terrainTransparency": 110})).is_err());
+        s.execute("3dorbit", &Value::Null).unwrap();
+        let reopened = s.execute("3dorbit", &Value::Null).unwrap();
+        assert_eq!(reopened["terrainColor"], "slope");
+        assert_eq!(reopened["terrainTransparency"], 45);
+        assert_eq!(reopened["terrainBands"], 10);
+        assert_eq!(reopened["terrainEdges"], false);
         s.execute("3dorbit", &Value::Null).unwrap();
         let state = s.state().unwrap();
         assert!(state.orbit.is_none());

@@ -48,7 +48,7 @@ mod selecttools;
 mod settings;
 mod spline_opts;
 mod table;
-mod terrain;
+pub(crate) mod terrain;
 mod tolerance;
 mod trimextend;
 mod txt2mtxt;

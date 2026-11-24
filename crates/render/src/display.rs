@@ -95,6 +95,8 @@ pub struct DisplayList {
     pub tris: Vec<Vec2>,
     /// Model-space Z coordinates for orbit lists, parallel to the planar arrays.
     pub heights: Option<Heights>,
+    /// Legend for the terrain bands shown in the spatial display.
+    pub terrain_legend: Option<crate::TerrainLegend>,
     /// Authored object-snap geometry, independent of line dashes and tessellation.
     pub spatial_snaps: Vec<SpatialSnap>,
     /// The raster images drawn by [`Kind::Image`] primitives.

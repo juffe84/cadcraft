@@ -12,7 +12,7 @@ pub struct Running {
 
 impl Running {
     pub(crate) fn spatial_drafting(&self) -> bool {
-        matches!(self.id.as_str(), "line" | "3dpoly" | "point" | "point.multiple" | "pointcloud.copybase")
+        matches!(self.id.as_str(), "line" | "3dpoly" | "point" | "point.multiple" | "pointcloud.copybase" | crate::cmd::terrain::MOVE_VERTEX)
     }
 
     pub(crate) fn planar_drafting(&self) -> bool {

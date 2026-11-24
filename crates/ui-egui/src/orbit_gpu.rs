@@ -43,15 +43,44 @@ struct Run {
     vertices: Range<u32>,
 }
 
+struct TransparentTriangle {
+    center: Vec3,
+    depth: f64,
+    start: u32,
+}
+
+struct TransparentPass {
+    triangles: Vec<TransparentTriangle>,
+    indices: wgpu::Buffer,
+    sorted_axis: Option<Vec3>,
+}
+
+impl TransparentPass {
+    fn prepare(&mut self, queue: &wgpu::Queue, axis: Vec3) {
+        if self.sorted_axis == Some(axis) {
+            return;
+        }
+        self.sorted_axis = Some(axis);
+        for triangle in &mut self.triangles {
+            triangle.depth = axis.dot(triangle.center);
+        }
+        self.triangles.sort_unstable_by(|a, b| a.depth.total_cmp(&b.depth).then_with(|| a.start.cmp(&b.start)));
+        let bytes: Vec<_> = self.triangles.iter().flat_map(|t| (t.start..t.start + 3).flat_map(u32::to_le_bytes)).collect();
+        queue.write_buffer(&self.indices, 0, &bytes);
+    }
+}
+
 struct Resident {
     list: Weak<DisplayList>,
     bg: Rgb,
     buffer: wgpu::Buffer,
     runs: Vec<Run>,
+    transparent: Option<TransparentPass>,
 }
 
 struct Resources {
     pipelines: [wgpu::RenderPipeline; 3],
+    transparent_fill: wgpu::RenderPipeline,
     uniform: wgpu::Buffer,
     bind: wgpu::BindGroup,
     linear: bool,
@@ -89,7 +118,7 @@ pub fn install(rs: &egui_wgpu::RenderState, target: crate::gpu::GpuTarget) {
         immediate_size: 0,
     });
     const ATTRIBUTES: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float32x3, 1 => Unorm8x4];
-    let create = |topology| {
+    let create = |topology, depth_write| {
         device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("orbit model"),
             layout: Some(&layout),
@@ -102,7 +131,7 @@ pub fn install(rs: &egui_wgpu::RenderState, target: crate::gpu::GpuTarget) {
             primitive: wgpu::PrimitiveState { topology, ..Default::default() },
             depth_stencil: Some(wgpu::DepthStencilState {
                 format,
-                depth_write_enabled: Some(true),
+                depth_write_enabled: Some(depth_write),
                 depth_compare: Some(wgpu::CompareFunction::LessEqual),
                 stencil: Default::default(),
                 bias: Default::default(),
@@ -122,8 +151,17 @@ pub fn install(rs: &egui_wgpu::RenderState, target: crate::gpu::GpuTarget) {
             cache: None,
         })
     };
-    let pipelines = [wgpu::PrimitiveTopology::TriangleList, wgpu::PrimitiveTopology::LineList, wgpu::PrimitiveTopology::PointList].map(create);
-    rs.renderer.write().callback_resources.insert(Resources { pipelines, uniform, bind, linear: target.format.is_srgb(), resident: None });
+    let pipelines = [wgpu::PrimitiveTopology::TriangleList, wgpu::PrimitiveTopology::LineList, wgpu::PrimitiveTopology::PointList]
+        .map(|topology| create(topology, true));
+    let transparent_fill = create(wgpu::PrimitiveTopology::TriangleList, false);
+    rs.renderer.write().callback_resources.insert(Resources {
+        pipelines,
+        transparent_fill,
+        uniform,
+        bind,
+        linear: target.format.is_srgb(),
+        resident: None,
+    });
 }
 
 pub fn available(target: Option<crate::gpu::GpuTarget>) -> bool {
@@ -150,12 +188,13 @@ pub(super) fn callback(
     bg: Rgb,
 ) -> impl egui_wgpu::CallbackTrait + use<> {
     let rows = camera.rows(rect, origin);
-    Callback { list, rows, origin, span, bg }
+    Callback { list, rows, origin, span, bg, depth_axis: camera.axes[2] }
 }
 
 struct Callback {
     list: Arc<DisplayList>,
     rows: [[f32; 4]; 4],
+    depth_axis: Vec3,
     origin: Vec3,
     span: f64,
     bg: Rgb,
@@ -165,6 +204,7 @@ impl Callback {
     fn upload(&self, device: &wgpu::Device) -> Option<Resident> {
         let mut bytes = Vec::new();
         let mut runs: Vec<Run> = Vec::new();
+        let mut triangles = Vec::new();
         for prim in &self.list.prims {
             let start = (bytes.len() / 16) as u32;
             let rgb = if prim.kind == Kind::Mask { self.bg } else { prim.display_rgb(self.bg) };
@@ -178,6 +218,18 @@ impl Callback {
             };
             let mut points = self.list.spatial_points(prim);
             let shape = match prim.kind {
+                Kind::Tris if prim.transparency > 0 => {
+                    let mut vertex = start;
+                    while let (Some(a), Some(b), Some(c)) = (points.next(), points.next(), points.next()) {
+                        let center = ((a - self.origin) + (b - self.origin) + (c - self.origin)) * (1.0 / 3.0);
+                        triangles.push(TransparentTriangle { center, depth: 0.0, start: vertex });
+                        for point in [a, b, c] {
+                            push(point);
+                        }
+                        vertex += 3;
+                    }
+                    continue;
+                }
                 Kind::Tris | Kind::Mask => {
                     for point in points {
                         push(point);
@@ -214,7 +266,7 @@ impl Callback {
             if start == end {
                 continue;
             }
-            if let Some(last) = runs.last_mut().filter(|r| r.shape == shape) {
+            if let Some(last) = runs.last_mut().filter(|r| r.shape == shape && r.vertices.end == start) {
                 last.vertices.end = end;
             } else {
                 runs.push(Run { shape, vertices: start..end });
@@ -228,7 +280,16 @@ impl Callback {
             contents: &bytes,
             usage: wgpu::BufferUsages::VERTEX,
         });
-        Some(Resident { list: Arc::downgrade(&self.list), bg: self.bg, buffer, runs })
+        let transparent = (!triangles.is_empty()).then(|| {
+            let indices = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("orbit transparent triangles"),
+                size: triangles.len() as u64 * 3 * 4,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            TransparentPass { triangles, indices, sorted_axis: None }
+        });
+        Some(Resident { list: Arc::downgrade(&self.list), bg: self.bg, buffer, runs, transparent })
     }
 }
 
@@ -246,6 +307,9 @@ impl egui_wgpu::CallbackTrait for Callback {
         if res.resident.as_ref().is_none_or(|r| !Weak::ptr_eq(&r.list, &list) || r.bg != self.bg) {
             res.resident = self.upload(device);
         }
+        if let Some(transparent) = res.resident.as_mut().and_then(|model| model.transparent.as_mut()) {
+            transparent.prepare(queue, self.depth_axis);
+        }
         let mut rows = self.rows.to_vec();
         rows.push([f32::from(res.linear), 0.0, 0.0, 0.0]);
         let bytes: Vec<_> = rows.into_iter().flatten().flat_map(f32::to_le_bytes).collect();
@@ -261,6 +325,11 @@ impl egui_wgpu::CallbackTrait for Callback {
         for run in &model.runs {
             pass.set_pipeline(&res.pipelines[run.shape as usize]);
             pass.draw(run.vertices.clone(), 0..1);
+        }
+        if let Some(transparent) = &model.transparent {
+            pass.set_pipeline(&res.transparent_fill);
+            pass.set_index_buffer(transparent.indices.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(0..transparent.triangles.len() as u32 * 3, 0, 0..1);
         }
     }
 }

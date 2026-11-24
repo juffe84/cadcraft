@@ -141,6 +141,7 @@ pub(super) fn ensure_vp_content(app: &mut CadApp, xf_paper: &Xf, ctx: &egui::Con
             on_screen: true,
             cancel: None,
             spatial: false,
+            terrain: Default::default(),
         };
         c.list = cadcraft_render::viewport_content(&st.doc, &st.space, h, area, &opts);
         c.key = Some(key);

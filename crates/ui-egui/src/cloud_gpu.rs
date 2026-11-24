@@ -502,19 +502,30 @@ mod tests {
         let mut drawing = cadcraft_doc::Drawing::new_metric();
         let points = [Vec3::new(-25.0, -25.0, 0.0), Vec3::new(25.0, -25.0, 0.0), Vec3::new(0.0, 25.0, 0.0), Vec3::new(0.0, 25.0, 0.0)];
         let color = cadcraft_color::Color::True(cadcraft_color::Rgb(0, 255, 0));
-        drawing
+        let terrain = drawing
             .add(
                 &cadcraft_doc::Space::Model,
                 cadcraft_doc::Common { color, ..Default::default() },
                 cadcraft_doc::EntityKind::Face3d(cadcraft_doc::Face3d { corners: points, hidden_edges: 15 }),
             )
             .unwrap();
-        let list = Arc::new(cadcraft_render::build(
-            &drawing,
-            &cadcraft_doc::Space::Model,
-            &cadcraft_render::Options { spatial: true, ..Default::default() },
-        ));
-        let model = crate::orbit_gpu::callback(rect, list, &camera, Vec3::ZERO, 50.0, cadcraft_color::Rgb(0, 0, 0));
+        drawing.groups.push(cadcraft_doc::Group {
+            name: "Terrain".into(),
+            description: cadcraft_doc::TIN_GROUP_DESCRIPTION.into(),
+            selectable: true,
+            members: vec![terrain],
+        });
+        let model = |transparency| {
+            let terrain = cadcraft_render::TerrainStyle { transparency, ..Default::default() };
+            let list = Arc::new(cadcraft_render::build(
+                &drawing,
+                &cadcraft_doc::Space::Model,
+                &cadcraft_render::Options { spatial: true, terrain, ..Default::default() },
+            ));
+            crate::orbit_gpu::callback(rect, list, &camera, Vec3::ZERO, 50.0, cadcraft_color::Rgb(0, 0, 0))
+        };
+        let solid = model(0);
+        let transparent = model(60);
         let device = &rs.device;
         let dimensions = wgpu::Extent3d { width: SIZE, height: SIZE, depth_or_array_layers: 1 };
         let texture = |format, usage| {
@@ -537,7 +548,13 @@ mod tests {
         let region = CloudRegion::plan(cadcraft_geom::Vec2::new(-0.5, -0.5), cadcraft_geom::Vec2::new(0.5, 0.5));
         let selection = CloudEdits { selected: Some(region), highlight: Color32::from_rgb(255, 0, 255), ..Default::default() };
         let removal = CloudEdits { removed: Arc::new(vec![region]), ..Default::default() };
-        for (edits, expected) in [(CloudEdits::default(), [255, 255, 255]), (selection, [255, 0, 255]), (removal, [0, 255, 0])] {
+        for (edits, expected, translucent) in [
+            (CloudEdits::default(), [255, 255, 255], false),
+            (selection, [255, 0, 255], false),
+            (removal.clone(), [0, 255, 0], false),
+            (removal, [0, 0, 0], true),
+        ] {
+            let model = if translucent { &transparent } else { &solid };
             let mut encoder = device.create_command_encoder(&Default::default());
             callback.edits = edits;
             callback.stride = 1;
@@ -590,11 +607,16 @@ mod tests {
             assert!(faults.take().is_none());
             let pixels = readback.slice(..).get_mapped_range().unwrap();
             let center = (SIZE as usize / 2) * (SIZE as usize + 1) * 4;
-            for (&actual, &wanted) in pixels[center..center + 3].iter().zip(&expected) {
-                assert!(actual.abs_diff(wanted) < 20, "unexpected cloud pixel: {:?}", &pixels[center..center + 3]);
-            }
             let side = center + 8 * 4;
-            assert!(pixels[side + 1] > 200 && pixels[side] < 10 && pixels[side + 2] < 10);
+            if translucent {
+                assert!(pixels[center + 1] > 30 && pixels[center + 1] < 220);
+                assert!(pixels[side + 1].abs_diff(pixels[center + 1]) < 10);
+            } else {
+                for (&actual, &wanted) in pixels[center..center + 3].iter().zip(&expected) {
+                    assert!(actual.abs_diff(wanted) < 20, "unexpected cloud pixel: {:?}", &pixels[center..center + 3]);
+                }
+                assert!(pixels[side + 1] > 200 && pixels[side] < 10 && pixels[side + 2] < 10);
+            }
             assert!(pixels[0..3].iter().all(|c| *c < 10));
         }
     }

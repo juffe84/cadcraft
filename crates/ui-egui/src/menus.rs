@@ -100,6 +100,7 @@ pub const UI_COMMANDS: &[(&str, &str, &[&str], Option<&str>)] = &[
     ("ui.toggle.filetabs", "File Tab", &["Window", "File Tab"], None),
     ("ui.toggle.statusbar", "Status Bar", &["Window", "Status Bar"], None),
     ("ui.toggle.cmdline", "Command Line", &["Window", "Command Line"], Some("Cmd+9")),
+    (crate::terrain_display::COMMAND, "Terrain Display...", &["View", "Terrain Display..."], None),
     ("ui.toggle.viewcube", "ViewCube", &["View", "ViewCube", "On"], None),
     ("ui.toggle.ucsicon", "UCS Icon", &["View", "UCS Icon", "On"], None),
     ("ui.toggle.ucsicon.origin", "UCS Icon at Origin", &["View", "UCS Icon", "Origin"], None),
@@ -162,6 +163,12 @@ fn route_ui_subsystems(app: &mut CadApp, id: &str, params: &Value) -> Option<Res
     }
     if let Some(r) = crate::bedit::route(app, id, params) {
         return Some(r);
+    }
+    if id == crate::terrain_display::COMMAND {
+        return Some(crate::terrain_display::open(app));
+    }
+    if id == "tin.volumes" && params.is_null() {
+        return Some(crate::earthwork::open(app));
     }
     if let Some(r) = crate::wblock::route(app, id, params) {
         return Some(r);
@@ -727,7 +734,11 @@ pub fn tree(app: &CadApp) -> Vec<(String, Vec<Entry>)> {
     for (id, label, menu, sc) in UI_COMMANDS {
         if !menu.is_empty() {
             // The UCS icon is a setting of the drawing: off the menu's reach when none is open.
-            let enabled = !id.starts_with("ui.toggle.ucsicon") || app.session.doc().is_ok();
+            let enabled = match *id {
+                crate::terrain_display::COMMAND => crate::terrain_display::available(app),
+                id if id.starts_with("ui.toggle.ucsicon") => app.session.doc().is_ok(),
+                _ => true,
+            };
             add(menu, label, id, *sc, enabled);
         }
     }
@@ -806,12 +817,15 @@ pub fn menu_bar(app: &mut CadApp, ui: &mut egui::Ui) {
                 // Titles first, so a hovered title can take over before any menu is drawn.
                 let titles: Vec<egui::Response> = tree.iter().map(|(name, _)| ui.add(egui::Button::new(crate::i18n::menu(name)))).collect();
                 switch_on_hover(ui.ctx(), &titles);
-                for ((_, entries), title) in tree.iter().zip(&titles) {
+                for ((name, entries), title) in tree.iter().zip(&titles) {
                     egui::Popup::menu(title).show(|ui| {
                         for e in entries {
                             entry_ui(ui, e, &mut clicked);
                         }
                     });
+                    if name == "View" && clicked.as_deref() == Some(crate::terrain_display::COMMAND) {
+                        crate::terrain_display::return_to_menu(ui.ctx(), title.id);
+                    }
                 }
             });
         },

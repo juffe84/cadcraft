@@ -32,6 +32,7 @@ mod widgets;
 use cursor::{draw_crosshair, draw_snap_marker, draw_tracking, effective_point, override_cursor};
 use cycle::{CycleList, cycle_badge, cycle_click, cycle_list, over_canvas_menu, shift_space_cycle};
 pub(crate) use draw::{Look, draw_highlight, draw_list};
+
 use draw::{dashed_polygon, dashed_rect, draw_drag_gpu, draw_highlight_gpu, draw_list_gpu, list_mesh_key, selection_area_fill};
 use dyn_boxes::dynamic_input;
 pub(crate) use dyn_boxes::length_units;
@@ -224,6 +225,10 @@ pub struct CanvasState {
 type CycleKey = (Option<String>, Option<String>, u64, u64, Vec2, f64);
 
 impl CanvasState {
+    pub(crate) fn terrain_legend(&self, document: u64) -> Option<&cadcraft_render::TerrainLegend> {
+        self.orbit_scene.terrain_legend(document)
+    }
+
     pub(crate) fn drawing_has_focus(&self, ctx: &egui::Context) -> bool {
         self.orbit_view_id.or(self.plan_view_id).is_some_and(|id| ctx.memory(|memory| memory.has_focus(id)))
     }
