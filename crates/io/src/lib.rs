@@ -133,14 +133,23 @@ fn check_point_cloud_output(d: &Drawing) -> Result<()> {
     Ok(())
 }
 
+fn check_cad_output(d: &Drawing) -> Result<()> {
+    // DXF/DWG can store the traced CAD entities. The point-cloud preview is an
+    // in-memory reference to the separately opened LAS/LAZ source.
+    if d.model.is_empty() && d.layouts.iter().all(|layout| layout.entities.is_empty()) {
+        check_point_cloud_output(d)?;
+    }
+    Ok(())
+}
+
 /// Like [`write`], with the DXF/DWG version and binary DXF chosen by `opts`. Binary applies to
 /// DXF only; asking for it with another format is an error.
 pub fn write_with(d: &Drawing, name: impl AsRef<Path>, opts: &SaveOptions) -> Result<Vec<u8>> {
     let name = name.as_ref();
-    check_point_cloud_output(d)?;
     let version = opts.version.unwrap_or_else(|| save_version(d));
     match Format::from_path(name) {
         Some(Format::Dxf) => {
+            check_cad_output(d)?;
             let tags = dxf_write::tags(d, version);
             // Before 2007 the text is in the code page the header declares.
             let code_page = dxf_write::code_page(d, version);
@@ -176,7 +185,7 @@ pub fn write_noted(d: &Drawing, name: impl AsRef<Path>, opts: &SaveOptions) -> R
 /// file they came from (`Foreign::version`, not `$ACADVER`, which SAVEAS changes), and the bridge
 /// reads them as that version.
 fn write_dwg(d: &Drawing, version: Version) -> Result<(Vec<u8>, craft_dwg::Unwritten)> {
-    check_point_cloud_output(d)?;
+    check_cad_output(d)?;
     let bridge = dxf_write::dwg_bridge(d, version);
     craft_dwg::encode_kept_noted(bridge.as_bytes(), version.code(), d.foreign.version.as_deref()).map_err(dwg_error)
 }
@@ -186,7 +195,6 @@ fn write_dwg(d: &Drawing, version: Version) -> Result<(Vec<u8>, craft_dwg::Unwri
 /// extents. Formats that are not images (DXF, DWG) ignore the window. The window is checked with
 /// [`check_window`].
 pub fn write_framed(d: &Drawing, name: impl AsRef<Path>, window: Option<Bounds2>) -> Result<Vec<u8>> {
-    check_point_cloud_output(d)?;
     let name = name.as_ref();
     // A drawing template (.dwt) is DWG content.
     let format = Format::from_path(name);
@@ -195,13 +203,16 @@ pub fn write_framed(d: &Drawing, name: impl AsRef<Path>, window: Option<Bounds2>
         dwg.push(".dwg");
         return write_framed(d, PathBuf::from(dwg), None);
     }
+    if matches!(format, Some(Format::Dxf | Format::Dwg)) {
+        return write_with(d, name, &SaveOptions::default());
+    }
+    check_point_cloud_output(d)?;
     if let Some(w) = &window
         && is_image(name)
     {
         check_window(w)?;
     }
     match format {
-        Some(Format::Dxf | Format::Dwg) => write_with(d, name, &SaveOptions::default()),
         Some(Format::Svg) => Ok(svg::export_window(d, &Space::Model, window).into_bytes()),
         Some(Format::Png) => png_framed(d, &Space::Model, 2400, 1600, window),
         Some(Format::Pdf) => pdf::pdf(d, &Space::Model, &PdfOptions { compress: true, window, ..PdfOptions::default() }),

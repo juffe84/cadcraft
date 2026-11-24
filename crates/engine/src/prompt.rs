@@ -1,7 +1,7 @@
 //! Interactive commands: prompts, inputs and the command-line coordinate grammar.
 
 use cadcraft_doc::{EntityKind, Handle};
-use cadcraft_geom::{Mat3, Vec2};
+use cadcraft_geom::{Mat3, Vec2, Vec3};
 use serde::Serialize;
 
 use crate::{Result, Session};
@@ -320,6 +320,10 @@ pub trait Interactive: Send {
     fn preview(&self, _s: &Session, _cursor: Vec2) -> Vec<EntityKind> {
         Vec::new()
     }
+    /// Preview of a spatial point, where the command preserves individual heights.
+    fn preview_3d(&self, s: &Session, cursor: Vec3) -> Vec<EntityKind> {
+        self.preview(s, cursor.xy())
+    }
     /// Preview objects drawn with their own properties (colour, layer, linetype) rather than
     /// the current layer's, as [`Interactive::preview`]'s are: a block reference re-evaluated
     /// under the cursor, drawn as it will look. Drawn under the rubber band.
@@ -467,6 +471,22 @@ pub fn parse_point_in(text: &str, last: Vec2, angles: &crate::units::AngleSettin
         let v = Vec2::new(x, y);
         if rel { last + frame.vec_to_wcs(v) } else { frame.to_wcs(v) }
     };
+    p.is_finite().then_some(p)
+}
+
+/// Explicit Cartesian XYZ input. Two-component and polar entries keep their existing grammar.
+pub(crate) fn parse_point3_in(text: &str, last: Vec3, ucs: crate::ucs::UcsFrame) -> Option<Vec3> {
+    let input = text.trim();
+    let (world_first, input) = input.strip_prefix('*').map_or((false, input), |rest| (true, rest.trim_start()));
+    let (relative, input) = input.strip_prefix('@').map_or((false, input.trim_start_matches('#').trim_start()), |rest| (true, rest.trim_start()));
+    let (world, input) = input.strip_prefix('*').map_or((world_first, input), |rest| (true, rest.trim_start()));
+    let mut parts = input.split(',').map(crate::units::parse_distance);
+    let p = Vec3::new(parts.next()??, parts.next()??, parts.next()??);
+    if parts.next().is_some() {
+        return None;
+    }
+    let frame = if world { crate::ucs::UcsFrame::WORLD } else { ucs };
+    let p = frame.to_wcs3(if relative { frame.to_ucs3(last) + p } else { p });
     p.is_finite().then_some(p)
 }
 

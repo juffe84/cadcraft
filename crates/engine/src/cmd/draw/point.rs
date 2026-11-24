@@ -1,16 +1,22 @@
+use crate::cmd::point3_value;
+
 use super::{
     Accept, EntityKind, Input, Interactive, Point, PolyVertex, Prompt, RayLine, Result, Session, Step, Value, Vec2, added, bad, json, lwpoly, number,
-    point_param, point_req, points_param, size_param, v3,
+    point_req, size_param, v3,
 };
 
 pub(super) fn run_point(s: &mut Session, p: &Value) -> Result<Value> {
-    let pts = match point_param(p, "at") {
+    let pts = match p.get("at").and_then(point3_value) {
         Some(a) => vec![a],
-        None => points_param(p, "points").ok_or_else(|| bad("point", "`at` or `points` is required"))?,
+        None => p
+            .get("points")
+            .and_then(Value::as_array)
+            .and_then(|points| points.iter().map(point3_value).collect())
+            .ok_or_else(|| bad("point", "`at` or `points` requires [x,y] or [x,y,z] positions"))?,
     };
     let mut hs = Vec::new();
     for q in pts {
-        hs.push(s.add_entity(EntityKind::Point(Point { p: v3(q), angle: 0.0 }))?.hex());
+        hs.push(s.add_entity(EntityKind::Point(Point { p: q, angle: 0.0 }))?.hex());
     }
     Ok(json!({ "handles": hs }))
 }
@@ -66,7 +72,7 @@ impl Interactive for PointM {
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
         match i {
             Input::Point(p) => {
-                s.add_entity(EntityKind::Point(Point { p: v3(p), angle: 0.0 }))?;
+                s.add_entity(EntityKind::Point(Point { p: s.point_position(p), angle: 0.0 }))?;
                 Ok(if self.multiple { Step::Continue } else { Step::Done })
             }
             Input::Enter => Ok(Step::Done),

@@ -90,8 +90,17 @@ and Home to fit the model. **View** offers standard directions and **Perspective
 Orbit shows CADCraft's supported geometry at its model elevation. The graphics backend
 depth-tests model lines, faces and cloud points together. Raster images are drawn as backdrops.
 Imported objects whose geometry CADCraft cannot decode, such as ACIS solids, stay in the drawing
-and are reported in the orbit view. Orbit is an inspection tool for the Model tab. Use the plan
-view for drawing, editing and object snaps.
+and are reported in the orbit view.
+
+Use the command line or the Draw tools to draw while Orbit is active. Click on the horizontal
+drawing plane, or enable **Snap to cloud points** and object snaps (F3) to pick an exact visible
+sample. **LINE**, **3DPOLY** and **POINT** preserve each sample's XYZ coordinates. Use **3DPOLY**
+when a path follows changes in height. Planar shapes such as **PLINE** and **CIRCLE** use the
+first point's elevation. An edge-on drafting plane requires a snap or a different view angle.
+Enter or a quick right-click finishes a command. Esc cancels the current command before leaving
+Orbit. Editing tools that depend on 2D object selection are available in the plan view.
+Save As writes the traced CAD geometry to DXF or DWG. Keep the original LAS or LAZ file
+for the point cloud.
 
 For large desktop clouds, open **Detail loading** above the drawing. **Load radius (×)**
 scales the detail region around the focus. At close zoom, `0.10×` loads at

@@ -61,13 +61,15 @@ pub struct OrbitView {
     pub pivot: Option<cadcraft_geom::Vec3>,
     pub pan: Vec2,
     pub fit: bool,
+    /// Advances on an explicit fit so the canvas can reframe its saved extent.
+    pub fit_revision: u64,
     pub perspective: bool,
     pub wireframe: bool,
 }
 
 impl Default for OrbitView {
     fn default() -> Self {
-        Self { yaw: 0.0, tilt: 0.55, zoom: 1.0, pivot: None, pan: Vec2::ZERO, fit: false, perspective: false, wireframe: false }
+        Self { yaw: 0.0, tilt: 0.55, zoom: 1.0, pivot: None, pan: Vec2::ZERO, fit: false, fit_revision: 0, perspective: false, wireframe: false }
     }
 }
 

@@ -138,6 +138,7 @@ fn run_orbit(s: &mut Session, p: &Value) -> Result<Value> {
         pan,
         pivot,
         fit: flag("fit", before.fit)?,
+        fit_revision: before.fit_revision.wrapping_add(u64::from(fit_requested)),
         perspective: flag("perspective", before.perspective)?,
         wireframe: flag("wireframe", before.wireframe)?,
     };

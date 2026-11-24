@@ -44,7 +44,7 @@ pub mod units;
 use std::sync::Arc;
 
 use cadcraft_doc::{Common, Drawing, Entity, EntityKind, Handle, Space};
-use cadcraft_geom::{Bounds2, Vec2};
+use cadcraft_geom::{Bounds2, Vec2, Vec3};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -67,7 +67,7 @@ mod view;
 pub use doc_state::{DocState, OrbitView, Snapshot};
 pub use error::{EngineError, Result};
 pub use last_used::{LastUsed, LeaderOrder, LeaderType, MLeaderOptions};
-pub use running::{PendingWindow, Running};
+pub use running::{OrbitDraftPlane, PendingWindow, Running};
 pub use settings::Settings;
 pub use view::{ModelTile, ModelTiles, View};
 
@@ -102,6 +102,9 @@ pub struct Session {
     pub last_command: Option<String>,
     /// LASTPOINT.
     pub last_point: Vec2,
+    last_spatial_point: Option<Vec3>,
+    spatial_input: Option<Vec3>,
+    draft_height: Option<f64>,
     /// AREA and PERIMETER: the last area AREA or MEASUREGEOM measured (in their Add and Subtract
     /// modes the running total) and that area's perimeter. Not saved, as in AutoCAD.
     pub area: f64,
@@ -195,6 +198,9 @@ impl Session {
             log: Vec::new(),
             last_command: None,
             last_point: Vec2::ZERO,
+            last_spatial_point: None,
+            spatial_input: None,
+            draft_height: None,
             area: 0.0,
             perimeter: 0.0,
             distance: 0.0,
@@ -309,7 +315,8 @@ impl Session {
     }
 
     /// Add an entity to the current space with current properties.
-    pub fn add_entity(&mut self, kind: EntityKind) -> Result<Handle> {
+    pub fn add_entity(&mut self, mut kind: EntityKind) -> Result<Handle> {
+        self.place_on_drafting_plane(&mut kind);
         let common = self.current_common();
         let space = self.space();
         let true_color = self.doc()?.header.get("CECOLOR_RGB").and_then(|v| v.as_i64());

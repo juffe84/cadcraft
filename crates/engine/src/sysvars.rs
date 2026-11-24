@@ -147,7 +147,10 @@ pub fn get(s: &Session, name: &str) -> Option<Value> {
         "MAXARRAY" => json!(st.maxarray),
         "ZOOMFACTOR" => json!(st.zoomfactor),
         "MEASUREINIT" => json!(i32::from(st.measureinit)),
-        "LASTPOINT" => json!([s.last_point.x, s.last_point.y, 0.0]),
+        "LASTPOINT" => {
+            let p = s.last_point3();
+            json!([p.x, p.y, p.z])
+        }
         "AREA" => json!(s.area),
         "PERIMETER" => json!(s.perimeter),
         "DISTANCE" => json!(s.distance),

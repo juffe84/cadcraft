@@ -68,12 +68,7 @@ impl Model {
         Self { list: Arc::new(list), extent, missing }
     }
 
-    pub fn paint(&self, painter: &Painter, frame: &OrbitFrame, gpu: bool) {
-        let background = Tokens::get().canvas;
-        let bg = cadcraft_color::Rgb(background.r(), background.g(), background.b());
-        if self.list.prims.is_empty() {
-            return;
-        }
+    pub fn paint_images(&self, painter: &Painter, frame: &OrbitFrame) {
         for p in &self.list.prims {
             if let Kind::Image { index } = p.kind
                 && let Some(image) = self.list.images.get(index as usize)
@@ -89,6 +84,14 @@ impl Model {
                 }
             }
         }
+    }
+
+    pub fn paint(&self, painter: &Painter, frame: &OrbitFrame, gpu: bool) {
+        if self.list.prims.is_empty() {
+            return;
+        }
+        let background = Tokens::get().canvas;
+        let bg = cadcraft_color::Rgb(background.r(), background.g(), background.b());
         if gpu {
             crate::orbit_gpu::paint(painter, frame.rect, self.list.clone(), &frame.camera, self.extent.center(), self.extent.span(), bg);
             return;
@@ -219,6 +222,20 @@ fn triangle(frame: &OrbitFrame, cursor: Pos2, points: [Vec3; 3]) -> Option<(f32,
 pub(super) struct Scene {
     ready: Option<(ListKey, Model)>,
     job: Option<rebuild::Job>,
+    frame: Option<(u64, u64, Extent)>,
+}
+
+impl Scene {
+    pub fn framing(&mut self, document: u64, fit_revision: u64, extent: Extent) -> Extent {
+        if let Some((uid, fit, reference)) = self.frame
+            && uid == document
+            && fit == fit_revision
+        {
+            return reference;
+        }
+        self.frame = Some((document, fit_revision, extent));
+        extent
+    }
 }
 
 pub(super) fn model(app: &mut CadApp, ctx: &egui::Context, height: f64) -> Option<Model> {

@@ -83,6 +83,15 @@ impl Interactive for Guarded {
             Vec::new()
         })
     }
+    fn preview_3d(&self, s: &Session, cursor: cadcraft_geom::Vec3) -> Vec<EntityKind> {
+        if self.broken.get().is_some() {
+            return Vec::new();
+        }
+        catch_unwind(AssertUnwindSafe(|| self.inner.preview_3d(s, cursor))).unwrap_or_else(|_| {
+            self.broken.set(Some("panic in preview"));
+            Vec::new()
+        })
+    }
     fn preview_objects(&self, s: &Session, cursor: Vec2) -> Vec<cadcraft_doc::Entity> {
         if self.broken.get().is_some() {
             return Vec::new();
@@ -222,7 +231,7 @@ pub(crate) mod tests {
         let machine = Guarded::create("panictest", factory, s)?;
         let st = s.state()?;
         let (before, selection_before) = (st.doc.clone(), st.selection.clone());
-        s.running = Some(Running { id: "panictest".into(), machine, before, selection_before });
+        s.running = Some(Running { id: "panictest".into(), machine, before, selection_before, draft_height: None });
         s.feed(None)
     }
 

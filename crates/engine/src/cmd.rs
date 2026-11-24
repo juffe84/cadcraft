@@ -62,7 +62,7 @@ pub mod machines;
 pub mod options;
 
 use cadcraft_doc::Handle;
-use cadcraft_geom::Vec2;
+use cadcraft_geom::{Vec2, Vec3};
 use serde::Serialize;
 use serde_json::Value;
 
@@ -298,6 +298,15 @@ pub fn point_value(v: &Value) -> Option<Vec2> {
     let y = v.get("y")?.as_f64()?;
     let p = Vec2::new(x, y);
     p.is_finite().then_some(p)
+}
+
+pub(crate) fn point3_value(v: &Value) -> Option<Vec3> {
+    if let Some(s) = v.as_str().filter(|s| s.matches(',').count() == 2) {
+        return crate::prompt::parse_point3_in(s, Vec3::ZERO, crate::ucs::UcsFrame::WORLD);
+    }
+    let xy = point_value(v)?;
+    let z = v.get(2).or_else(|| v.get("z")).map_or(Some(0.0), Value::as_f64)?;
+    z.is_finite().then_some(xy.to3(z))
 }
 pub(crate) fn point_param(p: &Value, key: &str) -> Option<Vec2> {
     p.get(key).and_then(point_value)

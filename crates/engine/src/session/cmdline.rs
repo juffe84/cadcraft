@@ -147,6 +147,12 @@ impl Session {
             return self.input(Input::Keyword(k));
         }
         if prompt.accept.point {
+            if self.running.as_ref().is_some_and(|r| r.spatial_drafting())
+                && let Some(point) = prompt::parse_point3_in(tt, self.last_point3(), self.ucs())
+            {
+                self.last_polar = None;
+                return self.input_point3(point);
+            }
             self.note_tilted_ucs();
             if let Some(p) = self.parse_typed_point(tt, self.last_point) {
                 self.last_polar = prompt::parse_polar_text(tt, &self.angle_settings());

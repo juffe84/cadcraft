@@ -1,32 +1,35 @@
+use crate::cmd::{helpers::line3, point3_value};
+use cadcraft_geom::Vec3;
+
 use super::{
     Accept, EntityKind, Input, Interactive, Outcome, PlineAsk, PolyVertex, Prompt, Result, Session, Step, Value, Vec2, added, arc_to_bulge, bad,
-    bool_or, bulge_to_arc, distinct_points, f64_or, json, line, lwpoly, number, point_value, points_param, size_param, snap,
+    bool_or, bulge_to_arc, f64_or, json, line, lwpoly, number, point_value, size_param, snap,
 };
 
 // ---------------- JSON forms ----------------
 
 pub(super) fn run_line(s: &mut Session, p: &Value) -> Result<Value> {
-    let pts = points_param(p, "points").ok_or_else(|| bad("line", "`points` [[x,y],...] (2 or more) is required"))?;
-    if pts.len() < 2 {
-        return Err(bad("line", "need at least 2 points"));
-    }
-    // A repeated point would make a zero-length line.
-    let pts = distinct_points(&pts);
+    let mut pts: Vec<Vec3> = p
+        .get("points")
+        .and_then(Value::as_array)
+        .and_then(|values| values.iter().map(point3_value).collect())
+        .ok_or_else(|| bad("line", "`points` requires [x,y] or [x,y,z] positions"))?;
+    pts.dedup_by(|a, b| (*a - *b).len() <= 1e-12);
     if pts.len() < 2 {
         return Err(bad("line", "need at least 2 different points"));
     }
     let mut hs = Vec::new();
     for w in pts.windows(2) {
         if let [a, b] = w {
-            hs.push(s.add_entity(line(*a, *b))?.hex());
+            hs.push(s.add_entity(line3(*a, *b))?.hex());
         }
     }
     if bool_or(p, "closed", false)
         && pts.len() > 2
         && let (Some(a), Some(b)) = (pts.last(), pts.first())
-        && !a.near(*b, 1e-12)
+        && (*a - *b).len() > 1e-12
     {
-        hs.push(s.add_entity(line(*a, *b))?.hex());
+        hs.push(s.add_entity(line3(*a, *b))?.hex());
     }
     Ok(json!({ "handles": hs }))
 }
@@ -61,7 +64,7 @@ pub(super) fn run_pline(s: &mut Session, p: &Value) -> Result<Value> {
 
 #[derive(Default)]
 pub(super) struct LineM {
-    pts: Vec<Vec2>,
+    pts: Vec<Vec3>,
     handles: Vec<cadcraft_doc::Handle>,
     /// A first point picked as a deferred tangent/perpendicular, resolved by the next point.
     first: Option<snap::Deferred>,
@@ -75,7 +78,7 @@ impl LineM {
             return Err(crate::EngineError::Other(format!("No {what} line through that point; pick another point.")));
         };
         self.handles.push(s.add_entity(line(a, b))?);
-        self.pts = vec![a, b];
+        self.pts = vec![a.to3(0.0), b.to3(0.0)];
         self.first = None;
         s.last_point = b;
         Ok(Step::Continue)
@@ -90,8 +93,8 @@ impl Interactive for LineM {
         match self.pts.len() {
             0 if self.first.is_some() => Prompt::new("Specify next point", Accept::POINT).kw(&["Undo"]).deferred(),
             0 => Prompt::new("Specify first point", Accept::POINT).deferred(),
-            1 | 2 => Prompt::new("Specify next point", Accept::POINT).kw(&["Undo"]).base_opt(self.pts.last().copied()),
-            _ => Prompt::new("Specify next point", Accept::POINT).kw(&["Close", "Undo"]).base_opt(self.pts.last().copied()),
+            1 | 2 => Prompt::new("Specify next point", Accept::POINT).kw(&["Undo"]).base_opt(self.pts.last().map(|p| p.xy())),
+            _ => Prompt::new("Specify next point", Accept::POINT).kw(&["Close", "Undo"]).base_opt(self.pts.last().map(|p| p.xy())),
         }
     }
     fn input(&mut self, s: &mut Session, i: Input) -> Result<Step> {
@@ -107,7 +110,7 @@ impl Interactive for LineM {
                     {
                         let e = t + Vec2::new(ang.cos(), ang.sin()) * dist;
                         self.handles.push(s.add_entity(line(t, e))?);
-                        self.pts = vec![t, e];
+                        self.pts = vec![t.to3(0.0), e.to3(0.0)];
                         s.last_point = e;
                         self.first = None;
                         return Ok(Step::Continue);
@@ -125,18 +128,19 @@ impl Interactive for LineM {
             }
             // A deferred pick with a known last point (not offered by the prompt, but harmless).
             Input::Deferred(d) => match self.pts.last().copied() {
-                Some(last) => match snap::resolve_deferred(snap::LineEnd::Point(last), snap::LineEnd::Deferred(d)) {
+                Some(last) => match snap::resolve_deferred(snap::LineEnd::Point(last.xy()), snap::LineEnd::Deferred(d)) {
                     Some((_, p)) => self.input(s, Input::Point(p)),
                     None => Err(crate::EngineError::Other("No tangent or perpendicular from the last point.".into())),
                 },
                 None => Ok(Step::Continue),
             },
             Input::Point(p) => {
+                let p = s.point_position(p);
                 if let Some(last) = self.pts.last().copied() {
-                    if last.near(p, 1e-12) {
+                    if (last - p).len() <= 1e-12 {
                         return Ok(Step::Continue);
                     }
-                    self.handles.push(s.add_entity(line(last, p))?);
+                    self.handles.push(s.add_entity(line3(last, p))?);
                 }
                 self.pts.push(p);
                 Ok(Step::Continue)
@@ -152,8 +156,10 @@ impl Interactive for LineM {
                 Ok(Step::Continue)
             }
             Input::Keyword(k) if k == "Close" => {
-                if let (Some(a), Some(b)) = (self.pts.last().copied(), self.pts.first().copied()) {
-                    s.add_entity(line(a, b))?;
+                if let (Some(a), Some(b)) = (self.pts.last().copied(), self.pts.first().copied())
+                    && (a - b).len() > 1e-12
+                {
+                    s.add_entity(line3(a, b))?;
                 }
                 Ok(Step::Done)
             }
@@ -167,7 +173,10 @@ impl Interactive for LineM {
             let end = s.cursor_deferred.map_or(snap::LineEnd::Point(c), snap::LineEnd::Deferred);
             return snap::resolve_deferred(snap::LineEnd::Deferred(first), end).map(|(a, b)| vec![line(a, b)]).unwrap_or_default();
         }
-        self.pts.last().map(|l| vec![line(*l, c)]).unwrap_or_default()
+        self.preview_3d(s, c.to3(0.0))
+    }
+    fn preview_3d(&self, _s: &Session, p: Vec3) -> Vec<EntityKind> {
+        self.pts.last().map(|l| vec![line3(*l, p)]).unwrap_or_default()
     }
 }
 
@@ -218,7 +227,8 @@ impl PlineM {
             }
             return Ok(());
         }
-        let k = self.entity(closed);
+        let mut k = self.entity(closed);
+        s.place_on_drafting_plane(&mut k);
         match self.handle {
             Some(h) => {
                 s.doc_mut()?.modify_entity(h, |e| e.kind = k)?;

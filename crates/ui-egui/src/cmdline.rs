@@ -299,7 +299,7 @@ fn enable_ime(app: &mut CadApp, ctx: &egui::Context) {
 
 /// Handle keyboard input destined for the command line (when no text field has focus).
 pub fn keyboard(app: &mut CadApp, ctx: &egui::Context) {
-    if ctx.egui_wants_keyboard_input() {
+    if ctx.egui_wants_keyboard_input() && !app.canvas.orbit_keyboard_focus {
         app.cmd.preedit.clear();
         app.cmd.ime_on = false;
         return;

@@ -180,3 +180,25 @@ fn check_chunks(input: &mut (impl Read + Seek), start: u64, len: u64, count: u64
     }
     Ok(entries)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cadcraft_doc::{Common, EntityKind, Line, Space};
+
+    #[test]
+    fn tracing_a_cloud_can_be_saved_as_cad_geometry() {
+        let [a, b] = [Vec3::new(50.0, 20.0, 10.0), Vec3::new(80.0, 40.0, 15.0)];
+        let points = [a, b].map(|position| CloudPoint { position, rgb: [0; 3], intensity: 0, classification: 0 });
+        let mut drawing = Drawing::new_metric();
+        drawing.point_cloud = Some(Arc::new(PointCloud::new(points.to_vec(), 2, false, false)));
+        assert!(crate::write(&drawing, "trace.dxf").is_err());
+        drawing.add(&Space::Model, Common::default(), EntityKind::Line(Line { a, b })).unwrap();
+        let bytes = crate::write(&drawing, "trace.dxf").unwrap();
+        let read = crate::read_dxf(&bytes).unwrap();
+        assert!(matches!(&read.model.iter().next().unwrap().kind, EntityKind::Line(line) if line.a == a && line.b == b));
+        assert!(read.point_cloud.is_none());
+        assert!(drawing.point_cloud.is_some());
+        assert!(crate::write(&drawing, "trace.las").is_err());
+    }
+}

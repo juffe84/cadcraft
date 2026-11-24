@@ -885,6 +885,9 @@ fn run_bytes(s: &mut Session, p: &Value) -> Result<Value> {
     let lost = not_saved_as(s.doc()?, version);
     let bytes = write_bytes(s, "document.bytes", &format!("drawing.{fmt}"), &opts)?;
     let mut r = json!({ "data": base64_encode(&bytes), "bytes": bytes.len() });
+    if s.doc()?.point_cloud.is_some() && is_drawing_file(format!("drawing.{fmt}")) {
+        r["pointCloudOmitted"] = json!(true);
+    }
     if drops_unknown(format!("drawing.{fmt}")) {
         report_not_saved(s, &mut r, &lost);
     } else if is_dxf_file(format!("drawing.{fmt}")) {
@@ -1125,6 +1128,10 @@ fn save_reporting(s: &mut Session, p: &Value, run: fn(&mut Session, &Value) -> R
         report_lost(s, &mut r, "drawing.dxf", version, &lost);
     }
     if r.get("path").and_then(Value::as_str).is_some_and(is_drawing_file) {
+        if s.doc().is_ok_and(|d| d.point_cloud.is_some()) {
+            r["pointCloudOmitted"] = json!(true);
+            s.echo("Saved CAD geometry. Keep the original LAS or LAZ file for the point cloud.");
+        }
         report_fonts(s, &mut r);
     }
     Ok(r)

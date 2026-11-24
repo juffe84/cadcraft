@@ -21,7 +21,7 @@ pub(super) fn controls(app: &mut CadApp, ui: &mut egui::Ui) {
         if ui.add(egui::Slider::new(&mut size, 1.0..=12.0).step_by(0.5).text(crate::i18n::t("Point size"))).changed() {
             let _ = app.run("pointcloud.settings", json!({ "size": size }));
         }
-        if ui.add_enabled(!orbit, egui::Checkbox::new(&mut snap, crate::i18n::t("Snap to cloud points"))).changed() {
+        if ui.checkbox(&mut snap, crate::i18n::t("Snap to cloud points")).changed() {
             let _ = app.run("pointcloud.settings", json!({ "snap": snap }));
         }
         if ui.selectable_label(orbit, crate::i18n::t("3D Orbit")).clicked() {
@@ -106,7 +106,7 @@ fn view(cloud: &PointCloud, bounds: Bounds2, app: &CadApp, request: bool) -> Clo
     })
 }
 
-fn layers<'a>(snapshot: &'a CloudView, root: &'a Arc<PointCloud>) -> impl Iterator<Item = &'a Arc<PointCloud>> {
+pub(super) fn layers<'a>(snapshot: &'a CloudView, root: &'a Arc<PointCloud>) -> impl Iterator<Item = &'a Arc<PointCloud>> {
     let overview = snapshot.overview.as_ref().or_else(|| (snapshot.indexing && snapshot.points.is_some()).then_some(root));
     overview.into_iter().chain(std::iter::once(snapshot.points.as_ref().unwrap_or(root))).filter(|cloud| !cloud.points().is_empty())
 }
@@ -183,12 +183,18 @@ pub(super) struct OrbitFrame {
 }
 
 impl OrbitFrame {
+    #[cfg(test)]
     fn new(orbit: OrbitView, plan: cadcraft_engine::View, scene: Extent, rect: Rect) -> Self {
+        Self::framed(orbit, plan, scene, scene, rect)
+    }
+
+    fn framed(orbit: OrbitView, plan: cadcraft_engine::View, reference: Extent, scene: Extent, rect: Rect) -> Self {
         let extent = scene.xy;
-        let plan_center = if extent.is_empty() || (!orbit.fit && extent.contains(plan.center)) { plan.center } else { extent.center() };
-        let z_mid = scene.center().z;
+        let plan_center =
+            if reference.xy.is_empty() || (!orbit.fit && reference.xy.contains(plan.center)) { plan.center } else { reference.xy.center() };
+        let z_mid = reference.center().z;
         let center = orbit.pivot.unwrap_or(Vec3::new(plan_center.x, plan_center.y, z_mid));
-        let diagonal = if extent.is_empty() { plan.height } else { scene.span() }.max(1e-6);
+        let diagonal = if reference.xy.is_empty() { plan.height } else { reference.span() }.max(1e-6);
         let fit = f64::from(rect.width().min(rect.height()).max(1.0)) / (diagonal * if orbit.perspective { 1.55 } else { 1.05 });
         let plan_scale = f64::from(rect.height().max(1.0)) / plan.height.max(1e-6);
         let scale = if orbit.fit { fit } else { plan_scale.max(fit) } * orbit.zoom;
@@ -218,8 +224,9 @@ impl OrbitFrame {
         } else {
             Bounds2::EMPTY
         };
-        let depth = diagonal + (center - Vec3::new(plan_center.x, plan_center.y, z_mid)).len();
-        let eye = orbit.perspective.then_some(depth * 1.6);
+        let reference_depth = diagonal + (center - Vec3::new(plan_center.x, plan_center.y, z_mid)).len();
+        let depth = reference_depth.max(scene.span() + (center - scene.center()).len());
+        let eye = orbit.perspective.then_some(reference_depth * 1.6);
         let camera = crate::cloud_gpu::Camera { center, axes, pan: [orbit.pan.x, orbit.pan.y], scale, depth: Some(depth), eye, bounds };
         Self { camera, rect, bounds }
     }
@@ -263,6 +270,18 @@ impl OrbitFrame {
         self.camera.eye.map_or(front, |eye| front - (right * f64::from(offset.x) - up * f64::from(offset.y)) * (1.0 / (eye * self.camera.scale)))
     }
 
+    /// A view ray meeting the horizontal drafting plane at the current elevation.
+    pub(super) fn on_draft_plane(&self, at: egui::Pos2, z: f64) -> Option<Vec3> {
+        let origin = self.ray_origin(at);
+        let direction = self.ray_direction(at);
+        if direction.z.abs() <= 1e-9 {
+            return None;
+        }
+        let depth = (z - origin.z) / direction.z;
+        let p = origin + direction * depth;
+        (p.is_finite() && self.camera.weight(depth) > 0.01).then_some(p.xy().to3(z))
+    }
+
     /// Locate a screen pixel on the plane at the depth of a visible sample.
     fn on_surface(&self, at: egui::Pos2, point: Vec3) -> Vec3 {
         let front = self.camera.axes[2];
@@ -301,9 +320,24 @@ impl OrbitFrame {
     }
 
     fn pick<'a>(&self, clouds: impl Iterator<Item = &'a Arc<PointCloud>>, cursor: egui::Pos2, limit: usize, radius: f32, size: f32) -> Option<Vec3> {
+        self.pick_where(clouds, cursor, limit, radius, size, |_| true)
+    }
+
+    pub(super) fn pick_where<'a>(
+        &self,
+        clouds: impl Iterator<Item = &'a Arc<PointCloud>>,
+        cursor: egui::Pos2,
+        limit: usize,
+        radius: f32,
+        size: f32,
+        accepts: impl Fn(Vec3) -> bool,
+    ) -> Option<Vec3> {
         let mut best: Option<SurfaceHit> = None;
         for cloud in clouds {
             cloud.visible(self.pick_bounds(cloud, cursor, radius), limit, |p| {
+                if !accepts(p.position) {
+                    return;
+                }
                 let (at, depth) = self.project(p.position);
                 let delta = (at - cursor).abs();
                 if !self.rect.contains(at) || delta.length_sq() > radius * radius {
@@ -501,6 +535,7 @@ fn pick_target(
 }
 
 pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
+    app.canvas.orbit_keyboard_focus = false;
     let Ok(state) = app.session.state() else { return };
     let Some(orbit) = state.orbit else { return };
     orbit_controls(app, ui, orbit);
@@ -523,6 +558,7 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     app.canvas.xf = None;
     app.canvas.cursor = None;
     app.canvas.snap = None;
+    app.canvas.orbit_cursor = None;
     let label = if model.is_none() && root.is_some() { "Point cloud 3D view" } else { "Model 3D view" };
     response.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Image, true, crate::i18n::t(label)));
     crate::control::record_widget(ui, &response, label, "image", None);
@@ -534,6 +570,7 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     }
     let focused = response.has_focus();
     let lost_focus = response.lost_focus();
+    app.canvas.orbit_keyboard_focus = focused;
     let hovered = response.hovered();
     let (arrows, keyboard_pan, scroll, escape, fit, press, pointer) = ui.input(|input| {
         let key = |k| f32::from(focused && input.key_pressed(k));
@@ -549,15 +586,30 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
         )
     });
     if escape {
-        let _ = app.run("3dorbit", json!({ "enabled": false }));
+        ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
+        if app.session.prompting() {
+            crate::cmdline::escape(app);
+        } else {
+            let _ = app.run("3dorbit", json!({ "enabled": false }));
+        }
         return;
+    }
+    // Egui may already have used Enter to activate the focused canvas widget.
+    // It is still a command-line key while the viewport owns focus.
+    let enter = ui.ctx().current_pass_index() == 0
+        && ui.input(|i| {
+            i.raw.events.iter().any(|event| matches!(event, egui::Event::Key { key: Key::Enter, pressed: true, modifiers, .. } if !modifiers.any()))
+        });
+    if (focused || lost_focus) && app.session.prompting() && app.cmd.options.is_none() && enter {
+        ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Enter));
+        crate::cmdline::submit(app);
     }
     if fit {
         let _ = app.run("3dorbit", json!({ "fit": true }));
         return;
     }
     let key_zoom = ui.input(|input| {
-        if focused {
+        if focused && !app.session.prompting() {
             50.0 * (f32::from(input.key_pressed(Key::Plus) || input.key_pressed(Key::Equals)) - f32::from(input.key_pressed(Key::Minus)))
         } else {
             0.0
@@ -565,7 +617,10 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     });
     let extent = model.as_ref().map_or_else(Extent::default, |model| model.extent);
     let extent = if let Some(root) = &root { extent.union(Extent { xy: root.bounds(), z: root.z_range }) } else { extent };
-    let mut frame = OrbitFrame::new(orbit, plan, extent, rect);
+    // Drawing a new entity must not move the view under the pointer. Reframing
+    // only occurs when an orbit starts, changes document, or fits explicitly.
+    let framing = app.canvas.orbit_scene.framing(document, orbit.fit_revision, extent);
+    let mut frame = OrbitFrame::framed(orbit, plan, framing, extent, rect);
     let mut updated = false;
     let mut hint = None;
     if press
@@ -625,28 +680,40 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
             "pan": [orbit.pan.x, orbit.pan.y], "pivot": orbit.pivot.map(|p| [p.x, p.y, p.z]) }),
         );
         if let Some(applied) = app.session.state().ok().and_then(|state| state.orbit) {
-            frame = OrbitFrame::new(applied, plan, extent, rect);
+            frame = OrbitFrame::framed(applied, plan, framing, extent, rect);
         }
     }
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, Tokens::get().canvas);
+    let dragging = response.dragged_by(PointerButton::Middle) || response.dragged_by(PointerButton::Secondary);
+    let snapshot = root.as_ref().map(|root| detail_view(app, ui, (root, model.as_ref()), &frame, document, dragging, hint));
+    if let Some(model) = &model {
+        model.paint_images(&painter, &frame);
+    }
+    let shown = root.as_ref().zip(snapshot.as_ref());
+    if let Some((root, snapshot)) = shown {
+        if snapshot.pending {
+            ui.ctx().request_repaint_after(std::time::Duration::from_millis(70));
+        }
+        paint_cloud_in_orbit(app, &painter, &frame, root, snapshot);
+    }
+    // The model wins depth ties with the underlying cloud samples used for drawing.
     if let Some(model) = &model {
         model.paint(&painter, &frame, crate::orbit_gpu::available(app.canvas.gpu));
     }
-    let Some(root) = root else { return };
-    let dragging = response.dragged_by(PointerButton::Middle) || response.dragged_by(PointerButton::Secondary);
-    let snapshot = detail_view(app, ui, (&root, model.as_ref()), &frame, document, dragging, hint);
-    if snapshot.pending {
-        ui.ctx().request_repaint_after(std::time::Duration::from_millis(70));
-    }
+    super::orbit_draft::draw(app, &painter, &frame, &response, shown, dragging);
+}
+
+fn paint_cloud_in_orbit(app: &CadApp, painter: &egui::Painter, frame: &OrbitFrame, root: &Arc<PointCloud>, snapshot: &CloudView) {
+    let rect = frame.rect;
     let fallback = Tokens::get().canvas_ink;
     let size = app.session.settings.point_cloud_size;
-    if layers(&snapshot, &root).all(|shown| crate::cloud_gpu::available(app.canvas.gpu, shown)) {
-        crate::cloud_gpu::paint(&painter, rect, layers(&snapshot, &root).cloned(), &frame.camera, size, fallback);
+    if layers(snapshot, root).all(|shown| crate::cloud_gpu::available(app.canvas.gpu, shown)) {
+        crate::cloud_gpu::paint(painter, rect, layers(snapshot, root).cloned(), &frame.camera, size, fallback);
         return;
     }
     let mut projected = Vec::new();
-    for shown in layers(&snapshot, &root) {
+    for shown in layers(snapshot, root) {
         shown.visible(frame.bounds, sample_budget(rect), |point| {
             let (at, depth) = frame.project(point.position);
             if rect.contains(at) {
@@ -668,6 +735,87 @@ mod tests {
     use cadcraft_engine::Session;
     use egui_kittest::kittest::{NodeT, Queryable};
     use std::sync::Arc;
+
+    #[test]
+    fn drawing_an_orbit_line_by_clicking_cloud_samples_keeps_their_original_xyz() {
+        let a = Vec3::new(-10.0, -5.0, 20.0);
+        let b = Vec3::new(14.0, 6.0, 45.0);
+        // Give the sample being traced room above the floating command bar.
+        let samples = [a, b, Vec3::new(2.0, -42.0, 32.5), Vec3::new(2.0, 43.0, 32.5)];
+        let root = Arc::new(PointCloud::new(
+            samples.map(|position| CloudPoint { position, rgb: [0; 3], intensity: 0, classification: 0 }).to_vec(),
+            4,
+            false,
+            false,
+        ));
+        let drawing = cadcraft_doc::Drawing { point_cloud: Some(root.clone()), ..cadcraft_doc::Drawing::new_metric() };
+        let mut session = Session::empty();
+        session.open_drawing(drawing, "Cloud", None);
+        session.settings.osmode = cadcraft_engine::snap::mode::END;
+        session.execute("3dorbit", &json!({"view": "isometric", "fit": true})).unwrap();
+        let plan = session.state().unwrap().view();
+        let pose = session.state().unwrap().orbit.unwrap();
+        let app = CadApp::new(session, Default::default());
+        let mut harness =
+            egui_kittest::Harness::builder().with_size(vec2(900.0, 500.0)).build_ui_state(|ui, app: &mut CadApp| super::super::show(app, ui), app);
+        let key = |key| egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+        harness.event(egui::Event::Text("LINE".into()));
+        harness.event(key(Key::Enter));
+        harness.run();
+        assert_eq!(harness.state().session.running.as_ref().map(|running| running.id.as_str()), Some("line"));
+        let rect = harness.get_by_label("Point cloud 3D view").rect();
+        let frame = OrbitFrame::new(pose, plan, Extent { xy: root.bounds(), z: root.z_range }, rect);
+        for point in [a, b] {
+            let at = frame.project(point).0;
+            harness.event(egui::Event::PointerMoved(at));
+            harness.run();
+            let hit = harness.state().canvas.orbit_cursor.unwrap();
+            assert!(hit.snapped);
+            assert_eq!(hit.position, point);
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
+                harness.step();
+            }
+        }
+        harness.event(key(Key::Enter));
+        harness.event(egui::Event::Key { key: Key::Enter, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::NONE });
+        harness.run();
+        assert!(harness.state().session.running.is_none());
+        let drawing = harness.state().session.doc().unwrap();
+        assert!(matches!(&drawing.model.iter().last().unwrap().kind, cadcraft_doc::EntityKind::Line(line) if line.a == a && line.b == b));
+    }
+
+    #[test]
+    fn adding_geometry_to_an_empty_orbit_keeps_the_work_plane_under_the_cursor() {
+        let mut drawing = cadcraft_doc::Drawing::new_metric();
+        drawing.header.set_f64("ELEVATION", 3.0);
+        let mut session = Session::empty();
+        session.open_drawing(drawing, "Model", None);
+        session.execute("3dorbit", &json!({"view": "isometric", "fit": true, "perspective": true})).unwrap();
+        let plan = session.state().unwrap().view();
+        let pose = session.state().unwrap().orbit.unwrap();
+        session.start("line").unwrap();
+        let app = CadApp::new(session, Default::default());
+        let mut harness =
+            egui_kittest::Harness::builder().with_size(vec2(900.0, 500.0)).build_ui_state(|ui, app: &mut CadApp| super::super::show(app, ui), app);
+        let rect = harness.get_by_label("Model 3D view").rect();
+        let frame = OrbitFrame::new(pose, plan, Extent::default(), rect);
+        let positions = [vec2(-35.0, -12.0), vec2(10.0, 7.0), vec2(38.0, -20.0)].map(|offset| rect.center() + offset);
+        for at in positions {
+            harness.event(egui::Event::PointerMoved(at));
+            harness.step();
+            for pressed in [true, false] {
+                harness.event(egui::Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
+                harness.step();
+            }
+        }
+        let b = frame.on_draft_plane(positions[1], 3.0).unwrap();
+        let c = frame.on_draft_plane(positions[2], 3.0).unwrap();
+        let drawing = harness.state().session.doc().unwrap();
+        assert!(
+            matches!(&drawing.model.iter().last().unwrap().kind, cadcraft_doc::EntityKind::Line(line) if (line.a - b).len() < 1e-8 && (line.b - c).len() < 1e-8)
+        );
+    }
 
     #[test]
     fn model_orbit_opens_without_a_cloud_and_can_exit_from_keyboard() {

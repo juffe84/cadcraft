@@ -1,4 +1,6 @@
-use crate::DisplayOnly;
+use crate::{DisplayOnly, OrbitDraftPlane};
+use cadcraft_doc::EntityKind;
+use cadcraft_geom::Vec3;
 
 use super::{
     Arc, Bounds2, Drag, Drawing, EngineError, Entity, Handle, Input, PendingWindow, Prompt, Result, Running, Session, Snapshot, Step, Value, Vec2,
@@ -126,7 +128,7 @@ impl Session {
                 if nested {
                     self.suspended = self.running.take();
                 }
-                self.running = Some(Running { id: spec.id.to_string(), machine, before, selection_before });
+                self.running = Some(Running { id: spec.id.to_string(), machine, before, selection_before, draft_height: None });
                 self.pending_window = None;
                 // Some commands complete immediately (e.g. ERASE with a pickfirst selection).
                 self.feed(None)?;
@@ -168,6 +170,45 @@ impl Session {
         let r = self.input_to_command(input);
         self.lisp_after_command_input();
         r
+    }
+
+    /// Feed a WCS position from a spatial canvas. Existing XY commands still receive
+    /// a normal point, while spatial commands can read its exact height.
+    pub fn input_point3(&mut self, point: Vec3) -> Result<()> {
+        if !point.is_finite() || point.x.abs().max(point.y.abs()).max(point.z.abs()) > 1e12 {
+            return Err(EngineError::Other("Point coordinates are outside the drawing range.".into()));
+        }
+        let saved = self.spatial_input.replace(point);
+        let result = self.input(Input::Point(point.xy()));
+        self.spatial_input = saved;
+        result
+    }
+
+    pub(crate) fn point_position(&self, point: Vec2) -> Vec3 {
+        self.spatial_input.filter(|p| p.xy() == point).unwrap_or_else(|| point.to3(0.0))
+    }
+
+    pub fn last_point3(&self) -> Vec3 {
+        self.last_spatial_point.filter(|p| p.xy() == self.last_point).unwrap_or_else(|| self.last_point.to3(0.0))
+    }
+
+    fn orbit_default_height(&self) -> f64 {
+        self.doc().ok().map(|d| d.header.f64("ELEVATION", 0.0) + self.input_ucs().origin.z).filter(|z| z.is_finite()).unwrap_or(0.0)
+    }
+
+    /// The horizontal drafting plane used by the 3D canvas on an unsnapped click.
+    pub fn orbit_draft_plane(&self) -> OrbitDraftPlane {
+        let running = self.running.as_ref();
+        let cloud_snap = running.is_some_and(|r| r.spatial_drafting() || r.planar_drafting());
+        let locked = running.and_then(|r| r.draft_height);
+        let height = if cloud_snap { locked.unwrap_or_else(|| self.orbit_default_height()) } else { 0.0 };
+        OrbitDraftPlane { height, locked: locked.is_some(), cloud_snap }
+    }
+
+    pub(crate) fn place_on_drafting_plane(&self, entity: &mut EntityKind) {
+        if let Some(z) = self.draft_height {
+            elevate(entity, z);
+        }
     }
 
     fn input_to_command(&mut self, input: Input) -> Result<()> {
@@ -347,6 +388,18 @@ impl Session {
     pub(crate) fn feed(&mut self, input: Option<Input>) -> Result<()> {
         let base = if matches!(input, Some(Input::Point(_))) { self.current_prompt().and_then(|p| p.base) } else { None };
         let Some(mut run) = self.running.take() else { return Ok(()) };
+        let in_orbit =
+            self.state().is_ok_and(|state| state.orbit.is_some() && state.space == cadcraft_doc::Space::Model && state.block_editor().is_none());
+        let point = if let Some(Input::Point(p)) = &input {
+            self.spatial_input
+                .filter(|v| v.xy() == *p)
+                .or_else(|| (in_orbit && (run.spatial_drafting() || run.planar_drafting())).then(|| p.to3(self.orbit_default_height())))
+        } else {
+            None
+        };
+        let saved_input = std::mem::replace(&mut self.spatial_input, point);
+        let height = run.draft_height.or_else(|| (in_orbit && run.planar_drafting()).then_some(point).flatten().map(|p| p.z));
+        let saved_height = std::mem::replace(&mut self.draft_height, height);
         let step = match input {
             Some(Input::Cancel) => {
                 run.machine.cancelled(self);
@@ -355,6 +408,7 @@ impl Session {
             Some(i) => {
                 if let Input::Point(p) = &i {
                     self.last_point = *p;
+                    self.last_spatial_point = height.map(|z| p.to3(z)).or(point);
                     if let Some(b) = base.filter(|b| b.is_finite() && p.is_finite() && b.dist(*p) > 1e-12) {
                         self.last_segment = Some((b, *p));
                     }
@@ -373,6 +427,11 @@ impl Session {
                 run.machine.begin(self)
             }
         };
+        self.spatial_input = saved_input;
+        self.draft_height = saved_height;
+        if step.is_ok() {
+            run.draft_height = height;
+        }
         // Redraw what the command has added so far (LINE adds a segment per point), not only when it ends.
         if let Ok(st) = self.state_mut()
             && !Arc::ptr_eq(&run.before, &st.doc)
@@ -595,12 +654,29 @@ impl Session {
     /// ([`Interactive::preview_objects`]), then the rubber band with the current properties, in
     /// the grip blue over such objects (so it shows over their fills, whatever their colour).
     pub fn preview(&self, cursor: Vec2) -> Vec<Entity> {
+        self.preview_at(cursor, None)
+    }
+
+    pub fn preview_3d(&self, cursor: Vec3) -> Vec<Entity> {
+        self.preview_at(cursor.xy(), Some(cursor))
+    }
+
+    fn preview_at(&self, cursor: Vec2, spatial: Option<Vec3>) -> Vec<Entity> {
         let mut common = self.current_common();
-        let (kinds, mut out) = match (self.lisp_preview(cursor), &self.running) {
+        let (mut kinds, mut out) = match (self.lisp_preview(cursor), &self.running) {
             (Some(k), _) => (k, Vec::new()),
-            (None, Some(r)) => (r.machine.preview(self, cursor), r.machine.preview_objects(self, cursor)),
+            (None, Some(r)) => {
+                let kinds = spatial.map_or_else(|| r.machine.preview(self, cursor), |p| r.machine.preview_3d(self, p));
+                (kinds, r.machine.preview_objects(self, cursor))
+            }
             (None, None) => (Vec::new(), Vec::new()),
         };
+        if let Some((run, p)) = self.running.as_ref().filter(|r| r.planar_drafting()).zip(spatial) {
+            let z = run.draft_height.unwrap_or(p.z);
+            for kind in kinds.iter_mut().chain(out.iter_mut().map(|e| &mut e.kind)) {
+                elevate(kind, z);
+            }
+        }
         if !out.is_empty() {
             common.color = cadcraft_doc::color::Color::True(cadcraft_doc::color::Rgb(0x2f, 0x6b, 0xff));
         }
@@ -623,5 +699,62 @@ impl Session {
         let common = self.current_common();
         let extra = d.extra.iter().map(|k| Entity { handle: Handle(0), common: common.clone(), kind: k.clone() }).collect();
         Some((d, extra))
+    }
+}
+
+fn elevate(kind: &mut EntityKind, z: f64) {
+    match kind {
+        // Line previews for planar polyline segments use ordinary line entities.
+        EntityKind::Line(line) => (line.a.z, line.b.z) = (z, z),
+        EntityKind::Circle(circle) => circle.center.z = z,
+        EntityKind::Arc(arc) => arc.center.z = z,
+        EntityKind::Ellipse(ellipse) => ellipse.center.z = z,
+        // RECTANG can supply its own elevation explicitly.
+        EntityKind::LwPolyline(line) if line.elevation == 0.0 => line.elevation = z,
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cadcraft_doc::Space;
+    use serde_json::json;
+
+    #[test]
+    fn orbit_drafting_keeps_spatial_points_and_updates_a_planar_polyline_at_its_first_height() {
+        let mut s = Session::empty();
+        s.open_drawing(Drawing::new_metric(), "Survey", None);
+        s.execute("3dorbit", &json!({ "enabled": true })).unwrap();
+        s.start("line").unwrap();
+        let a = Vec3::new(100.0, 200.0, 18.0);
+        let b = Vec3::new(100.0, 200.0, 24.0);
+        s.input_point3(a).unwrap();
+        let preview = s.preview_3d(b);
+        assert!(matches!(&preview[0].kind, EntityKind::Line(line) if line.a == a && line.b == b));
+        s.typed("@0,0,6").unwrap();
+        assert_eq!(s.last_point3(), b);
+        s.input(Input::Enter).unwrap();
+        assert!(matches!(&s.doc().unwrap().model.iter().next().unwrap().kind, EntityKind::Line(line) if line.a == a && line.b == b));
+
+        s.start("pline").unwrap();
+        for x in [5.0, 8.0, 10.0] {
+            s.input_point3(Vec3::new(x, 25.0, 12.0)).unwrap();
+        }
+        s.input(Input::Enter).unwrap();
+        let drawing = s.doc().unwrap();
+        let entity = drawing.space(&Space::Model).unwrap().iter().last().unwrap();
+        assert!(matches!(&entity.kind, EntityKind::LwPolyline(poly) if poly.elevation == 12.0 && poly.vertices.len() == 3));
+
+        s.start("3dpoly").unwrap();
+        let positions = [a, b, Vec3::new(103.0, 205.0, 31.0)];
+        for point in positions {
+            s.input_point3(point).unwrap();
+        }
+        s.input(Input::Enter).unwrap();
+        assert!(matches!(&s.doc().unwrap().model.iter().last().unwrap().kind, EntityKind::Polyline3d(poly) if poly.points == positions));
+        s.start("point").unwrap();
+        s.input_point3(b).unwrap();
+        assert!(matches!(&s.doc().unwrap().model.iter().last().unwrap().kind, EntityKind::Point(point) if point.p == b));
     }
 }

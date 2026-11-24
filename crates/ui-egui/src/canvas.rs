@@ -19,6 +19,7 @@ mod dyn_boxes;
 mod grid;
 mod grips;
 mod list;
+mod orbit_draft;
 mod orbit_scene;
 mod pick;
 mod point_cloud;
@@ -123,6 +124,8 @@ pub struct CanvasState {
     pub gpu_device: Option<egui_wgpu::wgpu::Device>,
     cloud_orbit_focus: Option<point_cloud::OrbitFocus>,
     orbit_scene: orbit_scene::Scene,
+    pub(crate) orbit_cursor: Option<orbit_draft::DraftPoint>,
+    pub(crate) orbit_keyboard_focus: bool,
     /// The mesh last handed to the GPU (see [`crate::gpu::CanvasCallback::key`]).
     mesh_key: Option<u64>,
     mesh_slot: crate::gpu::MeshSlot,
@@ -834,10 +837,17 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         point_cloud::controls(app, ui);
     }
     if app.session.state().is_ok_and(|state| state.space == cadcraft_doc::Space::Model && state.block_editor().is_none() && state.orbit.is_some()) {
+        let full = ui.available_rect_before_wrap();
         point_cloud::orbit(app, ui);
+        crate::cmdline::keyboard(app, ui.ctx());
+        if app.ui.show_command_line {
+            crate::cmdline::show(app, ui, full);
+        }
         return;
     }
     app.canvas.cloud_orbit_focus = None;
+    app.canvas.orbit_cursor = None;
+    app.canvas.orbit_keyboard_focus = false;
     app.canvas.orbit_scene = Default::default();
     let full = ui.available_rect_before_wrap();
     // Tiled model viewports (VPORTS): the current tile is the drawing area below; `draw_tiles`

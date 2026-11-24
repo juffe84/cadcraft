@@ -291,6 +291,7 @@ pub fn inspect(app: &CadApp, ctx: &egui::Context) -> Value {
         "orbit": orbit.map(|o| json!({"yaw": o.yaw, "tilt": o.tilt, "zoom": o.zoom, "pan": [o.pan.x, o.pan.y],
             "pivot": o.pivot.map(|p| [p.x, p.y, p.z]), "fit": o.fit, "perspective": o.perspective, "wireframe": o.wireframe})),
         "cursor": app.canvas.cursor.map(|c| [c.x, c.y]),
+        "orbitCursor": app.canvas.orbit_cursor.map(|c| json!({"point": [c.position.x, c.position.y, c.position.z], "cloudSnap": c.snapped})),
         "snap": app.canvas.snap.map(|s| json!({"point": [s.point.x, s.point.y], "mode": s.name})),
         "session": app.session.summary(),
         "closePrompt": app.close_prompt(),

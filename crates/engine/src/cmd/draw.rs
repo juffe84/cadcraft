@@ -44,7 +44,7 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("line", "Line", run_line)
             .menu(&["Draw", "Line"])
             .alias(&["l"])
-            .params("{points: [[x,y],...], closed?: bool}")
+            .params("{points: [[x,y] | [x,y,z], ...], closed?: bool}")
             .interactive(|_| Ok(Box::new(LineM::default()))),
         CommandSpec::new("pline", "Polyline", run_pline)
             .menu(&["Draw", "Polyline"])
@@ -79,7 +79,7 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("point", "Point", run_point)
             .menu(&["Draw", "Point", "Single Point"])
             .alias(&["po"])
-            .params("{at: [x,y]} | {points: [...]}")
+            .params("{at: [x,y] | [x,y,z]} | {points: [...]}")
             .interactive(|_| Ok(Box::new(PointM { multiple: false }))),
         CommandSpec::new("point.multiple", "Multiple Point", run_point)
             .menu(&["Draw", "Point", "Multiple Point"])
