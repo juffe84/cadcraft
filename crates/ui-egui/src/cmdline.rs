@@ -63,26 +63,23 @@ pub fn dyn_frame(app: &CadApp) -> Option<crate::dyninput::Frame> {
     Some(crate::dyninput::Frame { base: p.base, cartesian, absolute: st.dynpi_absolute, ucs, spatial })
 }
 
-/// Take Tab away from egui before it moves keyboard focus to the next widget (which would leave
-/// the command line deaf to typing). While no widget has focus, a pressed Tab becomes a `"\t"`
-/// text event, which keeps its place among the other keystrokes; [`keyboard`] handles it.
-pub fn capture_tab(ctx: &egui::Context, raw: &mut egui::RawInput) {
-    if ctx.egui_wants_keyboard_input() {
+/// Route plain Tab to drafting before egui moves focus. The orbit viewport can own focus
+/// while its Dynamic Input fields share the command line's keyboard input.
+pub(crate) fn capture_tab(app: &CadApp, ctx: &egui::Context, raw: &mut egui::RawInput) {
+    let plain_tab = |event: &egui::Event| matches!(event, egui::Event::Key { key: Key::Tab, modifiers, .. } if !modifiers.any());
+    if !raw.events.iter().any(plain_tab) || (ctx.egui_wants_keyboard_input() && !(app.canvas.orbit_has_focus(ctx) && dyn_frame(app).is_some())) {
         return;
     }
     raw.events.retain_mut(|e| {
-        let tab = match e {
-            egui::Event::Key { key: Key::Tab, pressed, .. } => Some(*pressed),
-            _ => None,
-        };
-        match tab {
-            Some(true) => {
-                *e = egui::Event::Text("\t".into());
-                true
-            }
-            Some(false) => false,
-            None => true,
+        if !plain_tab(e) {
+            return true;
         }
+        if !matches!(e, egui::Event::Key { pressed: true, .. }) {
+            return false;
+        }
+        // A text event keeps Tab in sequence with the surrounding typed digits.
+        *e = egui::Event::Text("\t".into());
+        true
     });
 }
 
@@ -93,8 +90,9 @@ fn tab(app: &mut CadApp) {
     if crate::grip_dyn::tab(app) {
         return;
     }
-    // Over a snap marker with nothing typed, Tab cycles the candidate snaps.
-    if app.cmd.buffer.is_empty() && app.canvas.snap.is_some() {
+    // The plan canvas cycles candidate snaps. In orbit, the live snap can supply the
+    // untyped coordinates while Tab moves on to the next field.
+    if app.canvas.orbit_view_id.is_none() && app.cmd.buffer.is_empty() && app.canvas.snap.is_some() {
         app.canvas.snap_tab = true;
     } else if let Some(f) = dyn_frame(app)
         && let Some(sep) = crate::dyninput::tab_separator(&app.cmd.buffer, &f)
@@ -300,7 +298,7 @@ fn enable_ime(app: &mut CadApp, ctx: &egui::Context) {
 
 /// Handle keyboard input destined for the command line (when no text field has focus).
 pub fn keyboard(app: &mut CadApp, ctx: &egui::Context) {
-    if ctx.egui_wants_keyboard_input() && !app.canvas.orbit_keyboard_focus {
+    if ctx.egui_wants_keyboard_input() && !app.canvas.orbit_has_focus(ctx) {
         app.cmd.preedit.clear();
         app.cmd.ime_on = false;
         return;
@@ -411,7 +409,7 @@ pub fn keyboard(app: &mut CadApp, ctx: &egui::Context) {
                         }
                     }
                 }
-                Key::Tab => tab(app),
+                Key::Tab if !modifiers.any() => tab(app),
                 Key::Delete if app.cmd.buffer.is_empty() && !app.session.prompting() => {
                     let _ = app.run("erase.selection", serde_json::json!({}));
                 }

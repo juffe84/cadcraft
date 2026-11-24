@@ -569,7 +569,7 @@ fn pick_target(
 }
 
 pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
-    app.canvas.orbit_keyboard_focus = false;
+    app.canvas.orbit_view_id = None;
     let Ok(state) = app.session.state() else { return };
     let Some(mut orbit) = state.orbit else { return };
     let plan = state.view();
@@ -603,7 +603,7 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     }
     let focused = response.has_focus();
     let lost_focus = response.lost_focus();
-    app.canvas.orbit_keyboard_focus = focused;
+    app.canvas.orbit_view_id = Some(response.id);
     let hovered = response.hovered() && !response.hover_pos().is_some_and(|at| app.canvas.over_orbit_button(at));
     let (arrows, keyboard_pan, scroll, escape, fit, press, pointer) = ui.input(|input| {
         let key = |k| f32::from(focused && input.key_pressed(k));

@@ -128,7 +128,7 @@ pub struct CanvasState {
     orbit_button: Option<Rect>,
     pub(crate) orbit_cursor: Option<orbit_draft::DraftPoint>,
     pub(crate) draft_cursor: Option<cadcraft_geom::Vec3>,
-    pub(crate) orbit_keyboard_focus: bool,
+    pub(crate) orbit_view_id: Option<egui::Id>,
     /// The mesh last handed to the GPU (see [`crate::gpu::CanvasCallback::key`]).
     mesh_key: Option<u64>,
     mesh_slot: crate::gpu::MeshSlot,
@@ -221,6 +221,10 @@ pub struct CanvasState {
 type CycleKey = (Option<String>, Option<String>, u64, u64, Vec2, f64);
 
 impl CanvasState {
+    pub(crate) fn orbit_has_focus(&self, ctx: &egui::Context) -> bool {
+        self.orbit_view_id.is_some_and(|id| ctx.memory(|memory| memory.has_focus(id)))
+    }
+
     fn over_orbit_button(&self, at: Pos2) -> bool {
         self.orbit_button.is_some_and(|rect| rect.contains(at))
     }
@@ -860,7 +864,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     }
     app.canvas.cloud_orbit_focus = None;
     app.canvas.orbit_cursor = None;
-    app.canvas.orbit_keyboard_focus = false;
+    app.canvas.orbit_view_id = None;
     app.canvas.orbit_scene = Default::default();
     let full = ui.available_rect_before_wrap();
     // Tiled model viewports (VPORTS): the current tile is the drawing area below; `draw_tiles`

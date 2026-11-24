@@ -126,11 +126,10 @@ impl eframe::App for App {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
     }
-    /// Apply the desktop-theme fallback, forward raw input to `CadApp`, and capture Tab at the command line.
+    /// Apply the desktop-theme fallback and forward raw input to `CadApp`.
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
         follow_desktop(raw, self.desktop_theme.current());
         self.cad.raw_input_hook(ctx, raw);
-        cadcraft_ui_egui::cmdline::capture_tab(ctx, raw);
     }
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.cad.guarded_ui(ui);

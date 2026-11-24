@@ -55,10 +55,9 @@ mod web {
                 bridge.report_dirty(&self.0);
             }
         }
-        /// Forward raw input to the web `CadApp` and capture Tab at the command line.
+        /// Forward raw input to the web `CadApp`.
         fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
             self.0.raw_input_hook(ctx, raw);
-            cadcraft_ui_egui::cmdline::capture_tab(ctx, raw);
         }
         /// Preferences and validated panel placement survive reloads; egui memory is not kept.
         fn save(&mut self, storage: &mut dyn eframe::Storage) {

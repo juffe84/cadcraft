@@ -265,9 +265,11 @@ fn plan_3dpoly_tabs_to_z_and_can_pick_an_elevated_line_endpoint() {
     let text = painted_text(&mut app, &ctx, center);
     assert!(text.lines().any(|line| line == "Z"), "{text}");
     let enter = egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
+    let tab = egui::Event::Key { key: egui::Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE };
     let text = |s: &str| egui::Event::Text(s.into());
     let frame = |app: &mut CadApp, events| {
-        let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))), events, ..Default::default() };
+        let mut raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))), events, ..Default::default() };
+        app.raw_input_hook(&ctx, &mut raw);
         ctx.run_ui(raw, |ui| {
             app.logic(ui.ctx());
             app.ui(ui);
@@ -275,7 +277,7 @@ fn plan_3dpoly_tabs_to_z_and_can_pick_an_elevated_line_endpoint() {
         .textures_delta
         .clear();
     };
-    frame(&mut app, vec![text("1"), text("\t"), text("2"), text("\t"), text("3"), enter]);
+    frame(&mut app, vec![text("1"), tab.clone(), text("2"), tab, text("3"), enter]);
     assert_eq!(app.session.last_point3(), Vec3::new(1.0, 2.0, 3.0));
     let at = app.canvas.xf.unwrap().to_screen(target.xy());
     frame(&mut app, vec![egui::Event::PointerMoved(at)]);
@@ -298,6 +300,74 @@ fn plan_3dpoly_tabs_to_z_and_can_pick_an_elevated_line_endpoint() {
     let drawing = app.session.doc().unwrap();
     assert!(matches!(&drawing.model.iter().last().unwrap().kind, cadcraft_doc::EntityKind::Polyline3d(line)
         if line.points == [Vec3::new(1.0, 2.0, 3.0), target, projected]));
+}
+
+#[test]
+fn raw_tab_edits_a_3dpolyline_while_the_orbit_view_has_focus() {
+    use cadcraft_geom::Vec3;
+    let mut drawing = cadcraft_doc::Drawing::new_metric();
+    let node = Vec3::new(0.0, 0.0, 2.0);
+    drawing
+        .add(
+            &cadcraft_doc::Space::Model,
+            cadcraft_doc::Common::default(),
+            cadcraft_doc::EntityKind::Point(cadcraft_doc::Point { p: node, angle: 0.0 }),
+        )
+        .unwrap();
+    let mut session = cadcraft_engine::Session::empty();
+    session.open_drawing(drawing, "Model", None);
+    session.settings.osmode = cadcraft_engine::snap::mode::NOD;
+    session.cmdline("3dpoly #5,7,10").unwrap();
+    session.execute("3dorbit", &serde_json::json!({"view": "top", "fit": true})).unwrap();
+
+    let mut app = CadApp::new(session, Default::default());
+    let ctx = egui::Context::default();
+    let frame = |app: &mut CadApp, events| {
+        let mut raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, vec2(1400.0, 900.0))), events, ..Default::default() };
+        app.raw_input_hook(&ctx, &mut raw);
+        ctx.run_ui(raw, |ui| {
+            app.logic(ui.ctx());
+            app.ui(ui);
+        })
+        .textures_delta
+        .clear();
+    };
+    let key = |key, pressed, modifiers| egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers };
+    let tab = |pressed| key(egui::Key::Tab, pressed, egui::Modifiers::NONE);
+    let enter = || key(egui::Key::Enter, true, egui::Modifiers::NONE);
+    let text = |s: &str| egui::Event::Text(s.into());
+
+    frame(&mut app, vec![]);
+    let orbit = app.canvas.orbit_view_id.unwrap();
+    ctx.memory_mut(|memory| memory.request_focus(orbit));
+    let at = app.canvas.rect.unwrap().center();
+    frame(&mut app, vec![egui::Event::PointerMoved(at)]);
+    assert!(ctx.egui_wants_keyboard_input() && app.canvas.orbit_has_focus(&ctx));
+    assert_eq!(app.canvas.draft_cursor, Some(node));
+
+    frame(&mut app, vec![text("6"), tab(true), tab(false), text("7"), tab(true), tab(false), text("4")]);
+    assert_eq!(app.cmd.buffer, "6,7,4");
+    assert!(app.canvas.orbit_has_focus(&ctx));
+    frame(&mut app, vec![enter()]);
+    assert_eq!(app.session.last_point3(), Vec3::new(11.0, 14.0, 14.0));
+
+    // At a snap, skip the XY fields to keep the cursor's position and type just the relative Z.
+    assert_eq!(app.canvas.draft_cursor, Some(node));
+    frame(&mut app, vec![tab(true), tab(false), tab(true), tab(false), text("4")]);
+    assert_eq!(app.cmd.buffer, ",,4");
+    frame(&mut app, vec![enter()]);
+    let points = [Vec3::new(5.0, 7.0, 10.0), Vec3::new(11.0, 14.0, 14.0), Vec3::new(0.0, 0.0, 18.0)];
+    assert!(matches!(&app.session.doc().unwrap().model.iter().last().unwrap().kind, cadcraft_doc::EntityKind::Polyline3d(line)
+        if line.points == points));
+
+    let shift_tab = key(egui::Key::Tab, true, egui::Modifiers::SHIFT);
+    let mut raw = egui::RawInput { events: vec![shift_tab.clone()], ..Default::default() };
+    app.raw_input_hook(&ctx, &mut raw);
+    assert_eq!(raw.events, [shift_tab]);
+    ctx.memory_mut(|memory| memory.request_focus(egui::Id::unique("orbit_drafting_test_other_control")));
+    let mut raw = egui::RawInput { events: vec![tab(true)], ..Default::default() };
+    app.raw_input_hook(&ctx, &mut raw);
+    assert_eq!(raw.events, [tab(true)]);
 }
 
 /// A hot grip whose object was hidden since (HIDEOBJECTS, a layer turned off) is no longer

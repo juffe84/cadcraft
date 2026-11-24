@@ -1019,25 +1019,25 @@ impl CadApp {
         } else if let Some(modifiers) = self.restore_modifiers.take() {
             raw.events.insert(0, egui::Event::ModifiersChanged(modifiers));
         }
-        if self.synthetic_injected || self.synthetic.is_empty() {
-            return;
+        if !self.synthetic_injected && !self.synthetic.is_empty() {
+            let n = match self.synthetic.first() {
+                Some(egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. }) => 1,
+                _ => self.synthetic.iter().position(|e| matches!(e, egui::Event::Key { pressed: false, .. })).map_or(self.synthetic.len(), |i| i + 1),
+            };
+            if let Some(egui::Event::PointerMoved(p) | egui::Event::PointerButton { pos: p, .. }) = self.synthetic.first() {
+                raw.events.push(egui::Event::PointerMoved(*p));
+            }
+            // A synthetic click holds its Shift/Ctrl (Shift+click a grip); the next move lets go.
+            match self.synthetic.first() {
+                Some(egui::Event::PointerButton { modifiers, .. }) => raw.events.push(egui::Event::ModifiersChanged(*modifiers)),
+                Some(egui::Event::PointerMoved(_)) => raw.events.push(egui::Event::ModifiersChanged(egui::Modifiers::default())),
+                _ => {}
+            }
+            let n = n.min(self.synthetic.len());
+            raw.events.extend(self.synthetic.drain(..n));
+            self.synthetic_injected = true;
         }
-        let n = match self.synthetic.first() {
-            Some(egui::Event::PointerMoved(_) | egui::Event::PointerButton { .. }) => 1,
-            _ => self.synthetic.iter().position(|e| matches!(e, egui::Event::Key { pressed: false, .. })).map_or(self.synthetic.len(), |i| i + 1),
-        };
-        if let Some(egui::Event::PointerMoved(p) | egui::Event::PointerButton { pos: p, .. }) = self.synthetic.first() {
-            raw.events.push(egui::Event::PointerMoved(*p));
-        }
-        // A synthetic click holds its Shift/Ctrl (Shift+click a grip); the next move lets go.
-        match self.synthetic.first() {
-            Some(egui::Event::PointerButton { modifiers, .. }) => raw.events.push(egui::Event::ModifiersChanged(*modifiers)),
-            Some(egui::Event::PointerMoved(_)) => raw.events.push(egui::Event::ModifiersChanged(egui::Modifiers::default())),
-            _ => {}
-        }
-        let n = n.min(self.synthetic.len());
-        raw.events.extend(self.synthetic.drain(..n));
-        self.synthetic_injected = true;
+        cmdline::capture_tab(self, ctx, raw);
     }
 
     /// Lay out the whole window. This is the only place with a real UI pass.
