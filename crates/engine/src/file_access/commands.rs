@@ -374,6 +374,7 @@ pub const NO_FILES: &[&str] = &[
     "3dorbit",
     "pointcloud.settings",
     "pointcloud.snap",
+    "pointcloud.select",
     "properties",
     "properties.set",
     "chprop",

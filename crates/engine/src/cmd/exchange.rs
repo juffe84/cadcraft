@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use cadcraft_color::Rgb;
-use cadcraft_doc::point_cloud::DetailOptions;
+use cadcraft_doc::point_cloud::{CloudRegion, DetailOptions};
 use cadcraft_doc::{Drawing, Entity, EntityKind, Space};
 use cadcraft_geom::{Bounds2, Mat3, Vec2, Vec3};
 use cadcraft_render::paper::{self, Sheet};
@@ -77,7 +77,42 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("pointcloud.snap", "Pick point cloud point", run_cloud_snap)
             .params("{point: [x,y], aperture: drawing units} → {point: [x,y,z] | null}")
             .noundo(),
+        CommandSpec::new("pointcloud.select", "Select cloud points", run_cloud_select)
+            .params("{min: [x,y], max: [x,y]} | {region: {origin: {x,y,z}, planes: [[a,b,c,d]; 5]}} | {enabled: bool}")
+            .noundo(),
     ]
+}
+
+fn run_cloud_select(s: &mut Session, p: &Value) -> Result<Value> {
+    const ID: &str = "pointcloud.select";
+    let state = s.state()?;
+    if state.doc.point_cloud.is_none() || state.space != cadcraft_doc::Space::Model || state.block_editor().is_some() {
+        return Err(bad(ID, "point selection requires a cloud on the Model tab"));
+    }
+    if let Some(value) = p.get("enabled") {
+        let enabled = value.as_bool().ok_or_else(|| bad(ID, "enabled must be a boolean"))?;
+        let state = s.state_mut()?;
+        state.cloud_selection_mode = Some(enabled);
+        if !enabled {
+            state.cloud_selection = None;
+        }
+        s.pending_window = None;
+        return Ok(json!({"enabled": enabled}));
+    }
+    let region: CloudRegion = if let Some(value) = p.get("region") {
+        serde_json::from_value(value.clone()).map_err(|e| bad(ID, format!("invalid selection region: {e}")))?
+    } else {
+        let corner =
+            |key| p.get(key).and_then(point_value).filter(|p| p.is_finite()).ok_or_else(|| bad(ID, format!("{key} must be a finite XY corner")));
+        CloudRegion::plan(corner("min")?, corner("max")?)
+    };
+    if !region.valid() {
+        return Err(bad(ID, "selection coordinates are outside the supported range"));
+    }
+    s.pending_window = None;
+    s.set_selection(Vec::new());
+    s.state_mut()?.cloud_selection = Some(region);
+    Ok(json!({"selected": true}))
 }
 
 fn run_orbit(s: &mut Session, p: &Value) -> Result<Value> {
@@ -227,7 +262,8 @@ fn run_cloud_snap(s: &mut Session, p: &Value) -> Result<Value> {
         .and_then(Value::as_f64)
         .filter(|n| n.is_finite() && *n > 0.0)
         .ok_or_else(|| bad("pointcloud.snap", "aperture must be positive and finite"))?;
-    let cloud = s.doc()?.point_cloud.as_ref().ok_or_else(|| bad("pointcloud.snap", "there is no open point cloud"))?;
+    let doc = s.doc()?;
+    let cloud = doc.point_cloud.as_ref().ok_or_else(|| bad("pointcloud.snap", "there is no open point cloud"))?;
     let extent = Bounds2::new(point, point).expand(aperture);
     let options = DetailOptions { radius: 0.0, radius_factor: 0.0, ..s.settings.cloud_detail_options() };
     let snapshot = cloud.detail.as_ref().map(|source| source.0.view_with(extent, options)).unwrap_or_default();
@@ -235,6 +271,9 @@ fn run_cloud_snap(s: &mut Session, p: &Value) -> Result<Value> {
     let mut distance = aperture;
     for layer in snapshot.layers(cloud) {
         layer.visible(extent, usize::MAX, |sample| {
+            if doc.point_cloud_removals.iter().any(|region| region.contains(sample.position)) {
+                return;
+            }
             let d = sample.position.xy().dist(point);
             if d <= distance {
                 distance = d;

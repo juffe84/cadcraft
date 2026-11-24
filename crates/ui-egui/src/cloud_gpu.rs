@@ -1,5 +1,5 @@
 //! Point-cloud vertices stay on the GPU when the camera moves.
-use cadcraft_doc::point_cloud::PointCloud;
+use cadcraft_doc::point_cloud::{CloudRegion, MAX_CLOUD_REMOVALS, PointCloud};
 use cadcraft_geom::{Bounds2, Vec3};
 use egui::{Color32, Rect};
 use egui_wgpu::wgpu;
@@ -22,17 +22,44 @@ struct View {
     marker: vec4f,
 };
 @group(0) @binding(0) var<uniform> view: View;
+struct Region {
+    planes: array<vec4f, 5>,
+};
+struct Edits {
+    highlight: vec4f,
+    selected: Region,
+    removed: array<Region, 128>,
+};
+@group(0) @binding(1) var<uniform> edits: Edits;
 struct Output {
     @builtin(position) pos: vec4f,
     @location(0) color: vec4f,
 };
+fn inside(region: Region, point: vec4f) -> bool {
+    for (var i = 0u; i < 5u; i += 1u) {
+        if dot(region.planes[i], point) < 0.0 {
+            return false;
+        }
+    }
+    return true;
+}
 @vertex fn vs(@location(0) position: vec3f, @location(1) color: vec4f, @builtin(vertex_index) vertex: u32) -> Output {
     let u = vec4f(position, 1.0);
     let corner = array<vec2f, 4>(vec2f(-1.0,-1.0), vec2f(1.0,-1.0), vec2f(-1.0,1.0), vec2f(1.0,1.0));
     var out: Output;
+    for (var i = 0u; i < u32(view.marker.w); i += 1u) {
+        if inside(edits.removed[i], u) {
+            out.pos = vec4f(2.0, 2.0, 2.0, 1.0);
+            out.color = vec4f(0.0);
+            return out;
+        }
+    }
     let w = dot(view.w, u);
     out.pos = vec4f(vec2f(dot(view.x, u), dot(view.y, u)) + corner[vertex] * view.marker.xy * w, dot(view.z, u), w);
     out.color = color;
+    if edits.highlight.a > 0.0 && inside(edits.selected, u) {
+        out.color = edits.highlight;
+    }
     return out;
 }
 @fragment fn fs(in: Output) -> @location(0) vec4f {
@@ -49,9 +76,27 @@ struct Resources {
     orbit: wgpu::RenderPipeline,
     orbit_moving: wgpu::RenderPipeline,
     bindings: wgpu::BindGroupLayout,
+    empty_edits: wgpu::Buffer,
     resident: HashMap<usize, Resident>,
     frame: u64,
     linear: bool,
+}
+
+const REGION_BYTES: usize = 5 * 16;
+const EDIT_BYTES: usize = 16 + REGION_BYTES * (1 + MAX_CLOUD_REMOVALS);
+
+#[derive(Clone, Default)]
+pub(crate) struct CloudEdits {
+    pub selected: Option<CloudRegion>,
+    pub removed: Arc<Vec<CloudRegion>>,
+    pub highlight: Color32,
+}
+
+pub(crate) struct PointStyle {
+    pub size: f32,
+    pub fallback: Color32,
+    pub moving: bool,
+    pub edits: CloudEdits,
 }
 
 struct Resident {
@@ -69,12 +114,20 @@ pub fn install(rs: &egui_wgpu::RenderState, target: crate::gpu::GpuTarget) {
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("cloud"), source: wgpu::ShaderSource::Wgsl(SHADER.into()) });
     let bindings = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("cloud"),
-        entries: &[wgpu::BindGroupLayoutEntry {
-            binding: 0,
-            visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
-            ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
-            count: None,
-        }],
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::VERTEX,
+                ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None },
+                count: None,
+            },
+        ],
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("cloud"),
@@ -120,6 +173,11 @@ pub fn install(rs: &egui_wgpu::RenderState, target: crate::gpu::GpuTarget) {
         orbit: pipeline(true, 1),
         orbit_moving: pipeline(true, MOVING_STRIDE),
         bindings,
+        empty_edits: device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("empty cloud edits"),
+            contents: &vec![0; EDIT_BYTES],
+            usage: wgpu::BufferUsages::UNIFORM,
+        }),
         resident: HashMap::new(),
         frame: 0,
         linear: target.format.is_srgb(),
@@ -154,10 +212,14 @@ impl Camera {
     }
 
     pub fn rows(&self, rect: Rect, origin: Vec3) -> [[f32; 4]; 4] {
+        self.rows_precise(rect, origin).map(|row| row.map(|value| value as f32))
+    }
+
+    pub(crate) fn rows_precise(&self, rect: Rect, origin: Vec3) -> [[f64; 4]; 4] {
         let delta = origin - self.center;
         let [x, y, z] = self.axes;
         let row = |axis: Vec3, offset: f64, factor: f64, bias: f64| {
-            [(axis.x * factor) as f32, (axis.y * factor) as f32, (axis.z * factor) as f32, ((axis.dot(delta) + offset) * factor + bias) as f32]
+            [axis.x * factor, axis.y * factor, axis.z * factor, (axis.dot(delta) + offset) * factor + bias]
         };
         let (depth, w) = if let Some(eye) = self.eye {
             (row(z, 0.0, -1.0 / eye, 0.99), row(z, 0.0, -1.0 / eye, 1.0))
@@ -173,15 +235,8 @@ impl Camera {
     }
 }
 
-pub fn paint(
-    painter: &egui::Painter,
-    rect: Rect,
-    clouds: impl IntoIterator<Item = Arc<PointCloud>>,
-    camera: &Camera,
-    size: f32,
-    fallback: Color32,
-    moving: bool,
-) {
+pub(crate) fn paint(painter: &egui::Painter, rect: Rect, clouds: impl IntoIterator<Item = Arc<PointCloud>>, camera: &Camera, style: PointStyle) {
+    let PointStyle { size, fallback, moving, edits } = style;
     let clouds: Vec<_> = clouds.into_iter().collect();
     let Some(base) = clouds.first() else { return };
     let origin = origin(base);
@@ -205,6 +260,7 @@ pub fn paint(
         stride,
         bounds: camera.bounds,
         ctx: painter.ctx().clone(),
+        edits,
     };
     painter.add(egui_wgpu::Callback::new_paint_callback(rect, callback));
 }
@@ -224,6 +280,7 @@ struct Callback {
     stride: u32,
     bounds: Bounds2,
     ctx: egui::Context,
+    edits: CloudEdits,
 }
 
 impl egui_wgpu::CallbackTrait for Callback {
@@ -270,16 +327,21 @@ impl egui_wgpu::CallbackTrait for Callback {
         }
         let mut rows = self.rows;
         rows[4][2] = f32::from(res.linear);
+        rows[4][3] = self.edits.removed.len().min(MAX_CLOUD_REMOVALS) as f32;
         let bytes: Vec<_> = rows.into_iter().flatten().flat_map(f32::to_le_bytes).collect();
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("cloud view"),
             contents: &bytes,
             usage: wgpu::BufferUsages::UNIFORM,
         });
+        let edits = edit_uniform(device, &self.edits, self.origin, &res.empty_edits);
         let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("cloud view"),
             layout: &res.bindings,
-            entries: &[wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() }],
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: edits.as_entire_binding() },
+            ],
         });
         *self.view.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(bind);
         Vec::new()
@@ -324,6 +386,26 @@ impl egui_wgpu::CallbackTrait for Callback {
 
 fn instance_range(points: Range<u32>, stride: u32) -> Range<u32> {
     points.start.div_ceil(stride)..points.end.div_ceil(stride)
+}
+
+fn edit_uniform(device: &wgpu::Device, edits: &CloudEdits, origin: Vec3, empty: &wgpu::Buffer) -> wgpu::Buffer {
+    if edits.selected.is_none() && edits.removed.is_empty() {
+        return empty.clone();
+    }
+    let mut bytes = Vec::with_capacity(EDIT_BYTES);
+    let highlight = edits.selected.map_or([0.0; 4], |_| edits.highlight.to_normalized_gamma_f32());
+    bytes.extend(highlight.into_iter().flat_map(f32::to_le_bytes));
+    let selected = edits.selected.map_or([[0.0; 4]; 5], |region| region.planes_at(origin));
+    let removed = edits.removed.iter().take(MAX_CLOUD_REMOVALS).map(|region| region.planes_at(origin));
+    for region in std::iter::once(selected).chain(removed) {
+        bytes.extend(region.into_iter().flatten().flat_map(|value| (value as f32).to_le_bytes()));
+    }
+    bytes.resize(EDIT_BYTES, 0);
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("cloud removal regions"),
+        contents: &bytes,
+        usage: wgpu::BufferUsages::UNIFORM,
+    })
 }
 
 fn upload(device: &wgpu::Device, cloud: &Arc<PointCloud>, origin: Vec3, fallback: Color32, frame: u64) -> Resident {
@@ -415,6 +497,7 @@ mod tests {
             stride: 1,
             bounds,
             ctx: egui::Context::default(),
+            edits: CloudEdits::default(),
         };
         let mut drawing = cadcraft_doc::Drawing::new_metric();
         let points = [Vec3::new(-25.0, -25.0, 0.0), Vec3::new(25.0, -25.0, 0.0), Vec3::new(0.0, 25.0, 0.0), Vec3::new(0.0, 25.0, 0.0)];
@@ -449,61 +532,70 @@ mod tests {
         let color = texture(rs.target_format, wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC);
         let depth = texture(DEPTH, wgpu::TextureUsages::RENDER_ATTACHMENT);
         let (color_view, depth_view) = (color.create_view(&Default::default()), depth.create_view(&Default::default()));
-        let mut encoder = device.create_command_encoder(&Default::default());
         let mut renderer = rs.renderer.write();
         let screen = ScreenDescriptor { size_in_pixels: [SIZE, SIZE], pixels_per_point: 1.0 };
-        let _ = callback.prepare(device, &rs.queue, &screen, &mut encoder, &mut renderer.callback_resources);
-        let key = Arc::as_ptr(&callback.clouds[0]) as usize;
-        let buffer = renderer.callback_resources.get::<Resources>().unwrap().resident[&key].buffer.clone();
-        let _ = callback.prepare(device, &rs.queue, &screen, &mut encoder, &mut renderer.callback_resources);
-        assert_eq!(renderer.callback_resources.get::<Resources>().unwrap().resident[&key].buffer, buffer);
-        let _ = model.prepare(device, &rs.queue, &screen, &mut encoder, &mut renderer.callback_resources);
-        {
-            let mut pass = encoder
-                .begin_render_pass(&wgpu::RenderPassDescriptor {
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &color_view,
-                        resolve_target: None,
-                        depth_slice: None,
-                        ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
-                    })],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &depth_view,
-                        depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
-                        stencil_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0), store: wgpu::StoreOp::Discard }),
-                    }),
-                    ..Default::default()
-                })
-                .forget_lifetime();
-            let info = || egui::PaintCallbackInfo { viewport: rect, clip_rect: rect, pixels_per_point: 1.0, screen_size_px: [SIZE, SIZE] };
-            callback.paint(info(), &mut pass, &renderer.callback_resources);
-            callback.stride = MOVING_STRIDE;
-            callback.paint(info(), &mut pass, &renderer.callback_resources);
-            model.paint(info(), &mut pass, &renderer.callback_resources);
+        let region = CloudRegion::plan(cadcraft_geom::Vec2::new(-0.5, -0.5), cadcraft_geom::Vec2::new(0.5, 0.5));
+        let selection = CloudEdits { selected: Some(region), highlight: Color32::from_rgb(255, 0, 255), ..Default::default() };
+        let removal = CloudEdits { removed: Arc::new(vec![region]), ..Default::default() };
+        for (edits, expected) in [(CloudEdits::default(), [255, 255, 255]), (selection, [255, 0, 255]), (removal, [0, 255, 0])] {
+            let mut encoder = device.create_command_encoder(&Default::default());
+            callback.edits = edits;
+            callback.stride = 1;
+            let _ = callback.prepare(device, &rs.queue, &screen, &mut encoder, &mut renderer.callback_resources);
+            let key = Arc::as_ptr(&callback.clouds[0]) as usize;
+            let buffer = renderer.callback_resources.get::<Resources>().unwrap().resident[&key].buffer.clone();
+            let _ = callback.prepare(device, &rs.queue, &screen, &mut encoder, &mut renderer.callback_resources);
+            assert_eq!(renderer.callback_resources.get::<Resources>().unwrap().resident[&key].buffer, buffer);
+            let _ = model.prepare(device, &rs.queue, &screen, &mut encoder, &mut renderer.callback_resources);
+            {
+                let mut pass = encoder
+                    .begin_render_pass(&wgpu::RenderPassDescriptor {
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view: &color_view,
+                            resolve_target: None,
+                            depth_slice: None,
+                            ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color::BLACK), store: wgpu::StoreOp::Store },
+                        })],
+                        depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                            view: &depth_view,
+                            depth_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(1.0), store: wgpu::StoreOp::Discard }),
+                            stencil_ops: Some(wgpu::Operations { load: wgpu::LoadOp::Clear(0), store: wgpu::StoreOp::Discard }),
+                        }),
+                        ..Default::default()
+                    })
+                    .forget_lifetime();
+                let info = || egui::PaintCallbackInfo { viewport: rect, clip_rect: rect, pixels_per_point: 1.0, screen_size_px: [SIZE, SIZE] };
+                callback.paint(info(), &mut pass, &renderer.callback_resources);
+                callback.stride = MOVING_STRIDE;
+                callback.paint(info(), &mut pass, &renderer.callback_resources);
+                model.paint(info(), &mut pass, &renderer.callback_resources);
+            }
+            let readback = device.create_buffer(&wgpu::BufferDescriptor {
+                label: None,
+                size: u64::from(SIZE * SIZE * 4),
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            encoder.copy_texture_to_buffer(
+                color.as_image_copy(),
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &readback,
+                    layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(SIZE * 4), rows_per_image: Some(SIZE) },
+                },
+                dimensions,
+            );
+            rs.queue.submit([encoder.finish()]);
+            readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+            device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(10)) }).unwrap();
+            assert!(faults.take().is_none());
+            let pixels = readback.slice(..).get_mapped_range().unwrap();
+            let center = (SIZE as usize / 2) * (SIZE as usize + 1) * 4;
+            for (&actual, &wanted) in pixels[center..center + 3].iter().zip(&expected) {
+                assert!(actual.abs_diff(wanted) < 20, "unexpected cloud pixel: {:?}", &pixels[center..center + 3]);
+            }
+            let side = center + 8 * 4;
+            assert!(pixels[side + 1] > 200 && pixels[side] < 10 && pixels[side + 2] < 10);
+            assert!(pixels[0..3].iter().all(|c| *c < 10));
         }
-        let readback = device.create_buffer(&wgpu::BufferDescriptor {
-            label: None,
-            size: u64::from(SIZE * SIZE * 4),
-            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        encoder.copy_texture_to_buffer(
-            color.as_image_copy(),
-            wgpu::TexelCopyBufferInfo {
-                buffer: &readback,
-                layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(SIZE * 4), rows_per_image: Some(SIZE) },
-            },
-            dimensions,
-        );
-        rs.queue.submit([encoder.finish()]);
-        readback.slice(..).map_async(wgpu::MapMode::Read, |_| {});
-        device.poll(wgpu::PollType::Wait { submission_index: None, timeout: Some(std::time::Duration::from_secs(10)) }).unwrap();
-        assert!(faults.take().is_none());
-        let pixels = readback.slice(..).get_mapped_range().unwrap();
-        let center = (SIZE as usize / 2) * (SIZE as usize + 1) * 4;
-        assert!(pixels[center..center + 3].iter().all(|c| *c > 200));
-        let side = center + 8 * 4;
-        assert!(pixels[side + 1] > 200 && pixels[side] < 10 && pixels[side + 2] < 10);
-        assert!(pixels[0..3].iter().all(|c| *c < 10));
     }
 }

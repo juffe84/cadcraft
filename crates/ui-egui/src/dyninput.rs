@@ -8,7 +8,8 @@
 //! - Tab types the separator for the format on show, so `40` Tab `90` reads `40<90`. Spatial
 //!   Cartesian entries advance to Z with a second Tab. Tab after the final value locks it.
 //! - Enter sends the entry with `@` in front when it is measured from the last point (relative is
-//!   the default; DYNPICOORDS = 1 makes it absolute), and fills an empty box from the cursor.
+//!   the default for planar drafting; DYNPICOORDS = 1 makes it absolute), and fills an empty box
+//!   from the cursor. Spatial drafting uses the actual X, Y and Z in the current UCS.
 //! - A plain number and Enter stays direct distance entry; `@`/`#` entries, keywords and command
 //!   names go through untouched.
 //!

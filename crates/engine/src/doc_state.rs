@@ -24,6 +24,8 @@ pub struct DocState {
     pub undo_ctl: undoctl::UndoCtl,
     pub selection: Vec<Handle>,
     pub previous_selection: Vec<Handle>,
+    pub cloud_selection: Option<cadcraft_doc::point_cloud::CloudRegion>,
+    pub cloud_selection_mode: Option<bool>,
     pub path: Option<String>,
     pub title: String,
     pub saved: Arc<Drawing>,
@@ -86,6 +88,8 @@ impl DocState {
             undo_ctl: undoctl::UndoCtl::default(),
             selection: Vec::new(),
             previous_selection: Vec::new(),
+            cloud_selection: None,
+            cloud_selection_mode: None,
             path,
             title: title.into(),
             revision: 1,
@@ -112,6 +116,7 @@ impl DocState {
     /// it was, as the step back.
     pub(crate) fn swap_in(&mut self, snap: Snapshot) -> Snapshot {
         let cur = Snapshot { label: snap.label, doc: std::mem::replace(&mut self.doc, snap.doc), selection: std::mem::take(&mut self.selection) };
+        self.cloud_selection = None;
         self.follow_layout(&cur.doc);
         self.reconcile_untiled_twist();
         self.revision += 1;

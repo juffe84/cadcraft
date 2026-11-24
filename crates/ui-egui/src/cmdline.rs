@@ -59,15 +59,20 @@ pub fn dyn_frame(app: &CadApp) -> Option<crate::dyninput::Frame> {
     let p = app.session.current_prompt().filter(cadcraft_engine::pointmod::accepts)?;
     let spatial = app.session.spatial_draft_reference();
     let ucs = if spatial.is_some() { app.session.spatial_draft_ucs() } else { app.session.input_ucs() };
-    let cartesian = st.dynpi_cartesian || app.session.running.as_ref().is_some_and(|r| r.id == "3dpoly");
-    Some(crate::dyninput::Frame { base: p.base, cartesian, absolute: st.dynpi_absolute, ucs, spatial })
+    let xyz = spatial.is_some()
+        && (app.session.running.as_ref().is_some_and(|r| r.id == "3dpoly")
+            || app.session.state().is_ok_and(|state| state.orbit.is_some())
+            || (p.base.is_some() && spatial.is_some_and(|base| ucs.to_ucs3(base).z.abs() > 1e-9)));
+    // The spatial fields show the actual XYZ of the next vertex. Explicit @
+    // entries still take the command line's relative-coordinate path.
+    Some(crate::dyninput::Frame { base: p.base, cartesian: xyz || st.dynpi_cartesian, absolute: xyz || st.dynpi_absolute, ucs, spatial })
 }
 
 /// Route plain Tab to drafting before egui moves focus. The orbit viewport can own focus
 /// while its Dynamic Input fields share the command line's keyboard input.
 pub(crate) fn capture_tab(app: &CadApp, ctx: &egui::Context, raw: &mut egui::RawInput) {
     let plain_tab = |event: &egui::Event| matches!(event, egui::Event::Key { key: Key::Tab, modifiers, .. } if !modifiers.any());
-    if !raw.events.iter().any(plain_tab) || (ctx.egui_wants_keyboard_input() && !(app.canvas.orbit_has_focus(ctx) && dyn_frame(app).is_some())) {
+    if !raw.events.iter().any(plain_tab) || (ctx.egui_wants_keyboard_input() && !(app.canvas.drawing_has_focus(ctx) && dyn_frame(app).is_some())) {
         return;
     }
     raw.events.retain_mut(|e| {
@@ -298,7 +303,7 @@ fn enable_ime(app: &mut CadApp, ctx: &egui::Context) {
 
 /// Handle keyboard input destined for the command line (when no text field has focus).
 pub fn keyboard(app: &mut CadApp, ctx: &egui::Context) {
-    if ctx.egui_wants_keyboard_input() && !app.canvas.orbit_has_focus(ctx) {
+    if ctx.egui_wants_keyboard_input() && !app.canvas.drawing_has_focus(ctx) {
         app.cmd.preedit.clear();
         app.cmd.ime_on = false;
         return;
@@ -380,7 +385,7 @@ pub fn keyboard(app: &mut CadApp, ctx: &egui::Context) {
                         press,
                         &app.cmd.buffer,
                         app.session.prompting(),
-                        !app.session.selection().is_empty(),
+                        !app.session.selection().is_empty() || app.session.state().is_ok_and(|state| state.cloud_selection.is_some()),
                         app.cmd.typed_since_selection,
                     );
                     if erase {
@@ -426,6 +431,7 @@ pub fn keyboard(app: &mut CadApp, ctx: &egui::Context) {
 pub fn escape(app: &mut CadApp) {
     app.cmd.buffer.clear();
     app.cmd.preedit.clear();
+    app.canvas.cloud_rectangle = None;
     app.session.cancel();
 }
 
@@ -964,6 +970,22 @@ mod delete_key_tests {
         assert!(c.typed_since_selection);
         c.watch_selection(&[Handle(1), Handle(2)]);
         assert!(!c.typed_since_selection);
+    }
+
+    #[test]
+    fn spatial_fields_show_the_next_vertex_instead_of_offsets_from_the_previous_one() {
+        use cadcraft_geom::Vec3;
+        for (command, orbit) in [("line", true), ("line", false), ("3dpoly", true), ("3dpoly", false)] {
+            let mut app = CadApp::new(cadcraft_engine::Session::new(), crate::Services::default());
+            app.session.execute("3dorbit", &serde_json::json!({"enabled": orbit})).unwrap();
+            app.session.cmdline(&format!("{command} 100,200,30")).unwrap();
+            let frame = dyn_frame(&app).unwrap();
+            let expected = Vec3::new(104.0, 203.0, 32.0);
+            assert!(frame.base.is_some());
+            assert!(crate::dyninput::parse("", &frame).unwrap().has_z(&frame));
+            assert_eq!(frame.live_xyz(expected), expected);
+            assert!(crate::dyninput::parse("@4,3,2", &frame).is_none());
+        }
     }
 }
 

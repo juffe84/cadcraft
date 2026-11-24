@@ -161,6 +161,8 @@ pub struct Drawing {
     pub rasters: Rasters,
     /// A point cloud opened for viewing in model space. Shared across undo snapshots.
     pub point_cloud: Option<std::sync::Arc<point_cloud::PointCloud>>,
+    /// Undoable removals applied to the cloud in this drawing.
+    pub point_cloud_removals: std::sync::Arc<Vec<point_cloud::CloudRegion>>,
 }
 
 impl Default for Drawing {
@@ -221,6 +223,7 @@ impl Drawing {
             ucs_previous: Vec::new(),
             read_notes: Vec::new(),
             point_cloud: None,
+            point_cloud_removals: Default::default(),
             refedit: None,
             skipped_records: BTreeMap::new(),
             portable_fonts: false,

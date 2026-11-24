@@ -1,5 +1,6 @@
 //! In-memory XYZ samples and a spatial index for model-space previews.
-use cadcraft_geom::{Bounds2, Vec3};
+use cadcraft_geom::{Bounds2, Vec2, Vec3};
+use serde::{Deserialize, Serialize};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -9,6 +10,57 @@ pub struct CloudPoint {
     pub rgb: [u16; 3],
     pub intensity: u16,
     pub classification: u8,
+}
+
+/// A selection through the point cloud, saved in model space so it follows the data.
+/// Each plane points inward and is relative to a local origin for survey coordinates.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+pub struct CloudRegion {
+    pub origin: Vec3,
+    pub planes: [[f64; 4]; 5],
+}
+
+/// Also bounds the portable renderer's uniform containing the removal regions.
+pub const MAX_CLOUD_REMOVALS: usize = 128;
+
+impl CloudRegion {
+    pub fn plan(a: Vec2, b: Vec2) -> Self {
+        let bounds = Bounds2::new(a, b);
+        let origin = bounds.center();
+        Self {
+            origin: origin.to3(0.0),
+            planes: [
+                [1.0, 0.0, 0.0, origin.x - bounds.min.x],
+                [-1.0, 0.0, 0.0, bounds.max.x - origin.x],
+                [0.0, 1.0, 0.0, origin.y - bounds.min.y],
+                [0.0, -1.0, 0.0, bounds.max.y - origin.y],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        }
+    }
+
+    /// Clip a rectangle in normalized screen space, through either camera projection.
+    pub fn projected(origin: Vec3, [x, y, _, w]: [[f64; 4]; 4], bounds: Bounds2) -> Self {
+        let lower = |axis: [f64; 4], edge| std::array::from_fn(|i| axis[i] - edge * w[i]);
+        let upper = |axis: [f64; 4], edge| std::array::from_fn(|i| edge * w[i] - axis[i]);
+        let mut front = w;
+        front[3] -= 0.01;
+        Self { origin, planes: [lower(x, bounds.min.x), upper(x, bounds.max.x), lower(y, bounds.min.y), upper(y, bounds.max.y), front] }
+    }
+
+    pub fn valid(&self) -> bool {
+        [self.origin.x, self.origin.y, self.origin.z].iter().all(|v| v.abs() <= 1.0e12) && self.planes.iter().flatten().all(|v| v.abs() <= 1.0e20)
+    }
+
+    pub fn contains(&self, position: Vec3) -> bool {
+        let p = position - self.origin;
+        self.planes.iter().all(|[a, b, c, d]| a * p.x + b * p.y + c * p.z + d >= 0.0)
+    }
+
+    pub fn planes_at(&self, origin: Vec3) -> [[f64; 4]; 5] {
+        let p = origin - self.origin;
+        self.planes.map(|[a, b, c, d]| [a, b, c, a * p.x + b * p.y + c * p.z + d])
+    }
 }
 
 #[derive(Debug, PartialEq)]

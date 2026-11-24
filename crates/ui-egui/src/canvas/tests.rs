@@ -342,19 +342,19 @@ fn raw_tab_edits_a_3dpolyline_while_the_orbit_view_has_focus() {
     ctx.memory_mut(|memory| memory.request_focus(orbit));
     let at = app.canvas.rect.unwrap().center();
     frame(&mut app, vec![egui::Event::PointerMoved(at)]);
-    assert!(ctx.egui_wants_keyboard_input() && app.canvas.orbit_has_focus(&ctx));
+    assert!(ctx.egui_wants_keyboard_input() && app.canvas.drawing_has_focus(&ctx));
     assert_eq!(app.canvas.draft_cursor, Some(node));
 
-    frame(&mut app, vec![text("6"), tab(true), tab(false), text("7"), tab(true), tab(false), text("4")]);
-    assert_eq!(app.cmd.buffer, "6,7,4");
-    assert!(app.canvas.orbit_has_focus(&ctx));
+    frame(&mut app, vec![text("11"), tab(true), tab(false), text("14"), tab(true), tab(false), text("14")]);
+    assert_eq!(app.cmd.buffer, "11,14,14");
+    assert!(app.canvas.drawing_has_focus(&ctx));
     frame(&mut app, vec![enter()]);
     assert_eq!(app.session.last_point3(), Vec3::new(11.0, 14.0, 14.0));
 
-    // At a snap, skip the XY fields to keep the cursor's position and type just the relative Z.
+    // At a snap, skip the XY fields to keep the cursor's position and type just the height.
     assert_eq!(app.canvas.draft_cursor, Some(node));
-    frame(&mut app, vec![tab(true), tab(false), tab(true), tab(false), text("4")]);
-    assert_eq!(app.cmd.buffer, ",,4");
+    frame(&mut app, vec![tab(true), tab(false), tab(true), tab(false), text("18")]);
+    assert_eq!(app.cmd.buffer, ",,18");
     frame(&mut app, vec![enter()]);
     let points = [Vec3::new(5.0, 7.0, 10.0), Vec3::new(11.0, 14.0, 14.0), Vec3::new(0.0, 0.0, 18.0)];
     assert!(matches!(&app.session.doc().unwrap().model.iter().last().unwrap().kind, cadcraft_doc::EntityKind::Polyline3d(line)

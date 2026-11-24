@@ -12,7 +12,7 @@ use egui::{Painter, Pos2, Response, Stroke};
 
 use super::orbit_scene::Model;
 use super::orbit_snap::Query;
-use super::point_cloud::{OrbitFrame, layers};
+use super::point_cloud::{OrbitFrame, layers, removals};
 use super::{CadApp, Tokens, cursor, press};
 
 #[derive(Clone, Copy, Debug)]
@@ -43,7 +43,10 @@ fn point_at(session: &Session, frame: &OrbitFrame, model: Option<&Model>, clouds
     {
         let size = session.settings.point_cloud_size;
         let aperture = query.radius.max(size * 0.5);
-        if let Some(position) = frame.pick_where(layers(snapshot, root), at, 160_000, aperture, size, |p| query.accepts(p)) {
+        let removed = removals(session);
+        if let Some(position) = frame
+            .pick_where(layers(snapshot, root), at, 160_000, aperture, size, |p| query.accepts(p) && !removed.iter().any(|region| region.contains(p)))
+        {
             let hit = snap::SnapHit::cloud_sample(position);
             return Some(DraftPoint { position: session.project_spatial_snap(position), snap: Some(hit) });
         }

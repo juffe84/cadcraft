@@ -1,6 +1,6 @@
 //! Edit menu: undo/redo, clipboard, selection.
 
-use cadcraft_doc::{Entity, Handle, entity_bounds};
+use cadcraft_doc::{Entity, Handle, Space, entity_bounds};
 use cadcraft_geom::{Bounds2, Mat3, Vec2};
 use serde_json::{Value, json};
 
@@ -60,7 +60,7 @@ pub fn specs() -> Vec<CommandSpec> {
             .params("{} (only into a drawing other than the one copied from)")
             .enabled(clipboard::can_paste_orig)
             .interactive(|_| Ok(Box::new(PasteM { mode: PasteMode::Orig }))),
-        CommandSpec::new("erase.selection", "Clear", run_clear).menu(&["Edit", "Clear"]).key("Delete").enabled(has_selection).params("{}"),
+        CommandSpec::new("erase.selection", "Clear", run_clear).menu(&["Edit", "Clear"]).key("Delete").enabled(can_clear).params("{}"),
         CommandSpec::new("selectall", "Select All", run_selectall).menu(&["Edit", "Select All"]).key("Cmd+A").alias(&["ai_selall"]).noundo(),
         CommandSpec::new("ai_deselect", "Deselect All", run_deselect).params("{}").noundo(),
         CommandSpec::new("select", "Select", run_select)
@@ -546,8 +546,31 @@ fn run_pasteorig(s: &mut Session, _p: &Value) -> Result<Value> {
     Ok(json!({ "handles": r.iter().map(|h| h.hex()).collect::<Vec<_>>() }))
 }
 
+fn can_clear(s: &Session) -> std::result::Result<(), String> {
+    if s.state().is_ok_and(|state| {
+        state.cloud_selection.is_some() && state.doc.point_cloud.is_some() && state.space == Space::Model && state.block_editor().is_none()
+    }) {
+        Ok(())
+    } else {
+        has_selection(s)
+    }
+}
+
 fn run_clear(s: &mut Session, _p: &Value) -> Result<Value> {
     let mut hs = s.selection();
+    if hs.is_empty()
+        && let Some(region) = s.state()?.cloud_selection
+        && s.doc()?.point_cloud.is_some()
+        && s.space() == Space::Model
+        && s.state()?.block_editor().is_none()
+    {
+        if s.doc()?.point_cloud_removals.len() >= cadcraft_doc::point_cloud::MAX_CLOUD_REMOVALS {
+            return Err(super::bad("erase.selection", "too many point cloud removal regions"));
+        }
+        std::sync::Arc::make_mut(&mut s.doc_mut()?.point_cloud_removals).push(region);
+        s.state_mut()?.cloud_selection = None;
+        return Ok(json!({ "erased": 0, "cloudRegionRemoved": true }));
+    }
     hs.retain(|h| !super::curves::is_locked(s, *h));
     let n = super::modify::erase_kept(s, &hs)?;
     s.set_selection(Vec::new());

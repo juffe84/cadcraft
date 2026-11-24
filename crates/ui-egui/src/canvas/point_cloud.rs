@@ -1,7 +1,8 @@
 use super::orbit_scene::{self, Extent, Model};
 use super::{CadApp, Color32, Rect, Shape, Tokens, Vec2, Xf, pos2, vec2};
+use crate::cloud_gpu::{CloudEdits, PointStyle};
 use cadcraft_doc::Space;
-use cadcraft_doc::point_cloud::{CloudPoint, CloudView, PointCloud};
+use cadcraft_doc::point_cloud::{CloudPoint, CloudRegion, CloudView, PointCloud};
 use cadcraft_engine::OrbitView;
 use cadcraft_geom::{Bounds2, Vec3};
 use egui::{Key, PointerButton, Sense};
@@ -60,6 +61,24 @@ fn controls(app: &mut CadApp, ui: &mut egui::Ui) {
         }
         if ui.checkbox(&mut snap, crate::i18n::t("Snap to cloud points")).changed() {
             let _ = app.run("pointcloud.settings", json!({ "snap": snap }));
+        }
+        let selecting = super::cloud_selection::enabled(app);
+        let label = "Select cloud points";
+        let choice = ui
+            .selectable_label(selecting, crate::i18n::t(label))
+            .on_hover_text(crate::i18n::t("Drag a rectangle or click its two corners to select points through the cloud."));
+        crate::control::record_widget(ui, &choice, label, "button", Some(selecting));
+        if choice.clicked() {
+            let _ = app.run("pointcloud.select", json!({ "enabled": !selecting }));
+        }
+        if app.session.state().is_ok_and(|state| state.cloud_selection.is_some()) {
+            let label = "Delete cloud selection";
+            let button =
+                ui.button(crate::i18n::t(label)).on_hover_text(crate::i18n::t("Remove the selected area in this drawing. You can undo this."));
+            crate::control::record_widget(ui, &button, label, "button", None);
+            if button.clicked() {
+                let _ = app.run("erase.selection", json!({}));
+            }
         }
         if streaming {
             ui.menu_button(crate::i18n::t("Detail loading"), |ui| {
@@ -125,6 +144,30 @@ fn color(cloud: &PointCloud, point: &CloudPoint, fallback: Color32) -> Color32 {
     }
 }
 
+pub(super) fn removals(session: &cadcraft_engine::Session) -> &[CloudRegion] {
+    session.doc().map_or(&[], |doc| doc.point_cloud_removals.as_slice())
+}
+
+fn point_style(app: &CadApp, moving: bool) -> PointStyle {
+    let tokens = Tokens::get();
+    let edits = app.session.state().map_or_else(
+        |_| CloudEdits::default(),
+        |state| CloudEdits { selected: state.cloud_selection, removed: state.doc.point_cloud_removals.clone(), highlight: tokens.selection },
+    );
+    PointStyle { size: app.session.settings.point_cloud_size, fallback: tokens.canvas_ink, moving, edits }
+}
+
+fn displayed_color(style: &PointStyle, cloud: &PointCloud, point: &CloudPoint) -> Option<Color32> {
+    if style.edits.removed.iter().any(|region| region.contains(point.position)) {
+        return None;
+    }
+    if style.edits.selected.is_some_and(|region| region.contains(point.position)) {
+        Some(style.edits.highlight)
+    } else {
+        Some(color(cloud, point, style.fallback))
+    }
+}
+
 fn view(cloud: &PointCloud, bounds: Bounds2, app: &CadApp, request: bool) -> CloudView {
     cloud.detail.as_ref().map_or_else(CloudView::default, |details| {
         if request { details.0.view_with(bounds, app.session.settings.cloud_detail_options()) } else { details.0.current(bounds) }
@@ -135,6 +178,19 @@ pub(super) fn layers<'a>(snapshot: &'a CloudView, root: &'a Arc<PointCloud>) -> 
     snapshot.layers(root)
 }
 
+pub(super) fn plan_camera(xf: &Xf) -> crate::cloud_gpu::Camera {
+    let (sin, cos) = xf.twist.sin_cos();
+    crate::cloud_gpu::Camera {
+        center: xf.center.to3(0.0),
+        axes: [Vec3::new(cos, -sin, 0.0), Vec3::new(sin, cos, 0.0), Vec3::Z],
+        pan: [0.0; 2],
+        scale: xf.scale,
+        depth: None,
+        eye: None,
+        bounds: xf.world_bounds(),
+    }
+}
+
 pub(super) fn paint_plan(app: &CadApp, painter: &egui::Painter, xf: &Xf, request: bool) {
     let Some(cloud) = cloud(app) else { return };
     let bounds = xf.world_bounds();
@@ -142,37 +198,21 @@ pub(super) fn paint_plan(app: &CadApp, painter: &egui::Painter, xf: &Xf, request
     if request && snapshot.pending {
         painter.ctx().request_repaint_after(std::time::Duration::from_millis(125));
     }
+    let style = point_style(app, false);
     if request && layers(&snapshot, cloud).all(|shown| crate::cloud_gpu::available(app.canvas.gpu, shown)) {
-        let (sin, cos) = xf.twist.sin_cos();
-        let camera = crate::cloud_gpu::Camera {
-            center: Vec3::new(xf.center.x, xf.center.y, 0.0),
-            axes: [Vec3::new(cos, -sin, 0.0), Vec3::new(sin, cos, 0.0), Vec3::Z],
-            pan: [0.0; 2],
-            scale: xf.scale,
-            depth: None,
-            eye: None,
-            bounds,
-        };
-        crate::cloud_gpu::paint(
-            painter,
-            xf.rect,
-            layers(&snapshot, cloud).cloned(),
-            &camera,
-            app.session.settings.point_cloud_size,
-            Tokens::get().canvas_ink,
-            false,
-        );
+        crate::cloud_gpu::paint(painter, xf.rect, layers(&snapshot, cloud).cloned(), &plan_camera(xf), style);
         return;
     }
     let mut mesh = egui::Mesh::default();
-    let size = egui::Vec2::splat(app.session.settings.point_cloud_size);
-    let fallback = Tokens::get().canvas_ink;
+    let size = egui::Vec2::splat(style.size);
     let limit = sample_budget(xf.rect).div_ceil(layers(&snapshot, cloud).count().max(1));
     for shown in layers(&snapshot, cloud) {
         shown.visible(bounds, limit, |point| {
             let screen = xf.to_screen(point.position.xy());
-            if xf.rect.contains(screen) {
-                mesh.add_colored_rect(Rect::from_center_size(screen, size), color(shown, point, fallback));
+            if xf.rect.contains(screen)
+                && let Some(color) = displayed_color(&style, shown, point)
+            {
+                mesh.add_colored_rect(Rect::from_center_size(screen, size), color);
             }
         });
     }
@@ -183,6 +223,7 @@ pub(super) fn snap_visible(app: &CadApp, xf: &Xf, raw: Vec2, aperture: f64) -> O
     let cloud = cloud(app)?;
     let bounds = xf.world_bounds();
     let snapshot = view(cloud, bounds, app, false);
+    let removed = removals(&app.session);
     let mut nearest = None;
     let mut distance = aperture.max(f64::from(app.session.settings.point_cloud_size) * 0.5 / xf.scale).powi(2);
     let gpu = layers(&snapshot, cloud).all(|shown| crate::cloud_gpu::available(app.canvas.gpu, shown));
@@ -190,6 +231,9 @@ pub(super) fn snap_visible(app: &CadApp, xf: &Xf, raw: Vec2, aperture: f64) -> O
     for shown in layers(&snapshot, cloud) {
         let (pick, limit) = if gpu { (Bounds2::new(raw, raw).expand(distance.sqrt()), usize::MAX) } else { (bounds, fallback_limit) };
         shown.visible(pick, limit, |point| {
+            if removed.iter().any(|region| region.contains(point.position)) {
+                return;
+            }
             let xy = point.position.xy();
             let delta = xy - raw;
             let d = delta.dot(delta);
@@ -352,6 +396,7 @@ impl OrbitFrame {
         bounds.expand(0.001)
     }
 
+    #[cfg(test)]
     fn pick<'a>(&self, clouds: impl Iterator<Item = &'a Arc<PointCloud>>, cursor: egui::Pos2, limit: usize, radius: f32, size: f32) -> Option<Vec3> {
         self.pick_where(clouds, cursor, limit, radius, size, |_| true)
     }
@@ -557,7 +602,8 @@ fn pick_target(
     let geometry = model.and_then(|model| model.pick(frame, cursor, radius));
     let point = root.and_then(|root| {
         let snapshot = view(root, frame.bounds, app, false);
-        frame.pick(layers(&snapshot, root), cursor, 160_000, radius, size)
+        let removed = removals(&app.session);
+        frame.pick_where(layers(&snapshot, root), cursor, 160_000, radius, size, |p| !removed.iter().any(|region| region.contains(p)))
     });
     match (geometry, point) {
         (Some(a), Some(b)) => {
@@ -631,7 +677,7 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     });
     if escape {
         ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
-        if app.session.prompting() {
+        if app.session.prompting() || super::cloud_selection::active(app) {
             crate::cmdline::escape(app);
         } else {
             let _ = app.run("3dorbit", json!({ "enabled": false }));
@@ -730,6 +776,8 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, Tokens::get().canvas);
     let dragging = response.dragged_by(PointerButton::Middle) || response.dragged_by(PointerButton::Secondary);
+    let can_select = !dragging && app.cmd.options.is_none();
+    let cloud_select = super::cloud_selection::input(app, &response, rect, &frame.camera, can_select);
     let snapshot = root.as_ref().map(|root| detail_view(app, ui, (root, model.as_ref()), &frame, document, dragging, hint));
     if let Some(model) = &model {
         model.paint_images(&painter, &frame);
@@ -745,15 +793,15 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     if let Some(model) = &model {
         model.paint(&painter, &frame, crate::orbit_gpu::available(app.canvas.gpu));
     }
-    super::orbit_draft::draw(app, &painter, &frame, &response, model.as_ref(), shown, dragging);
+    super::orbit_draft::draw(app, &painter, &frame, &response, model.as_ref(), shown, dragging || cloud_select);
+    super::cloud_selection::draw(app, &painter, &response, rect);
 }
 
 fn paint_cloud_in_orbit(app: &CadApp, painter: &egui::Painter, frame: &OrbitFrame, root: &Arc<PointCloud>, snapshot: &CloudView, moving: bool) {
     let rect = frame.rect;
-    let fallback = Tokens::get().canvas_ink;
-    let size = app.session.settings.point_cloud_size;
+    let style = point_style(app, moving);
     if layers(snapshot, root).all(|shown| crate::cloud_gpu::available(app.canvas.gpu, shown)) {
-        crate::cloud_gpu::paint(painter, rect, layers(snapshot, root).cloned(), &frame.camera, size, fallback, moving);
+        crate::cloud_gpu::paint(painter, rect, layers(snapshot, root).cloned(), &frame.camera, style);
         return;
     }
     let mut projected = Vec::new();
@@ -761,15 +809,17 @@ fn paint_cloud_in_orbit(app: &CadApp, painter: &egui::Painter, frame: &OrbitFram
     for shown in layers(snapshot, root) {
         shown.visible(frame.bounds, limit, |point| {
             let (at, depth) = frame.project(point.position);
-            if rect.contains(at) {
-                projected.push((depth, at, color(shown, point, fallback)));
+            if rect.contains(at)
+                && let Some(color) = displayed_color(&style, shown, point)
+            {
+                projected.push((depth, at, color));
             }
         });
     }
     projected.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
     let mut mesh = egui::Mesh::default();
     for (_, position, color) in projected {
-        mesh.add_colored_rect(Rect::from_center_size(position, egui::Vec2::splat(size)), color);
+        mesh.add_colored_rect(Rect::from_center_size(position, egui::Vec2::splat(style.size)), color);
     }
     painter.add(Shape::mesh(mesh));
 }
@@ -780,6 +830,60 @@ mod tests {
     use cadcraft_engine::Session;
     use egui_kittest::kittest::{NodeT, Queryable};
     use std::sync::Arc;
+
+    #[test]
+    fn point_cloud_rectangle_and_delete_work_in_plan_and_orbit() {
+        let center = Vec3::ZERO;
+        let outside = Vec3::new(25.0, 20.0, 5.0);
+        let points = [center, outside, -outside].map(|position| CloudPoint { position, rgb: [255; 3], intensity: 0, classification: 0 });
+        for orbit in [false, true] {
+            let drawing = cadcraft_doc::Drawing {
+                point_cloud: Some(Arc::new(PointCloud::new(points.to_vec(), 3, true, true))),
+                ..cadcraft_doc::Drawing::new_metric()
+            };
+            let mut session = Session::empty();
+            session.open_drawing(drawing, "Cloud", None);
+            if orbit {
+                session.execute("3dorbit", &json!({ "enabled": true, "fit": true })).unwrap();
+            }
+            let app = CadApp::new(session, Default::default());
+            let mut harness = egui_kittest::Harness::builder()
+                .with_size(vec2(900.0, 500.0))
+                .build_ui_state(|ui, app: &mut CadApp| super::super::show(app, ui), app);
+            let middle = harness.state().canvas.rect.unwrap().center();
+            let first = middle - vec2(12.0, 13.0);
+            let last = middle + vec2(12.0, 13.0);
+            let button = |pos, pressed| egui::Event::PointerButton { pos, button: PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE };
+            let events = if orbit {
+                vec![egui::Event::PointerMoved(first), button(first, true), egui::Event::PointerMoved(last), button(last, false)]
+            } else {
+                vec![
+                    egui::Event::PointerMoved(first),
+                    button(first, true),
+                    button(first, false),
+                    egui::Event::PointerMoved(last),
+                    button(last, true),
+                    button(last, false),
+                ]
+            };
+            for event in events {
+                harness.event(event);
+                harness.step();
+            }
+            let state = harness.state().session.state().unwrap();
+            let selected = state.cloud_selection.expect("the two corners select a cloud region");
+            assert!(selected.contains(center));
+            assert!(!selected.contains(outside));
+            harness.key_press(Key::Delete);
+            harness.run();
+            let session = &mut harness.state_mut().session;
+            assert_eq!(session.doc().unwrap().point_cloud_removals.as_slice(), [selected]);
+            assert_eq!(session.execute("pointcloud.snap", &json!({ "point": [0,0], "aperture": 1 })).unwrap()["point"], serde_json::Value::Null);
+            session.undo().unwrap();
+            assert!(session.doc().unwrap().point_cloud_removals.is_empty());
+            assert_eq!(session.execute("pointcloud.snap", &json!({ "point": [0,0], "aperture": 1 })).unwrap()["point"], json!([0.0, 0.0, 0.0]));
+        }
+    }
 
     #[test]
     fn drawing_an_orbit_line_by_clicking_cloud_samples_keeps_their_original_xyz() {
@@ -883,6 +987,8 @@ mod tests {
             let hit = harness.state().canvas.orbit_cursor.unwrap();
             assert_eq!(hit.snap.map(|hit| hit.mode), Some(snap), "point at {expected:?}");
             assert!((hit.position - expected).len() < 1e-5);
+            let xyz = crate::cmdline::dyn_frame(harness.state()).unwrap().live_xyz(hit.position);
+            assert!((xyz - expected).len() < 1e-5);
             for pressed in [true, false] {
                 harness.event(click(at, pressed, egui::Modifiers::NONE));
                 harness.step();

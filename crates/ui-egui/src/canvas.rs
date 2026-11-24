@@ -12,6 +12,7 @@ use egui::{Color32, Pos2, Rect, Sense, Shape, Stroke, pos2, vec2};
 use crate::CadApp;
 use crate::theme::Tokens;
 
+mod cloud_selection;
 mod cursor;
 mod cycle;
 mod draw;
@@ -124,11 +125,13 @@ pub struct CanvasState {
     /// The wgpu device, for background rebuilds to create their buffers (see [`rebuild`]).
     pub gpu_device: Option<egui_wgpu::wgpu::Device>,
     cloud_orbit_focus: Option<point_cloud::OrbitFocus>,
+    pub(crate) cloud_rectangle: Option<cloud_selection::Rectangle>,
     orbit_scene: orbit_scene::Scene,
     orbit_button: Option<Rect>,
     pub(crate) orbit_cursor: Option<orbit_draft::DraftPoint>,
     pub(crate) draft_cursor: Option<cadcraft_geom::Vec3>,
     pub(crate) orbit_view_id: Option<egui::Id>,
+    plan_view_id: Option<egui::Id>,
     /// The mesh last handed to the GPU (see [`crate::gpu::CanvasCallback::key`]).
     mesh_key: Option<u64>,
     mesh_slot: crate::gpu::MeshSlot,
@@ -221,8 +224,8 @@ pub struct CanvasState {
 type CycleKey = (Option<String>, Option<String>, u64, u64, Vec2, f64);
 
 impl CanvasState {
-    pub(crate) fn orbit_has_focus(&self, ctx: &egui::Context) -> bool {
-        self.orbit_view_id.is_some_and(|id| ctx.memory(|memory| memory.has_focus(id)))
+    pub(crate) fn drawing_has_focus(&self, ctx: &egui::Context) -> bool {
+        self.orbit_view_id.or(self.plan_view_id).is_some_and(|id| ctx.memory(|memory| memory.has_focus(id)))
     }
 
     fn over_orbit_button(&self, at: Pos2) -> bool {
@@ -853,6 +856,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         point_cloud::navigation_bar(app, ui);
     }
     if model && app.session.state().is_ok_and(|state| state.orbit.is_some()) {
+        app.canvas.plan_view_id = None;
         let full = ui.available_rect_before_wrap();
         point_cloud::orbit(app, ui);
         crate::cmdline::keyboard(app, ui.ctx());
@@ -872,6 +876,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     let tiles = tile_rects(app, full);
     let rect = tiles.iter().find(|(_, tile)| tile.active).map_or(full, |(r, _)| *r);
     let resp = ui.interact(full, ui.scope_id().with("canvas"), Sense::click_and_drag());
+    app.canvas.plan_view_id = Some(resp.id);
     let painter = ui.painter_at(rect);
     app.canvas.rect = Some(rect);
     app.session.viewport_px = (f64::from(rect.width()).max(1.0), f64::from(rect.height()).max(1.0));
@@ -919,10 +924,17 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     };
     // A clipped active viewport's outline (picks and its heavy border follow it).
     let active_clip = app.session.state().ok().and_then(|st| st.active_viewport().and_then(|(h, v)| cadcraft_render::viewport_clip(&st.doc, h, &v)));
+    let cloud_select = if app.session.state().is_ok_and(|state| state.doc.point_cloud.is_some()) {
+        let can_select = inside && !on_menu && !middle_down && app.cmd.options.is_none();
+        cloud_selection::input(app, &resp, rect, &point_cloud::plan_camera(&xf), can_select)
+    } else {
+        app.canvas.cloud_rectangle = None;
+        false
+    };
     let Some(hatch_dialog) = handle_double_click(
         app,
         DoubleClickContext {
-            inside,
+            inside: inside && !cloud_select,
             double: dbl_primary,
             hover: hover_pos,
             xf,
@@ -951,7 +963,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     }
     let idle_double = dbl_primary && app.session.running.is_none();
     let grip_clicks = !hatch_dialog && !idle_double;
-    let click_used = handle_presses(app, ui, &PressContext { rect, xf, inside, middle_down, mods, grip_clicks });
+    let click_used = cloud_select || handle_presses(app, ui, &PressContext { rect, xf, inside, middle_down, mods, grip_clicks });
 
     let (raw_world, dyn_frame) = update_canvas_cursor(app, ui, &xf, inside, hover_pos);
 
@@ -1047,6 +1059,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         hover_pos,
         raw_world,
     });
+    cloud_selection::draw(app, &painter, &resp, rect);
     point_cloud::show_orbit_button(app, ui);
 }
 
