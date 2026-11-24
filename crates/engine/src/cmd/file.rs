@@ -7,6 +7,7 @@ mod template;
 
 use std::sync::OnceLock;
 
+use cadcraft_doc::point_cloud::OverviewProgress;
 use cadcraft_doc::{Drawing, Format};
 pub use craft_dxf::Version;
 use serde_json::{Value, json};
@@ -51,7 +52,7 @@ pub fn io() -> Option<&'static IoHooks> {
 
 /// A streaming point-cloud reader, installed by native hosts.
 #[cfg(not(target_arch = "wasm32"))]
-type PointCloudReader = fn(std::io::BufReader<std::fs::File>, u16) -> std::result::Result<Drawing, String>;
+type PointCloudReader = fn(std::io::BufReader<std::fs::File>, u16, Option<OverviewProgress<'_>>) -> std::result::Result<Drawing, String>;
 
 #[cfg(not(target_arch = "wasm32"))]
 static POINT_CLOUD_READER: OnceLock<PointCloudReader> = OnceLock::new();
@@ -354,6 +355,14 @@ pub fn read_file(path: &std::path::Path) -> std::result::Result<ReadFile, String
 }
 
 pub fn read_file_with_preview(path: &std::path::Path, preview_step: u16) -> std::result::Result<ReadFile, String> {
+    read_file_with_progress(path, preview_step, None)
+}
+
+pub fn read_file_with_progress(
+    path: &std::path::Path,
+    preview_step: u16,
+    progress: Option<OverviewProgress<'_>>,
+) -> std::result::Result<ReadFile, String> {
     #[cfg(not(target_arch = "wasm32"))]
     {
         let r = std::panic::catch_unwind(|| {
@@ -367,7 +376,7 @@ pub fn read_file_with_preview(path: &std::path::Path, preview_step: u16) -> std:
                 && let Some(read) = POINT_CLOUD_READER.get()
             {
                 let file = crate::capped_read::open_regular(path).map_err(|e| bad("open", format!("{shown}: {e}")))?;
-                let drawing = read(std::io::BufReader::new(file), preview_step).map_err(|e| bad("open", format!("{shown}: {e}")))?;
+                let drawing = read(std::io::BufReader::new(file), preview_step, progress).map_err(|e| bad("open", format!("{shown}: {e}")))?;
                 return Ok(ReadFile { drawing, binary_dxf: false, name: text_path.to_string(), path: None });
             }
             if preview_step != 0 {
@@ -383,7 +392,7 @@ pub fn read_file_with_preview(path: &std::path::Path, preview_step: u16) -> std:
     }
     #[cfg(target_arch = "wasm32")]
     {
-        let _ = (path, preview_step);
+        let _ = (path, preview_step, progress);
         Err(bad("open", "paths are not available on the web; pass `data`").to_string())
     }
 }

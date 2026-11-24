@@ -95,6 +95,7 @@ pub struct GpuTarget {
     /// The stencil buffer format of the render pass, when it has one (the native window asks
     /// for one): clipped viewports are clipped with it.
     pub stencil: Option<wgpu::TextureFormat>,
+    pub(crate) max_buffer_size: u64,
 }
 
 /// CPU-side vertex data for one display list, waiting to be uploaded.
@@ -696,7 +697,11 @@ pub fn install(rs: &egui_wgpu::RenderState, faults: &Arc<GpuFaults>, stencil: Op
     rs.device.on_uncaptured_error(Arc::new(move |e: wgpu::Error| f.error(e.to_string())));
     let f = Arc::clone(faults);
     rs.device.set_device_lost_callback(move |reason, message| f.device_lost(reason, message));
-    let target = GpuTarget { format: rs.target_format, stencil: stencil.filter(|s| s.has_stencil_aspect()) };
+    let target = GpuTarget {
+        format: rs.target_format,
+        stencil: stencil.filter(|s| s.has_stencil_aspect()),
+        max_buffer_size: rs.device.limits().max_buffer_size,
+    };
     let res = Resources::new(&rs.device, target);
     rs.renderer.write().callback_resources.insert(res);
     crate::cloud_gpu::install(rs, target);

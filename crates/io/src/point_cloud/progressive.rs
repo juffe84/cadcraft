@@ -1,7 +1,7 @@
-//! Read sampled blocks first. Index the original blocks in the background and reopen only the
-//! overlapping blocks for a detailed view. The worker retains the already authorized file handle.
+//! Prepare the requested overview, then read overlapping blocks for detailed views.
+//! The worker retains the already authorized file handle.
 use super::{CloudPoint, Drawing, IoError, MAX_FULL_POINTS, PointCloud, Result, preflight};
-use cadcraft_doc::point_cloud::{CloudDetails, CloudView, DetailOptions, DetailSource, MAX_PREVIEW_STEP};
+use cadcraft_doc::point_cloud::{CloudDetails, CloudView, DetailOptions, DetailSource, MAX_PREVIEW_STEP, OverviewProgress};
 use cadcraft_geom::{Bounds2, Vec2, Vec3};
 use las::{Header, PointData, PointDataBuilder};
 use laz::laszip::{ChunkTable, ChunkTableEntry};
@@ -19,6 +19,8 @@ use std::time::{Duration, Instant};
 const INITIAL_BLOCKS: usize = 40;
 const OVERVIEW_BUDGET: usize = 1_000_000;
 const DETAIL_BUDGET: usize = 500_000;
+// Orthographic view height at a 2,000-unit camera distance with a 45° field of view.
+const DETAIL_VIEW_HEIGHT: f64 = 4_000.0 * (std::f64::consts::SQRT_2 - 1.0);
 
 mod cache;
 use cache::IndexCache;
@@ -34,8 +36,19 @@ pub fn read_progressive_cached(file: BufReader<File>, cache_directory: Option<&P
 
 /// Load every `preview_step`th point in the overview, or use automatic sampling for zero.
 pub fn read_progressive_with_preview(file: BufReader<File>, preview_step: u16, cache_directory: Option<&Path>) -> Result<Drawing> {
-    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| read_preview(file, MAX_FULL_POINTS, INITIAL_BLOCKS, cache_directory, preview_step)))
-        .map_err(|_| format_error("could not decode initial point cloud preview"))?
+    read_with_overview_progress(file, preview_step, cache_directory, None)
+}
+
+pub fn read_with_overview_progress(
+    file: BufReader<File>,
+    preview_step: u16,
+    cache_directory: Option<&Path>,
+    progress: Option<OverviewProgress<'_>>,
+) -> Result<Drawing> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        read_preview(file, MAX_FULL_POINTS, INITIAL_BLOCKS, cache_directory, preview_step, progress)
+    }))
+    .map_err(|_| format_error("could not prepare the point cloud overview"))?
 }
 
 fn read_preview(
@@ -44,6 +57,7 @@ fn read_preview(
     preview_blocks: usize,
     cache_directory: Option<&Path>,
     preview_step: u16,
+    progress: Option<OverviewProgress<'_>>,
 ) -> Result<Drawing> {
     if preview_step > MAX_PREVIEW_STEP {
         return Err(format_error("preview step must be between 0 and 1000"));
@@ -61,9 +75,16 @@ fn read_preview(
         return super::read(file);
     }
     let stride = if preview_step == 0 { count.div_ceil(OVERVIEW_BUDGET as u64) as usize } else { usize::from(preview_step) };
-    let quick_stride = if preview_step == 0 { 8 } else { stride * 8usize.div_ceil(stride) };
     let cache = cache_directory.and_then(|directory| IndexCache::new(directory, file.get_ref(), stride));
-    let mut source = Source::new(file, &header, table)?;
+    let source = Source::new(file, &header, table)?;
+    let cloud =
+        if preview_step > 1 { read_complete(source, cache, stride, progress)? } else { read_quick(source, &header, preview_blocks, cache, stride)? };
+    let mut drawing = Drawing::new_metric();
+    drawing.point_cloud = Some(cloud);
+    Ok(drawing)
+}
+
+fn read_quick(mut source: Source, header: &Header, preview_blocks: usize, cache: Option<IndexCache>, stride: usize) -> Result<Arc<PointCloud>> {
     let mut quick = Sample::new(preview_blocks * 8_000);
     let blocks = preview_blocks.min(source.entries.len());
     let preview_ids: Vec<_> = (0..blocks).map(|i| if blocks < 2 { 0 } else { i * (source.entries.len() - 1) / (blocks - 1) }).collect();
@@ -77,8 +98,7 @@ fn read_preview(
             .zip(data)
             .map(|(id, data)| {
                 let mut points = Vec::new();
-                let start = if preview_step == 0 { 0 } else { source.sample_start(id, quick_stride) };
-                visit(&data, start, quick_stride, |_| true, |point| points.push(point))?;
+                visit(&data, 0, 8, |_| true, |point| points.push(point))?;
                 Ok((id, BlockExtent::new(&data), points))
             })
             .collect::<Result<_>>()?;
@@ -108,13 +128,26 @@ fn read_preview(
         initial.z_range = [initial.z_range[0].min(bounds.min.z), initial.z_range[1].max(bounds.max.z)];
     }
 
+    attach_worker(initial, None, move |bridge, rx| work(source, &preview_index, &bridge, rx, cache, stride))
+}
+
+fn attach_worker(
+    mut cloud: PointCloud,
+    indexed_extent: Option<Bounds2>,
+    worker: impl FnOnce(Weak<Bridge>, Receiver<()>) -> Result<()> + Send + 'static,
+) -> Result<Arc<PointCloud>> {
     let (wake, rx) = sync_channel(1);
-    let bridge = Arc::new(Bridge { state: Mutex::new(State::default()), wake, extent: initial.extent });
+    let bridge = Arc::new(Bridge { state: Mutex::new(State::default()), wake, extent: indexed_extent.unwrap_or(cloud.extent) });
+    cloud.detail = Some(DetailSource(bridge.clone()));
+    let cloud = Arc::new(cloud);
+    if indexed_extent.is_some() {
+        bridge.state().overview = Overview::Root(Arc::downgrade(&cloud));
+    }
     let weak = Arc::downgrade(&bridge);
     std::thread::Builder::new()
         .name("cadcraft-point-cloud".into())
         .spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(source, &preview_index, &weak, rx, cache, stride)));
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| worker(weak.clone(), rx)));
             if !matches!(result, Ok(Ok(())))
                 && let Some(bridge) = weak.upgrade()
             {
@@ -125,10 +158,7 @@ fn read_preview(
             }
         })
         .map_err(format_error)?;
-    initial.detail = Some(DetailSource(bridge));
-    let mut drawing = Drawing::new_metric();
-    drawing.point_cloud = Some(Arc::new(initial));
-    Ok(drawing)
+    Ok(cloud)
 }
 
 fn format_error(e: impl std::fmt::Display) -> IoError {
@@ -392,11 +422,19 @@ impl Request {
 }
 
 #[derive(Debug, Default)]
+enum Overview {
+    #[default]
+    Building,
+    Root(Weak<PointCloud>),
+    Refined(Arc<PointCloud>),
+}
+
+#[derive(Debug, Default)]
 struct State {
     wanted: Option<Request>,
     details: VecDeque<(Request, Arc<PointCloud>)>,
     partial: Option<(Request, Arc<PointCloud>)>,
-    overview: Option<Arc<PointCloud>>,
+    overview: Overview,
     failed: bool,
 }
 
@@ -424,9 +462,16 @@ impl Bridge {
         let complete = state.wanted.is_none() || detail_count.is_some();
         let partial = state.partial.as_ref().filter(|(request, _)| state.wanted == Some(*request) && request.region.intersects(&bounds));
         let overlay = partial.or(detail).map(|(_, cloud)| cloud.clone());
-        let overview = overlay.as_ref().and(state.overview.clone());
-        let points = overlay.or_else(|| state.overview.clone());
-        let indexing = state.overview.is_none();
+        let overview = overlay.as_ref().and_then(|_| match &state.overview {
+            Overview::Building => None,
+            Overview::Root(root) => root.upgrade(),
+            Overview::Refined(cloud) => Some(cloud.clone()),
+        });
+        let points = overlay.or_else(|| match &state.overview {
+            Overview::Refined(cloud) => Some(cloud.clone()),
+            _ => None,
+        });
+        let indexing = matches!(state.overview, Overview::Building);
         CloudView { points, overview, detail_count, indexing, pending: !state.failed && (indexing || !complete), failed: state.failed }
     }
 }
@@ -434,7 +479,12 @@ impl Bridge {
 impl CloudDetails for Bridge {
     fn view_with(&self, bounds: Bounds2, options: DetailOptions) -> CloudView {
         let mut state = self.state();
-        let close = bounds.intersects(&self.extent) && (bounds.width() < 0.65 * self.extent.width() || bounds.height() < 0.65 * self.extent.height());
+        let zoomed_in = if options.radius_factor > 0.0 && matches!(state.overview, Overview::Root(_)) {
+            bounds.height() <= DETAIL_VIEW_HEIGHT
+        } else {
+            bounds.width() < 0.65 * self.extent.width() || bounds.height() < 0.65 * self.extent.height()
+        };
+        let close = zoomed_in && bounds.intersects(&self.extent);
         if !close {
             state.wanted = None;
             state.partial = None;
@@ -550,21 +600,26 @@ impl DetailJob {
 fn build_index(
     source: &mut Source,
     preview: &[(usize, BlockExtent)],
-    bridge: &Weak<Bridge>,
+    bridge: Option<&Weak<Bridge>>,
     stride: usize,
+    progress: Option<OverviewProgress<'_>>,
 ) -> Result<Option<(Vec<BlockExtent>, Vec<CloudPoint>, Option<DetailJob>)>> {
     log::info!("point cloud indexing: {} Rayon workers", rayon::current_num_threads());
     let mut index = Vec::with_capacity(source.entries.len());
     let mut overview = Vec::new();
+    overview.try_reserve_exact(source.count.div_ceil(stride as u64) as usize).map_err(format_error)?;
     let mut ids = (0..source.entries.len()).peekable();
     let mut live: Option<DetailJob> = None;
     while let Some(first) = ids.next() {
-        let Some(active) = bridge.upgrade() else { return Ok(None) };
-        let request = active.state().wanted;
-        drop(active);
+        let request = if let Some(bridge) = bridge {
+            let Some(active) = bridge.upgrade() else { return Ok(None) };
+            active.state().wanted
+        } else {
+            None
+        };
         if live.as_ref().map(|job| job.request) != request {
             live = request.map(|request| DetailJob::new(request, first));
-            if let Some(job) = &mut live {
+            if let (Some(job), Some(bridge)) = (&mut live, bridge) {
                 job.seed(source, preview, &index, bridge)?;
             }
         }
@@ -596,11 +651,49 @@ fn build_index(
                 }
             }
         }
-        if let Some(job) = &mut live {
+        if let (Some(job), Some(bridge)) = (&mut live, bridge) {
             publish_partial(source, bridge, job);
+        }
+        if let Some(report) = progress {
+            let last = index.len() - 1;
+            report(source.point_starts[last] + source.entries[last].point_count, source.count);
         }
     }
     Ok(Some((index, overview, live)))
+}
+
+fn read_complete(mut source: Source, cache: Option<IndexCache>, stride: usize, progress: Option<OverviewProgress<'_>>) -> Result<Arc<PointCloud>> {
+    let restored = cache.as_ref().and_then(|cache| cache.load(&source));
+    let (index, overview, save) = if let Some((index, overview)) = restored {
+        log::info!("point cloud index restored from cache");
+        (index, overview, None)
+    } else {
+        let Some((index, overview, _)) = build_index(&mut source, &[], None, stride, progress)? else {
+            return Err(format_error("point cloud indexing stopped before the overview was ready"));
+        };
+        let save = cache.zip(source.file.get_ref().try_clone().ok());
+        (index, overview, save)
+    };
+    let index = Arc::new(index);
+    let query_index = index.clone();
+    let extent = index.iter().fold(Bounds2::EMPTY, |bounds, block| bounds.union(&block.bounds));
+    let mut cloud = source.cloud(overview);
+    let edge = [extent.min.x, extent.min.y, extent.max.x, extent.max.y];
+    let extent = if edge.iter().all(|value| value.abs() <= super::super::MAX_WINDOW_COORD) { extent } else { cloud.extent };
+    if cloud.extent.width() == 0.0 && cloud.extent.height() == 0.0 {
+        // A very sparse sample may be a single point. Fit the indexed footprint
+        // so the rest of the drawing can be reached when zooming in.
+        cloud.extent = cloud.extent.union(&extent);
+    }
+    let count = source.count;
+    let cloud = attach_worker(cloud, Some(extent), move |bridge, wake| run_queries(&mut source, &query_index, &bridge, wake, None))?;
+    if let Some((cache, file)) = save {
+        cache.save_in_background(&file, index, cloud.clone());
+    }
+    if let Some(report) = progress {
+        report(count, count);
+    }
+    Ok(cloud)
 }
 
 fn work(
@@ -612,25 +705,28 @@ fn work(
     stride: usize,
 ) -> Result<()> {
     let restored = index_cache.as_ref().and_then(|cache| cache.load(&source));
-    let (index, overview, mut live, save) = match restored {
+    let (index, overview, live, save) = match restored {
         Some((index, overview)) => {
             log::info!("point cloud index restored from cache");
             (index, overview, None, false)
         }
         None => {
-            let Some((index, overview, live)) = build_index(&mut source, preview, bridge, stride)? else { return Ok(()) };
+            let Some((index, overview, live)) = build_index(&mut source, preview, Some(bridge), stride, None)? else { return Ok(()) };
             (index, overview, live, true)
         }
     };
     let index = Arc::new(index);
     let overview = Arc::new(source.cloud(overview));
     let Some(active) = bridge.upgrade() else { return Ok(()) };
-    active.state().overview = Some(overview.clone());
+    active.state().overview = Overview::Refined(overview.clone());
     drop(active);
     if save && let Some(cache) = index_cache {
         cache.save_in_background(source.file.get_ref(), index.clone(), overview);
     }
+    run_queries(&mut source, &index, bridge, wake, live)
+}
 
+fn run_queries(source: &mut Source, index: &[BlockExtent], bridge: &Weak<Bridge>, wake: Receiver<()>, mut live: Option<DetailJob>) -> Result<()> {
     let mut cache = BlockCache::default();
     while wake.recv().is_ok() {
         let Some(active) = bridge.upgrade() else { break };
@@ -638,7 +734,7 @@ fn work(
         let Some(request) = request.filter(|r| !active.state().details.iter().any(|(done, _)| done == r)) else { continue };
         drop(active);
         let job = live.take().filter(|job| job.request == request).unwrap_or_else(|| DetailJob::new(request, index.len()));
-        if let Some(detail) = query(&mut source, &index[..job.indexed_before_request], job, bridge, &mut cache)?
+        if let Some(detail) = query(source, &index[..job.indexed_before_request], job, bridge, &mut cache)?
             && let Some(active) = bridge.upgrade()
         {
             let mut state = active.state();
@@ -945,22 +1041,33 @@ mod tests {
             }
         }
 
-        let opened = read_progressive_with_preview(BufReader::new(File::open(&path).unwrap()), 997, None).unwrap();
-        let cloud = opened.point_cloud.unwrap();
-        assert!(cloud.points().iter().all(|point| (point.position.x.round() as u64).is_multiple_of(997)));
-        let source = &cloud.detail.as_ref().unwrap().0;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let overview = loop {
-            let view = source.current(cloud.bounds());
-            assert!(!view.failed);
-            if let Some(overview) = view.points {
-                break overview;
-            }
-            assert!(Instant::now() < deadline, "the selected interval never finished loading");
-            std::thread::sleep(Duration::from_millis(10));
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let processed = AtomicU64::new(0);
+        let report = |read, total| {
+            assert_eq!(total, 100_100);
+            assert!(processed.fetch_max(read, Ordering::Relaxed) <= read);
         };
-        assert_eq!(overview.points().len(), 100_100_usize.div_ceil(997));
-        assert!(overview.points().iter().all(|point| (point.position.x.round() as u64).is_multiple_of(997)));
+        let opened = read_with_overview_progress(BufReader::new(File::open(&path).unwrap()), 997, None, Some(&report)).unwrap();
+        let cloud = opened.point_cloud.unwrap();
+        assert_eq!(cloud.points().len(), 100_100_usize.div_ceil(997));
+        assert!(cloud.points().iter().all(|point| (point.position.x.round() as u64).is_multiple_of(997)));
+        assert_eq!(processed.load(Ordering::Relaxed), cloud.source_count);
+        let source = &cloud.detail.as_ref().unwrap().0;
+        assert!(!source.current(cloud.bounds()).indexing);
+        let area = Bounds2::new(Vec2::new(75_000.0, 0.0), Vec2::new(75_020.0, 9.0));
+        let _ = source.view(area);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let view = source.current(area);
+            assert!(!view.failed);
+            if !view.pending {
+                assert!(Arc::ptr_eq(view.overview.as_ref().unwrap(), &cloud));
+                assert!(view.points.unwrap().points().iter().any(|point| point.position.x == 75_001.0));
+                break;
+            }
+            assert!(Instant::now() < deadline, "the complete overview could not stream detail");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         drop(cloud);
 
         // The preview can seed real detail even before the full index exists.
@@ -998,7 +1105,7 @@ mod tests {
         thread.join().unwrap();
 
         let file = BufReader::new(File::open(&path).unwrap());
-        let d = read_preview(file, 10, 1, None, 0).unwrap();
+        let d = read_preview(file, 10, 1, None, 0, None).unwrap();
         let cloud = d.point_cloud.as_ref().unwrap();
         let area = Bounds2::new(Vec2::new(75_000.0, 0.0), Vec2::new(75_020.0, 9.0));
         let mut initial = 0;

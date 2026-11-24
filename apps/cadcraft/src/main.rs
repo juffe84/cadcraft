@@ -157,13 +157,13 @@ impl eframe::App for App {
 
 /// File format hooks for the engine (it stays I/O-agnostic).
 pub fn install_io() {
-    cadcraft_engine::cmd::file::set_point_cloud_reader(|file, step| {
+    cadcraft_engine::cmd::file::set_point_cloud_reader(|file, step, progress| {
         let cache = if cadcraft_engine::file_access::current().is_none() {
             cadcraft_engine::settings_dir::current().map(|dir| dir.join("point-cloud-cache"))
         } else {
             None
         };
-        cadcraft_io::point_cloud::read_progressive_with_preview(file, step, cache.as_deref()).map_err(|e| e.to_string())
+        cadcraft_io::point_cloud::read_with_overview_progress(file, step, cache.as_deref(), progress).map_err(|e| e.to_string())
     });
     cadcraft_engine::cmd::file::set_io(cadcraft_engine::cmd::file::IoHooks {
         read: |b, name| cadcraft_io::read(b, name).map_err(|e| e.to_string()),

@@ -150,6 +150,9 @@ impl DetailOptions {
 /// Zero leaves the overview density to the reader. Otherwise retain every Nth source point.
 pub const MAX_PREVIEW_STEP: u16 = 1_000;
 
+/// Reports processed and total source points while an overview is being prepared.
+pub type OverviewProgress<'a> = &'a (dyn Fn(u64, u64) + std::panic::RefUnwindSafe);
+
 pub trait CloudDetails: std::fmt::Debug + std::panic::RefUnwindSafe + Send + Sync {
     /// Request more detail without blocking the caller.
     fn view(&self, bounds: Bounds2) -> CloudView {

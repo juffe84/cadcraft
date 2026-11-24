@@ -6,10 +6,12 @@
 #[cfg(not(target_arch = "wasm32"))]
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::time::{Duration, Instant};
 
-use cadcraft_engine::cmd::file::{ReadFile, read_file_with_preview};
+use cadcraft_engine::cmd::file::{ReadFile, read_file_with_progress};
 
 use crate::theme::Tokens;
 
@@ -19,6 +21,7 @@ struct Job {
     path: PathBuf,
     started: Instant,
     rx: Receiver<Outcome>,
+    progress: Option<Arc<AtomicU8>>,
 }
 
 /// The files being read in the background, oldest first.
@@ -51,17 +54,31 @@ impl Opening {
     fn start_with_preview(&mut self, path: &Path, step: u16) {
         let (tx, rx) = channel();
         let p = path.to_path_buf();
+        let progress = (step > 1).then(|| Arc::new(AtomicU8::new(0)));
+        let worker_progress = progress.clone();
         let spawned = std::thread::Builder::new().name("cadcraft-open".into()).spawn(move || {
-            let _ = tx.send(read_file_with_preview(&p, step));
+            let outcome = if let Some(progress) = worker_progress {
+                read_file_with_progress(
+                    &p,
+                    step,
+                    Some(&|read, total| {
+                        let percent = read.min(total) * 100 / total.max(1);
+                        progress.store(percent as u8, Ordering::Relaxed);
+                    }),
+                )
+            } else {
+                read_file_with_progress(&p, step, None)
+            };
+            let _ = tx.send(outcome);
         });
         if spawned.is_err() {
             // No thread to read on: report it like any other failed open.
             let (tx, rx2) = channel();
             let _ = tx.send(Err(format!("open: {}: could not start a reader thread", path.display())));
-            self.jobs.push(Job { path: path.to_path_buf(), started: Instant::now(), rx: rx2 });
+            self.jobs.push(Job { path: path.to_path_buf(), started: Instant::now(), rx: rx2, progress });
             return;
         }
-        self.jobs.push(Job { path: path.to_path_buf(), started: Instant::now(), rx });
+        self.jobs.push(Job { path: path.to_path_buf(), started: Instant::now(), rx, progress });
     }
 
     #[cfg(not(target_arch = "wasm32"))]
@@ -112,6 +129,7 @@ impl Opening {
     /// Paint the card in the middle of the window and keep frames coming while files load.
     pub fn show(&self, ctx: &egui::Context) {
         let Some(label) = self.label() else { return };
+        let progress = self.jobs.first().and_then(|job| job.progress.as_ref()).map(|p| p.load(Ordering::Relaxed));
         let t = Tokens::get();
         egui::Area::new(egui::Id::unique("cc_opening"))
             .order(egui::Order::Foreground)
@@ -128,6 +146,14 @@ impl Opening {
                             ui.add(egui::Spinner::new().color(t.accent));
                             ui.label(egui::RichText::new(label).color(t.text));
                         });
+                        if let Some(percent) = progress {
+                            let name = "Point cloud overview";
+                            let label = ui.label(crate::i18n::t(name));
+                            let bar = ui
+                                .add(egui::ProgressBar::new(f32::from(percent) / 100.0).desired_width(220.0).fill(t.accent).show_percentage())
+                                .labelled_by(label.id);
+                            crate::control::record_widget(ui, &bar, name, "progressbar", None);
+                        }
                     });
             });
         ctx.request_repaint_after(Duration::from_millis(50));

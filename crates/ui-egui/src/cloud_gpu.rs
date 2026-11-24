@@ -8,7 +8,8 @@ use std::collections::VecDeque;
 use std::ops::Range;
 use std::sync::{Arc, Weak};
 
-const MAX_RESIDENT: usize = 1_000_000;
+const POINT_BYTES: usize = 16;
+const CLOUD_BUFFER_BUDGET: u64 = 512 << 20;
 
 const SHADER: &str = r#"
 struct View {
@@ -128,9 +129,15 @@ pub fn install(rs: &egui_wgpu::RenderState, target: crate::gpu::GpuTarget) {
 }
 
 pub fn available(target: Option<crate::gpu::GpuTarget>, points: &PointCloud) -> bool {
-    !points.points().is_empty()
-        && points.points().len() <= MAX_RESIDENT
-        && target.and_then(|target| target.stencil).is_some_and(|format| format.has_depth_aspect())
+    fits_device(target, points.points().len())
+}
+
+fn fits_device(target: Option<crate::gpu::GpuTarget>, point_count: usize) -> bool {
+    let bytes = (point_count as u64).saturating_mul(POINT_BYTES as u64);
+    bytes != 0
+        && target.is_some_and(|target| {
+            bytes <= target.max_buffer_size.min(CLOUD_BUFFER_BUDGET) && target.stencil.is_some_and(|format| format.has_depth_aspect())
+        })
 }
 
 pub struct Camera {
@@ -219,7 +226,7 @@ impl egui_wgpu::CallbackTrait for Callback {
                 }
             } else {
                 let origin = origin(cloud);
-                let mut vertices = Vec::with_capacity(cloud.points().len() * 16);
+                let mut vertices = Vec::with_capacity(cloud.points().len() * POINT_BYTES);
                 let mut blocks = Vec::new();
                 const BLOCK: usize = 8_192;
                 for (index, points) in cloud.points().chunks(BLOCK).enumerate() {
@@ -240,14 +247,19 @@ impl egui_wgpu::CallbackTrait for Callback {
                         vertices.extend_from_slice(&color);
                     }
                 }
+                while res.resident.len() >= 3
+                    || res.resident.iter().map(|entry| entry.buffer.size()).sum::<u64>() + vertices.len() as u64 > CLOUD_BUFFER_BUDGET
+                {
+                    // Keep the cache bounded even when an explicitly sampled overview is large.
+                    if res.resident.pop_front().is_none() {
+                        break;
+                    }
+                }
                 let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                     label: Some("cloud points"),
                     contents: &vertices,
                     usage: wgpu::BufferUsages::VERTEX,
                 });
-                if res.resident.len() >= 3 {
-                    res.resident.pop_front();
-                }
                 res.resident.push_back(Resident { cloud: weak, color: self.fallback, buffer, blocks });
             }
             let mut rows = layer.rows;
@@ -288,6 +300,21 @@ impl egui_wgpu::CallbackTrait for Callback {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn sampled_overview_can_exceed_a_million_points_on_a_capable_device() {
+        use super::*;
+
+        let samples = 3_800_000;
+        let target = crate::gpu::GpuTarget {
+            format: wgpu::TextureFormat::Bgra8Unorm,
+            stencil: Some(wgpu::TextureFormat::Depth24PlusStencil8),
+            max_buffer_size: 128 << 20,
+        };
+        assert!(fits_device(Some(target), samples));
+        let small_device = crate::gpu::GpuTarget { max_buffer_size: 32 << 20, ..target };
+        assert!(!fits_device(Some(small_device), samples));
+    }
+
     #[test]
     fn point_shader_passes_wgsl_validation() {
         let module = naga::front::wgsl::parse_str(super::SHADER).unwrap();

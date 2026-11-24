@@ -316,9 +316,10 @@ impl OrbitFrame {
         self.ray_origin(at) + self.ray_direction(at) * front.dot(point - self.camera.center)
     }
 
-    fn detail_bounds(&self, focus: Vec3) -> Bounds2 {
+    fn detail_bounds(&self, surface: Option<Vec3>) -> Bounds2 {
         // Loading is centered on the geometry under the view. The wide footprint belonging
         // to the cloud's entire elevation range is only used for render culling.
+        let focus = self.on_surface(self.rect.center(), surface.unwrap_or(self.camera.center));
         let depth = self.camera.axes[2].dot(focus - self.camera.center);
         let half = Vec2::new(f64::from(self.rect.width()), f64::from(self.rect.height())) * (self.camera.weight(depth) / (2.0 * self.camera.scale));
         let margin = half.x.max(half.y) * (1.0 - self.camera.axes[2].z.abs());
@@ -425,6 +426,7 @@ pub(super) struct OrbitFocus {
     changed_at: f64,
     at: egui::Pos2,
     surface: Option<Vec3>,
+    center_surface: Option<Vec3>,
     sample_source: Option<Weak<PointCloud>>,
 }
 
@@ -462,7 +464,7 @@ fn detail_view(
         let surface = hint
             .and_then(|hint| hint.surface)
             .or_else(|| state.as_ref().and_then(|state| state.surface).filter(|point| frame.project(*point).0.distance(at) <= FOCUS_RADIUS));
-        state = Some(OrbitFocus { document, pose, changed_at: now, at, surface, sample_source: None });
+        state = Some(OrbitFocus { document, pose, changed_at: now, at, surface, center_surface: None, sample_source: None });
     }
     let Some(mut state) = state else { return snapshot };
     if dragging || now - state.changed_at < 0.12 {
@@ -472,13 +474,22 @@ fn detail_view(
     }
     let overview = if snapshot.indexing { root } else { snapshot.overview.as_ref().or(snapshot.points.as_ref()).unwrap_or(root) };
     let samples = Arc::downgrade(overview);
-    if state.sample_source.as_ref().is_none_or(|previous| state.surface.is_none() && !Weak::ptr_eq(previous, &samples)) {
-        if let Some(point) = pick_target(app, Some(root), model, frame, state.at, FOCUS_RADIUS) {
-            state.surface = Some(frame.on_surface(state.at, point));
+    let at = frame.rect.center();
+    if state.sample_source.as_ref().is_none_or(|previous| state.center_surface.is_none() && !Weak::ptr_eq(previous, &samples)) {
+        let tilted = frame.camera.axes[2].z.abs() < 1.0 - 1e-6 || frame.camera.eye.is_some();
+        if tilted {
+            state.center_surface = pick_target(app, Some(root), model, frame, at, FOCUS_RADIUS);
+        }
+        if state.at == at
+            && let Some(surface) = state.center_surface
+        {
+            state.surface = Some(frame.on_surface(at, surface));
         }
         state.sample_source = Some(samples);
     }
-    let bounds = state.surface.map_or(Bounds2::EMPTY, |point| frame.detail_bounds(frame.on_surface(state.at, point)));
+    // The scroll anchor can be under the pointer. Detail follows the center of the
+    // view, with the camera target's depth as a fallback between sparse samples.
+    let bounds = frame.detail_bounds(state.center_surface);
     app.canvas.cloud_orbit_focus = Some(state);
     let _ = view(root, bounds, app, true);
     // Fetch the composed layers against the actual render footprint, not the load zone.
@@ -987,7 +998,7 @@ mod tests {
     }
 
     #[test]
-    fn orbit_detail_uses_the_front_surface_at_an_off_center_zoom_anchor() {
+    fn orbit_picks_the_front_surface_at_an_off_center_zoom_anchor() {
         let pose = OrbitView { pivot: Some(Vec3::ZERO), yaw: 0.5, tilt: 1.1, ..Default::default() };
         let plan = cadcraft_engine::View { center: Vec2::ZERO, height: 80.0, twist: 0.0 };
         let rect = Rect::from_min_size(pos2(0.0, 0.0), vec2(800.0, 500.0));
@@ -1012,7 +1023,7 @@ mod tests {
         let surface = frame.pick([&overview, &detail].into_iter(), cursor, usize::MAX, FOCUS_RADIUS, 4.0).unwrap();
         let focus = frame.on_surface(cursor, surface);
         assert!((focus - nearer).len() < 1.0);
-        assert!(frame.detail_bounds(focus).center().dist(back.xy()) > 50.0);
+        assert!(focus.xy().dist(back.xy()) > 50.0);
         assert!(frame.project(focus).0.distance(cursor) < 0.01);
     }
 
@@ -1036,8 +1047,11 @@ mod tests {
         assert!(frame.project(target).0.distance(rect.center()) < 0.01);
         let focus = frame.on_surface(rect.center(), target);
         assert!((focus - target).len() < 1e-8);
-        assert!(frame.detail_bounds(focus).center().near(target.xy(), 1e-8));
-        assert!(frame.bounds.center().dist(target.xy()) > frame.detail_bounds(focus).height());
+        let detail = frame.detail_bounds(Some(target));
+        assert!(detail.center().near(target.xy(), 1e-8));
+        assert!(frame.bounds.center().dist(target.xy()) > detail.height());
+        let fallback = frame.detail_bounds(None);
+        assert!(frame.project(fallback.center().to3(frame.ray_origin(rect.center()).z)).0.distance(rect.center()) < 0.01);
     }
 
     #[test]
