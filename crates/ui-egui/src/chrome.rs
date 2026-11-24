@@ -29,7 +29,7 @@ const TOOLBAR: &[&[(Icon, &str, &str, Option<&str>)]] = &[
         (Icon::Attach, "attach", "Attach", None),
         (Icon::Share, "share", "Share", None),
     ],
-    &[(Icon::ZoomWindow, "zoom.window", "Zoom Window", None), (Icon::Pan, "pan", "Pan", None), (Icon::Orbit, "3dorbit", "Orbit", None)],
+    &[(Icon::ZoomWindow, "zoom.window", "Zoom Window", None), (Icon::Pan, "pan", "Pan", None), (Icon::Orbit, "'3dorbit", "Orbit", None)],
     &[
         (Icon::ZoomExtents, "zoom.extents", "Zoom Extents", None),
         (Icon::Properties, "ui.toggle.palettes", "Properties", None),

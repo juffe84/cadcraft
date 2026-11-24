@@ -923,6 +923,41 @@ mod tests {
     }
 
     #[test]
+    fn orbit_toolbar_and_middle_drag_keep_a_live_3dpolyline() {
+        let mut session = Session::empty();
+        session.open_drawing(cadcraft_doc::Drawing::new_metric(), "Model", None);
+        session.cmdline("3dpoly 0,0,2 8,4,5").unwrap();
+        let app = CadApp::new(session, Default::default());
+        let mut harness = egui_kittest::Harness::builder().with_size(vec2(1260.0, 660.0)).build_ui_state(
+            |ui, app: &mut CadApp| {
+                crate::chrome::title_and_toolbar(app, ui);
+                super::super::show(app, ui);
+            },
+            app,
+        );
+        harness.get_by_label("Orbit").click();
+        harness.run();
+        let before = harness.state().session.state().unwrap().orbit.unwrap();
+        let at = harness.get_by_label("Model 3D view").rect().center() - vec2(70.0, 60.0);
+        let to = at + vec2(65.0, -35.0);
+        let middle = |pos, pressed| egui::Event::PointerButton { pos, button: PointerButton::Middle, pressed, modifiers: egui::Modifiers::NONE };
+        for event in [egui::Event::PointerMoved(at), middle(at, true), egui::Event::PointerMoved(to), middle(to, false)] {
+            harness.event(event);
+            harness.step();
+        }
+        let after = harness.state().session.state().unwrap().orbit.unwrap();
+        assert_ne!(before.yaw, after.yaw);
+        let session = &mut harness.state_mut().session;
+        session.cmdline("@0,0,3").unwrap();
+        session.cmdline("'3dorbit").unwrap();
+        assert!(session.state().unwrap().orbit.is_none());
+        session.cmdline("@2,0,0 ").unwrap();
+        let drawing = session.doc().unwrap();
+        let points = [Vec3::new(0.0, 0.0, 2.0), Vec3::new(8.0, 4.0, 5.0), Vec3::new(8.0, 4.0, 8.0), Vec3::new(10.0, 4.0, 8.0)];
+        assert!(matches!(&drawing.model.iter().last().unwrap().kind, cadcraft_doc::EntityKind::Polyline3d(poly) if poly.points == points));
+    }
+
+    #[test]
     fn orbit_detail_uses_the_front_surface_at_an_off_center_zoom_anchor() {
         let pose = OrbitView { pivot: Some(Vec3::ZERO), yaw: 0.5, tilt: 1.1, ..Default::default() };
         let plan = cadcraft_engine::View { center: Vec2::ZERO, height: 80.0, twist: 0.0 };

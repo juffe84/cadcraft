@@ -68,7 +68,8 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("3dorbit", "Orbit", run_orbit)
             .alias(&["3do", "orbit"])
             .params("{enabled?: bool, yaw?: radians, tilt?: radians, zoom?: factor, pivot?: [x,y,z], pan?: [x,y], fit?: bool, perspective?: bool, wireframe?: bool, view?: top|bottom|front|back|left|right|isometric}; with no arguments toggles the model orbit camera")
-            .noundo(),
+            .noundo()
+            .transparent(),
         CommandSpec::new("pointcloud.settings", "Point cloud display", run_cloud_settings)
             .enabled(always)
             .params("{size?: 1–12 screen points, snap?: bool, detailRadiusFactor?: 0 or 0.01–5, detailRadius?: 0–1000 drawing units, batchPoints?: 0 or 10000–2000000 per worker}; zero is automatic")
