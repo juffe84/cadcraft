@@ -40,8 +40,8 @@ use run::{fill_last, returned_handle};
 use sample::sample;
 
 fn install_io() {
-    cadcraft_engine::cmd::file::cloud_export::set_writer(|input, output, removals| {
-        cadcraft_io::point_cloud::export_laz(input, output, removals).map_err(|e| e.to_string())
+    cadcraft_engine::cmd::file::cloud_export::set_writer(|input, output, removals, copy| {
+        cadcraft_io::point_cloud::export_laz(input, output, removals, copy).map_err(|e| e.to_string())
     });
     cadcraft_engine::cmd::file::set_point_cloud_reader(|file, step, progress| {
         cadcraft_io::point_cloud::read_with_overview_progress(file, step, None, progress).map_err(|e| e.to_string())

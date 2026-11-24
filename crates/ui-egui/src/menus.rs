@@ -489,7 +489,10 @@ fn run_ui_command_inner(app: &mut CadApp, id: &str, params: &Value) -> Option<Re
             app.ui.start_tab = false;
             Ok(Value::Null)
         }
-        "pointcloud.export" | "export.selection" if params.is_null() => {
+        "copybase" if params.is_null() && app.session.state().is_ok_and(|state| state.cloud_selection.is_some()) => {
+            return Some(crate::exchange::route(app, "pointcloud.copybase"));
+        }
+        "pointcloud.export" | "pointcloud.copybase" | "export.selection" if params.is_null() => {
             return Some(crate::exchange::route(app, id));
         }
         "export" | "exp" | "import" | "imp" | "publish" | "preview" | "pre" if params.is_null() && app.session.state().is_ok() => {

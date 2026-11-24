@@ -20,6 +20,13 @@ pub struct CloudRegion {
     pub planes: [[f64; 4]; 5],
 }
 
+/// A full-resolution copy of a selected volume, expressed relative to a world-space base point.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CloudCopy {
+    pub region: CloudRegion,
+    pub base: Vec3,
+}
+
 /// Also bounds the portable renderer's uniform containing the removal regions.
 pub const MAX_CLOUD_REMOVALS: usize = 128;
 

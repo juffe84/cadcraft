@@ -26,6 +26,7 @@ pub const FILES: &[&str] = &[
     "export",
     "export.selection",
     "pointcloud.export",
+    "pointcloud.copybase",
     "exportpdf",
     "hatch",
     "hatch.patterns",

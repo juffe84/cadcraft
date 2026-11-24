@@ -157,8 +157,8 @@ impl eframe::App for App {
 
 /// File format hooks for the engine (it stays I/O-agnostic).
 pub fn install_io() {
-    cadcraft_engine::cmd::file::cloud_export::set_writer(|input, output, removals| {
-        cadcraft_io::point_cloud::export_laz(input, output, removals).map_err(|e| e.to_string())
+    cadcraft_engine::cmd::file::cloud_export::set_writer(|input, output, removals, copy| {
+        cadcraft_io::point_cloud::export_laz(input, output, removals, copy).map_err(|e| e.to_string())
     });
     cadcraft_engine::cmd::file::set_point_cloud_reader(|file, step, progress| {
         let cache = if cadcraft_engine::file_access::current().is_none() {

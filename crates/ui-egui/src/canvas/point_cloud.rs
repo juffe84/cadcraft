@@ -72,6 +72,19 @@ fn controls(app: &mut CadApp, ui: &mut egui::Ui) {
             let _ = app.run("pointcloud.select", json!({ "enabled": !selecting }));
         }
         if app.session.state().is_ok_and(|state| state.cloud_selection.is_some()) {
+            let label = "Copy Cloud Points with Base Point...";
+            let copy = ui
+                .button(crate::i18n::t(label))
+                .on_hover_text(crate::i18n::t("Save the selected points to a new LAZ with the base point at its origin."));
+            crate::control::record_widget(ui, &copy, label, "button", None);
+            if copy.clicked() {
+                app.start("pointcloud.copybase");
+                if app.session.prompting()
+                    && let Some(id) = app.canvas.orbit_view_id.or(app.canvas.plan_view_id)
+                {
+                    ui.memory_mut(|memory| memory.request_focus(id));
+                }
+            }
             let label = "Delete cloud selection";
             let button =
                 ui.button(crate::i18n::t(label)).on_hover_text(crate::i18n::t("Remove the selected area in this drawing. You can undo this."));
@@ -836,6 +849,89 @@ mod tests {
     use cadcraft_engine::Session;
     use egui_kittest::kittest::{NodeT, Queryable};
     use std::sync::Arc;
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn copy_with_base_point_accepts_xyz_and_snaps_to_cloud_height() {
+        use std::{cell::RefCell, rc::Rc};
+
+        cadcraft_engine::cmd::file::set_point_cloud_reader(|input, step, progress| {
+            cadcraft_io::point_cloud::read_with_overview_progress(input, step, None, progress).map_err(|error| error.to_string())
+        });
+        cadcraft_engine::cmd::file::cloud_export::set_writer(|input, output, removals, copy| {
+            cadcraft_io::point_cloud::export_laz(input, output, removals, copy).map_err(|error| error.to_string())
+        });
+        let source = std::env::temp_dir().join(format!("cadcraft-copy-base-{}.las", std::process::id()));
+        // Three authored LAS 1.2 format-0 points; the middle one is on the centre pixel.
+        let mut las = vec![0_u8; 227 + 3 * 20];
+        las[..4].copy_from_slice(b"LASF");
+        las[24..26].copy_from_slice(&[1, 2]);
+        las[94..96].copy_from_slice(&227_u16.to_le_bytes());
+        las[96..100].copy_from_slice(&227_u32.to_le_bytes());
+        las[105..107].copy_from_slice(&20_u16.to_le_bytes());
+        las[107..111].copy_from_slice(&3_u32.to_le_bytes());
+        for (offset, value) in (131..227).step_by(8).zip([1.0_f64, 1.0, 1.0, 0.0, 0.0, 0.0, 20.0, -20.0, 20.0, -20.0, 32.0, 32.0]) {
+            las[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        for (record, xy) in las[227..].as_chunks_mut::<20>().0.iter_mut().zip([-20_i32, 0, 20]) {
+            record[..4].copy_from_slice(&xy.to_le_bytes());
+            record[4..8].copy_from_slice(&xy.to_le_bytes());
+            record[8..12].copy_from_slice(&32_i32.to_le_bytes());
+        }
+        std::fs::write(&source, las).unwrap();
+        for orbit in [false, true] {
+            let mut session = Session::empty();
+            session.execute("open", &json!({ "path": source })).unwrap();
+            session.execute("pointcloud.select", &json!({ "min": [-5, -5], "max": [5, 5] })).unwrap();
+            session.settings.osmode = cadcraft_engine::snap::mode::END;
+            session.settings.point_cloud_snap = true;
+            if orbit {
+                session.execute("3dorbit", &json!({ "view": "top", "fit": true })).unwrap();
+            }
+            let asked = Rc::new(RefCell::new(Vec::new()));
+            let picked = asked.clone();
+            let services = crate::Services {
+                pick_save: Some(Box::new(move |name| {
+                    picked.borrow_mut().push(name.to_owned());
+                    None
+                })),
+                ..Default::default()
+            };
+            let app = CadApp::new(session, services);
+            let mut harness = egui_kittest::Harness::builder().with_size(vec2(900.0, 500.0)).build_ui_state(
+                |ui, app: &mut CadApp| {
+                    crate::exchange::finish_cloud_copy(app);
+                    super::super::show(app, ui);
+                },
+                app,
+            );
+            assert!(harness.get_by_label("Copy Cloud Points with Base Point...").rect().is_positive());
+            harness.state_mut().start("copybase");
+            harness.step();
+            assert_eq!(harness.state().session.current_prompt().unwrap().message, "Specify base point (X,Y,Z)");
+            let base = if orbit {
+                let at = harness.state().canvas.rect.unwrap().center();
+                harness.event(egui::Event::PointerMoved(at));
+                harness.step();
+                assert!(harness.state().canvas.orbit_cursor.unwrap().cloud_snap());
+                for pressed in [true, false] {
+                    harness.event(egui::Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
+                    harness.step();
+                }
+                Vec3::new(0.0, 0.0, 32.0)
+            } else {
+                harness.event(egui::Event::Text("4,5,32".into()));
+                harness.key_press(Key::Enter);
+                Vec3::new(4.0, 5.0, 32.0)
+            };
+            harness.run();
+            assert_eq!(harness.state().session.last_point3(), base);
+            assert!(harness.state().session.state().unwrap().cloud_selection.is_some());
+            assert_eq!(asked.borrow().len(), 1);
+            assert!(asked.borrow()[0].ends_with("-selection.laz"));
+        }
+        std::fs::remove_file(source).unwrap();
+    }
 
     #[test]
     fn cloud_toolbar_exposes_laz_export_and_dwg_export_can_pick_cad_in_both_views() {
