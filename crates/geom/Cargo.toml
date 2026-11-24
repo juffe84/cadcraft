@@ -10,3 +10,4 @@ workspace = true
 
 [dependencies]
 serde = { workspace = true }
+spade = "2.15.1"

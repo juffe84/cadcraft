@@ -203,3 +203,7 @@ laz 0.13.0
 
 Copyright [2023] [Thomas Montaigu]
 Licensed under Apache License, Version 2.0 (LICENSE-APACHE).
+
+Terrain triangulation dependencies: Spade 2.15.1 and robust 1.2.0,
+dual-licensed MIT OR Apache-2.0. Their unmodified distributions carry the
+upstream license texts and copyright notices.

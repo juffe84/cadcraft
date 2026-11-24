@@ -92,3 +92,10 @@ Generated-in-code assets are original and have no file to list:
 | `laz` | laz-rs contributors | [laz 0.13.0](https://crates.io/crates/laz/0.13.0) | Apache-2.0 | Unmodified Rust dependency. |
 | LAS/LAZ integration test inputs | CADCraft contributors | `crates/io/tests/it/las_laz.rs` | MIT OR Apache-2.0 | Generated in memory from synthetic XYZ and color values declared in the test. |
 | Progressive LAZ test input | CADCraft contributors | `crates/io/src/point_cloud/progressive.rs` | MIT OR Apache-2.0 | Generated as a temporary LAZ file from synthetic XYZ values declared in the test. |
+
+## Terrain triangulation dependencies
+
+| Dependency | Source | Licence | Use |
+|---|---|---|---|
+| Spade 2.15.1 | [crates.io](https://crates.io/crates/spade/2.15.1) | MIT OR Apache-2.0 | Constrained Delaunay triangulation |
+| robust 1.2.0 | [crates.io](https://crates.io/crates/robust/1.2.0) | MIT OR Apache-2.0 | Geometric predicates used by Spade |
