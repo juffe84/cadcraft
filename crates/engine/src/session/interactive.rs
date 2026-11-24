@@ -184,7 +184,7 @@ impl Session {
     pub(crate) fn input_ucs_point(&mut self, [x, y, z]: [f64; 3], explicit_z: bool) -> Result<()> {
         let xy = Vec2::new(x, y);
         if let Some(reference) = self.spatial_draft_reference() {
-            let frame = self.ucs();
+            let frame = if explicit_z { self.ucs() } else { self.spatial_draft_ucs() };
             let z = if explicit_z { z } else { frame.to_ucs3(reference).z };
             self.input_point3(frame.to_wcs3(xy.to3(z)))
         } else {
@@ -219,6 +219,16 @@ impl Session {
         self.last_spatial_point = Some(point);
     }
 
+    /// The frame for pointer input and implicit heights in spatial drawing commands.
+    /// Ordinary plan-view LINE and POINT retain the planar UCS fallback.
+    pub fn spatial_draft_ucs(&self) -> crate::ucs::UcsFrame {
+        if self.running.as_ref().is_some_and(|run| run.id == "3dpoly") || self.in_model_orbit() { self.ucs() } else { self.input_ucs() }
+    }
+
+    fn in_model_orbit(&self) -> bool {
+        self.state().is_ok_and(|state| state.orbit.is_some() && state.space == cadcraft_doc::Space::Model && state.block_editor().is_none())
+    }
+
     /// A point on the working plane for the active spatial drawing prompt.
     pub fn spatial_draft_reference(&self) -> Option<Vec3> {
         if !self.running.as_ref().is_some_and(|run| run.spatial_drafting()) {
@@ -228,7 +238,12 @@ impl Session {
         if !crate::pointmod::accepts(&prompt) {
             return None;
         }
-        Some(prompt.base.zip(prompt.base_z).map_or_else(|| self.ucs().to_wcs3(Vec3::new(0.0, 0.0, self.draft_elevation())), |(base, z)| base.to3(z)))
+        Some(
+            prompt
+                .base
+                .zip(prompt.base_z)
+                .map_or_else(|| self.spatial_draft_ucs().to_wcs3(Vec3::new(0.0, 0.0, self.draft_elevation())), |(base, z)| base.to3(z)),
+        )
     }
 
     fn draft_elevation(&self) -> f64 {
@@ -247,7 +262,7 @@ impl Session {
     /// An unsnapped plan-view pick on the spatial drafting plane.
     pub fn spatial_point_at_xy(&self, point: Vec2) -> Option<Vec3> {
         let reference = self.spatial_draft_reference()?;
-        let normal = self.ucs().z();
+        let normal = self.spatial_draft_ucs().z();
         let height = if normal.z.abs() > 1e-9 { reference.z - (point - reference.xy()).dot(normal.xy()) / normal.z } else { reference.z };
         Some(point.to3(height))
     }
@@ -478,9 +493,8 @@ impl Session {
             Some(Input::Point(p)) if self.spatial_input.is_none_or(|v| v.xy() != *p) => self.spatial_point_at_xy(*p),
             _ => None,
         };
+        let in_orbit = self.in_model_orbit();
         let Some(mut run) = self.running.take() else { return Ok(()) };
-        let in_orbit =
-            self.state().is_ok_and(|state| state.orbit.is_some() && state.space == cadcraft_doc::Space::Model && state.block_editor().is_none());
         let point = if let Some(Input::Point(p)) = &input {
             self.spatial_input
                 .filter(|v| v.xy() == *p)

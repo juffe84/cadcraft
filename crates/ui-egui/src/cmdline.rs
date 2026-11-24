@@ -58,7 +58,7 @@ pub fn dyn_frame(app: &CadApp) -> Option<crate::dyninput::Frame> {
     }
     let p = app.session.current_prompt().filter(cadcraft_engine::pointmod::accepts)?;
     let spatial = app.session.spatial_draft_reference();
-    let ucs = if spatial.is_some() { app.session.ucs() } else { app.session.input_ucs() };
+    let ucs = if spatial.is_some() { app.session.spatial_draft_ucs() } else { app.session.input_ucs() };
     let cartesian = st.dynpi_cartesian || app.session.running.as_ref().is_some_and(|r| r.id == "3dpoly");
     Some(crate::dyninput::Frame { base: p.base, cartesian, absolute: st.dynpi_absolute, ucs, spatial })
 }
@@ -446,8 +446,7 @@ pub fn submit(app: &mut CadApp) {
             if e.has_z(&f) {
                 let cursor = app.canvas.draft_cursor.or_else(|| app.session.spatial_point_at_xy(cursor))?;
                 let point = crate::dyninput::resolve_xyz(&e, &f, cursor, true)?;
-                let point = f.ucs.to_ucs3(point);
-                Some(format!("#{},{},{}", point.x, point.y, point.z))
+                Some(format!("*#{},{},{}", point.x, point.y, point.z))
             } else {
                 crate::dyninput::complete(&e, &f, cursor, last)
             }

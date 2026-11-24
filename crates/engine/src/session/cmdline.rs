@@ -150,11 +150,21 @@ impl Session {
             if tt == "@" && self.spatial_draft_reference().is_some() {
                 return self.input_point3(self.last_point3());
             }
-            if let Some(reference) = self.spatial_draft_reference()
-                && let Some(point) = prompt::parse_cartesian3(tt, self.last_point3(), self.ucs(), Some(reference))
-            {
-                self.last_polar = None;
-                return self.input_point3(point);
+            if let Some(reference) = self.spatial_draft_reference() {
+                let ucs = self.ucs();
+                let frame = self.spatial_draft_ucs();
+                let point = if frame != ucs {
+                    prompt::parse_point3_in(tt, self.last_point3(), ucs).or_else(|| {
+                        self.note_tilted_ucs();
+                        prompt::parse_cartesian3(tt, self.last_point3(), frame, Some(reference))
+                    })
+                } else {
+                    prompt::parse_cartesian3(tt, self.last_point3(), frame, Some(reference))
+                };
+                if let Some(point) = point {
+                    self.last_polar = None;
+                    return self.input_point3(point);
+                }
             }
             self.note_tilted_ucs();
             if let Some(p) = self.parse_typed_point(tt, self.last_point) {
@@ -177,8 +187,18 @@ impl Session {
                     && let Some(cursor) = self.spatial_cursor.filter(|p| p.xy() == self.cursor).or_else(|| self.spatial_point_at_xy(self.cursor))
                 {
                     let base = base.to3(z);
-                    let dir = (cursor - base).normalized();
-                    let dir = if dir == cadcraft_geom::Vec3::ZERO { self.ucs().x } else { dir };
+                    let frame = self.spatial_draft_ucs();
+                    let dir = if self.settings.orthomode && !prompt.corner {
+                        let mut settings = self.drafting_settings();
+                        settings.ucs_angle = 0.0;
+                        let local = frame.to_ucs3(cursor) - frame.to_ucs3(base);
+                        let xy = snap::iso::constrain(&settings, Vec2::ZERO, local.xy());
+                        if local.z.abs() > xy.len() { frame.z() * local.z.signum() } else { frame.x * xy.x + frame.y * xy.y }
+                    } else {
+                        cursor - base
+                    }
+                    .normalized();
+                    let dir = if dir == cadcraft_geom::Vec3::ZERO { frame.x } else { dir };
                     return self.input_point3(base + dir * dist);
                 }
                 let mut c = self.cursor;

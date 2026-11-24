@@ -360,8 +360,11 @@ impl Session {
                 Frame::From { base: Some(_) } => {}
                 Frame::Mid { first: Some(f) } => position = f + (position - f) * 0.5,
                 Frame::Filter { keep, first: Some(f) } => {
-                    position =
-                        if spatial { keep.combine3_in(&self.ucs(), f, position) } else { keep.combine_in(&self.input_ucs(), f.xy(), p).to3(0.0) }
+                    position = if spatial {
+                        keep.combine3_in(&self.spatial_draft_ucs(), f, position)
+                    } else {
+                        keep.combine_in(&self.input_ucs(), f.xy(), p).to3(0.0)
+                    }
                 }
                 Frame::Angle { base, dir } => position = (base + dir * (p - base).dot(dir)).to3(position.z),
                 Frame::Snap { mode: 0 } => {}
