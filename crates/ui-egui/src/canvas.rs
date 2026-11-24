@@ -21,6 +21,7 @@ mod grips;
 mod list;
 mod orbit_draft;
 mod orbit_scene;
+mod orbit_snap;
 mod pick;
 mod point_cloud;
 mod press;

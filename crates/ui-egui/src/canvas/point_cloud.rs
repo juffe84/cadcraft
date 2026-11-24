@@ -298,7 +298,7 @@ impl OrbitFrame {
         Bounds2::new(focus.xy() - span, focus.xy() + span)
     }
 
-    fn pick_bounds(&self, cloud: &PointCloud, cursor: egui::Pos2, radius: f32) -> Bounds2 {
+    pub(super) fn pick_bounds(&self, heights: [f64; 2], cursor: egui::Pos2, radius: f32) -> Bounds2 {
         let front = self.camera.axes[2];
         if front.z.abs() < 0.001 {
             return self.bounds;
@@ -311,7 +311,7 @@ impl OrbitFrame {
             if direction.z * front.z <= 1e-6 {
                 return self.bounds;
             }
-            for z in cloud.z_range {
+            for z in heights {
                 bounds.add((origin + direction * ((z - origin.z) / direction.z)).xy());
             }
         }
@@ -334,7 +334,7 @@ impl OrbitFrame {
     ) -> Option<Vec3> {
         let mut best: Option<SurfaceHit> = None;
         for cloud in clouds {
-            cloud.visible(self.pick_bounds(cloud, cursor, radius), limit, |p| {
+            cloud.visible(self.pick_bounds(cloud.z_range, cursor, radius), limit, |p| {
                 if !accepts(p.position) {
                     return;
                 }
@@ -701,7 +701,7 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     if let Some(model) = &model {
         model.paint(&painter, &frame, crate::orbit_gpu::available(app.canvas.gpu));
     }
-    super::orbit_draft::draw(app, &painter, &frame, &response, shown, dragging);
+    super::orbit_draft::draw(app, &painter, &frame, &response, model.as_ref(), shown, dragging);
 }
 
 fn paint_cloud_in_orbit(app: &CadApp, painter: &egui::Painter, frame: &OrbitFrame, root: &Arc<PointCloud>, snapshot: &CloudView) {
@@ -770,7 +770,7 @@ mod tests {
             harness.event(egui::Event::PointerMoved(at));
             harness.run();
             let hit = harness.state().canvas.orbit_cursor.unwrap();
-            assert!(hit.snapped);
+            assert!(hit.cloud_snap());
             assert_eq!(hit.position, point);
             for pressed in [true, false] {
                 harness.event(egui::Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers: egui::Modifiers::NONE });
@@ -783,6 +783,79 @@ mod tests {
         assert!(harness.state().session.running.is_none());
         let drawing = harness.state().session.doc().unwrap();
         assert!(matches!(&drawing.model.iter().last().unwrap().kind, cadcraft_doc::EntityKind::Line(line) if line.a == a && line.b == b));
+    }
+
+    #[test]
+    fn picks_and_draws_from_cad_lines_in_a_perspective_orbit_without_a_cloud() {
+        use cadcraft_doc::{Common, Drawing, EntityKind, Line};
+        use cadcraft_engine::snap::mode;
+
+        let mut drawing = Drawing::new_metric();
+        let a = Vec3::new(-10.0, -5.0, 20.0);
+        let b = Vec3::new(14.0, 6.0, 45.0);
+        let original = drawing.add(&Space::Model, Common::default(), EntityKind::Line(Line { a, b })).unwrap();
+        // Leave enough room to hit the endpoints above the floating command line.
+        let support = [Vec3::new(2.0, -42.0, 32.5), Vec3::new(2.0, 43.0, 32.5)];
+        drawing.add(&Space::Model, Common::default(), EntityKind::Line(Line { a: support[0], b: support[1] })).unwrap();
+        let mut session = Session::empty();
+        session.open_drawing(drawing, "Model", None);
+        session.settings.osmode = mode::END | mode::NEA;
+        session.execute("3dorbit", &json!({"view": "isometric", "fit": true, "perspective": true})).unwrap();
+        let plan = session.state().unwrap().view();
+        let pose = session.state().unwrap().orbit.unwrap();
+        let app = CadApp::new(session, Default::default());
+        let mut harness =
+            egui_kittest::Harness::builder().with_size(vec2(900.0, 500.0)).build_ui_state(|ui, app: &mut CadApp| super::super::show(app, ui), app);
+        let rect = harness.get_by_label("Model 3D view").rect();
+        let frame =
+            OrbitFrame::new(pose, plan, Extent { xy: Bounds2::from_points([a, b, support[0], support[1]].map(Vec3::xy)), z: [a.z, b.z] }, rect);
+        let click = |at, pressed, modifiers| egui::Event::PointerButton { pos: at, button: PointerButton::Primary, pressed, modifiers };
+        let midpoint = a + (b - a) * 0.5;
+        let at = frame.project(a + (b - a) * 0.25).0;
+        for modifiers in [egui::Modifiers::NONE, egui::Modifiers::SHIFT] {
+            harness.event(egui::Event::PointerMoved(at));
+            harness.event(click(at, true, modifiers));
+            harness.step();
+            assert_eq!(harness.state().session.selection().contains(&original), !modifiers.shift);
+            harness.event(click(at, false, modifiers));
+            harness.step();
+        }
+
+        harness.state_mut().session.start("line").unwrap();
+        let near = a + (b - a) * 0.77;
+        for (expected, snap) in [(a, mode::END), (midpoint, mode::MID), (near, mode::NEA)] {
+            let session = &mut harness.state_mut().session;
+            if snap == mode::MID {
+                session.settings.osmode |= mode::OFF;
+                session.cmdline("_mid").unwrap();
+                assert_eq!(session.snap_override(), Some(mode::MID));
+            } else {
+                session.settings.osmode &= !mode::OFF;
+            }
+            let at = frame.project(expected).0;
+            harness.event(egui::Event::PointerMoved(at));
+            harness.step();
+            let hit = harness.state().canvas.orbit_cursor.unwrap();
+            assert_eq!(hit.snap.map(|hit| hit.mode), Some(snap), "point at {expected:?}");
+            assert!((hit.position - expected).len() < 1e-5);
+            for pressed in [true, false] {
+                harness.event(click(at, pressed, egui::Modifiers::NONE));
+                harness.step();
+            }
+        }
+        let drawing = harness.state().session.doc().unwrap();
+        let created: Vec<_> = drawing
+            .model
+            .iter()
+            .skip(2)
+            .filter_map(|e| match &e.kind {
+                EntityKind::Line(line) => Some(line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(created.len(), 2);
+        assert_eq!((created[0].a, created[0].b, created[1].a), (a, midpoint, midpoint));
+        assert!((created[1].b - near).len() < 1e-5);
     }
 
     #[test]

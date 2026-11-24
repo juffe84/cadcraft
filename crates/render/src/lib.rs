@@ -492,7 +492,7 @@ mod text_entity;
 mod viewports;
 
 pub use dim_draw::{dim_text, dimension_in};
-pub use display::{DImage, DPrim, DisplayList, Heights, Kind, MAX_TRANSPARENCY, NO_LAYER, PlotText, VIEWPORT_CONTENT, alpha};
+pub use display::{DImage, DPrim, DisplayList, Heights, Kind, MAX_TRANSPARENCY, NO_LAYER, PlotText, SpatialSnap, VIEWPORT_CONTENT, alpha};
 pub use pipeline::{Options, build, build_entities, build_plot};
 use props::{default_lineweight, resolve_common};
 use text_entity::text_style;

@@ -1,5 +1,5 @@
 //! Spatial primitives for the model orbit. Planar artwork is drawn by the normal builder at its elevation.
-use super::{Builder, Ctx, Entity, EntityKind, Ink, Vec2, Vec3};
+use super::{Builder, Ctx, Entity, EntityKind, Ink, SpatialSnap, Vec2, Vec3};
 use cadcraft_geom::{Mat4, Polyline, ccw_sweep};
 use std::f64::consts::{PI, TAU};
 
@@ -20,6 +20,82 @@ pub(crate) fn elevation(kind: &EntityKind) -> f64 {
         EntityKind::Tolerance(tolerance) => tolerance.insert.z,
         _ => 0.0,
     }
+}
+
+pub(crate) fn snaps(builder: &mut Builder, ctx: &Ctx, e: &Entity) {
+    use SpatialSnap::*;
+    let world = |p: Vec3| lifted(ctx.xf.apply(p.xy()), ctx.z_offset + ctx.z_scale * p.z);
+    let mut add = |snap: SpatialSnap| {
+        if snap.positions().iter().all(|p| p.is_finite()) {
+            builder.list.spatial_snaps.push(snap);
+        }
+    };
+    let line = |a, b| Segment { ends: [world(a), world(b)], range: [0.0, 1.0] };
+    match &e.kind {
+        EntityKind::Line(l) => add(line(l.a, l.b)),
+        EntityKind::Polyline3d(p) => {
+            for pair in p.points.windows(2) {
+                add(line(pair[0], pair[1]));
+            }
+            if p.closed
+                && let Some((last, first)) = p.points.last().zip(p.points.first())
+            {
+                add(line(*last, *first));
+            }
+        }
+        EntityKind::LwPolyline(p) => {
+            let at = |q| lifted(q, p.elevation);
+            for (a, b) in p.vertices.iter().zip(p.vertices.iter().cycle().skip(1)).take(p.vertices.len().saturating_sub(usize::from(!p.closed))) {
+                if let Some((arc, _)) = cadcraft_geom::bulge_to_arc(a.p, b.p, a.bulge) {
+                    add(End(world(at(a.p))));
+                    add(End(world(at(b.p))));
+                    add(Mid(world(at(arc.mid_point()))));
+                    add(Center(world(at(arc.center))));
+                } else {
+                    add(line(at(a.p), at(b.p)));
+                }
+            }
+        }
+        EntityKind::Point(p) => add(Node(world(p.p))),
+        EntityKind::Insert(p) => add(Insertion(world(p.insert))),
+        EntityKind::Face3d(f) => {
+            for (a, b) in f.visible_edges() {
+                add(line(a, b));
+            }
+        }
+        EntityKind::Circle(c) => {
+            let (m, _) = circle_axes(e.common.extrusion);
+            add(Center(world(c.center)));
+            for angle in [0.0, PI * 0.5, PI, PI * 1.5] {
+                add(Quadrant(world(circle_point(c.center, c.radius, m, angle))));
+            }
+        }
+        EntityKind::Arc(a) => {
+            let (m, reversed) = circle_axes(e.common.extrusion);
+            let (start, end) = if reversed { (PI - a.end, PI - a.start) } else { (a.start, a.end) };
+            let sweep = ccw_sweep(start, end);
+            let at = |angle| world(circle_point(a.center, a.radius, m, angle));
+            add(Center(world(a.center)));
+            add(End(at(start)));
+            add(End(at(end)));
+            add(Mid(at(start + sweep * 0.5)));
+            for angle in [0.0, PI * 0.5, PI, PI * 1.5] {
+                if (angle - start).rem_euclid(TAU) <= sweep {
+                    add(Quadrant(at(angle)));
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn circle_axes(extrusion: Vec3) -> (Mat4, bool) {
+    let normal = extrusion.normalized();
+    if normal.x.abs().max(normal.y.abs()) > 1e-10 { (Mat4::ocs(normal), normal.z < 0.0) } else { (Mat4::ocs(Vec3::Z), false) }
+}
+
+fn circle_point(center: Vec3, radius: f64, axes: Mat4, angle: f64) -> Vec3 {
+    center + axes.apply(Vec3::new(radius * angle.cos(), radius * angle.sin(), 0.0))
 }
 
 pub(crate) fn draw(b: &mut Builder, ctx: &Ctx, e: &Entity, color: Ink, lw: f32, tol: f64) -> bool {
@@ -56,17 +132,14 @@ pub(crate) fn draw(b: &mut Builder, ctx: &Ctx, e: &Entity, color: Ink, lw: f32, 
         }
         EntityKind::Circle(circle) if tilted || thickness != Vec3::ZERO => {
             let m = Mat4::ocs(normal);
-            let points = arc_points(0.0, TAU, circle.radius, tol, |t| {
-                circle.center + m.apply(Vec3::new(circle.radius * t.cos(), circle.radius * t.sin(), 0.0))
-            });
+            let points = arc_points(0.0, TAU, circle.radius, tol, |t| circle_point(circle.center, circle.radius, m, t));
             path(b, ctx, color, lw, &points, thickness, fill);
         }
         EntityKind::Arc(arc) if tilted || thickness != Vec3::ZERO => {
             let m = Mat4::ocs(normal);
             // The document stores arc angles in the plan convention for a negative OCS Z.
             let (start, end) = if normal.z < 0.0 { (PI - arc.end, PI - arc.start) } else { (arc.start, arc.end) };
-            let points =
-                arc_points(start, end, arc.radius, tol, |t| arc.center + m.apply(Vec3::new(arc.radius * t.cos(), arc.radius * t.sin(), 0.0)));
+            let points = arc_points(start, end, arc.radius, tol, |t| circle_point(arc.center, arc.radius, m, t));
             path(b, ctx, color, lw, &points, thickness, fill);
         }
         EntityKind::Ellipse(ellipse) => {

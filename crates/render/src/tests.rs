@@ -1453,4 +1453,15 @@ fn orbit_heights_survive_block_scaling_and_xclip() {
     assert_eq!(points.len(), 2);
     assert!(points[0].x > 0.0 && points[1].x < 10.0);
     assert!(points.iter().all(|v| (v.z - 20.0 - 2.0 * v.x).abs() < 1e-9));
+    let (ends, range, visible) = spatial
+        .spatial_snaps
+        .iter()
+        .find_map(|snap| match *snap {
+            SpatialSnap::Segment { ends, range } => Some((ends, range, snap.positions())),
+            _ => None,
+        })
+        .unwrap();
+    assert!(range[0] > 0.0 && range[0] < 0.5 && range[1] > 0.5 && range[1] < 1.0);
+    assert!(ends[0].x < points[0].x && ends[1].x > points[1].x);
+    assert!(visible.iter().zip(points).all(|(p, drawn)| (*p - drawn).len() < 1e-9));
 }

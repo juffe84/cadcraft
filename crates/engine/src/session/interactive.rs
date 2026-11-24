@@ -175,8 +175,16 @@ impl Session {
     /// Feed a WCS position from a spatial canvas. Existing XY commands still receive
     /// a normal point, while spatial commands can read its exact height.
     pub fn input_point3(&mut self, point: Vec3) -> Result<()> {
+        self.input_picked_point3(point, 0)
+    }
+
+    /// Feed an orbit pick whose snap mode was resolved in the spatial view.
+    pub fn input_picked_point3(&mut self, point: Vec3, mode: u32) -> Result<()> {
         if !point.is_finite() || point.x.abs().max(point.y.abs()).max(point.z.abs()) > 1e12 {
             return Err(EngineError::Other("Point coordinates are outside the drawing range.".into()));
+        }
+        if mode != 0 && self.snap_override().is_some_and(|requested| requested & mode != 0) {
+            self.point_mods.pop();
         }
         let saved = self.spatial_input.replace(point);
         let result = self.input(Input::Point(point.xy()));
@@ -203,6 +211,24 @@ impl Session {
         let locked = running.and_then(|r| r.draft_height);
         let height = if cloud_snap { locked.unwrap_or_else(|| self.orbit_default_height()) } else { 0.0 };
         OrbitDraftPlane { height, locked: locked.is_some(), cloud_snap }
+    }
+
+    /// Grid snap and Ortho for an unsnapped point on the orbit work plane.
+    pub fn constrain_orbit_point(&self, raw: Vec3, shift: bool) -> Vec3 {
+        let Ok(doc) = self.doc() else { return raw };
+        let space = self.space();
+        let settings = self.drafting_settings();
+        let (mut point, grid) = crate::snap::iso::grid_snap(doc, &space, settings.clone(), raw.xy());
+        if grid.snapmode && !grid.polarsnap {
+            let (origin, angle) = crate::snap::grid_frame_in(doc, &space);
+            point = crate::snap::grid_snap(point, doc.header.snap_unit(), origin, angle);
+        }
+        if settings.orthomode ^ shift
+            && let Some(base) = self.current_prompt().filter(|p| !p.corner).and_then(|p| p.base)
+        {
+            point = crate::snap::iso::ortho(&settings, base, point);
+        }
+        point.to3(raw.z)
     }
 
     pub(crate) fn place_on_drafting_plane(&self, entity: &mut EntityKind) {

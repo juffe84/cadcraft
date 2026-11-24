@@ -78,7 +78,8 @@ impl SnapHit {
         }
     }
 
-    fn plain(mode: u32, point: Vec2) -> SnapHit {
+    /// A fixed point provided by a view's geometric snap query.
+    pub fn plain(mode: u32, point: Vec2) -> SnapHit {
         SnapHit { point, mode, name: name_of(mode), viewport: None, deferred: None }
     }
 

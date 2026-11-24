@@ -1,10 +1,11 @@
 //! A display list with model elevations, shared by orbit picking and rendering.
+use std::ops::Range;
 use std::sync::Arc;
 
-use cadcraft_doc::Space;
+use cadcraft_doc::{Handle, Space};
 use cadcraft_geom::{Bounds2, Vec3};
-use cadcraft_render::{DPrim, DisplayList, Kind, Options};
-use egui::{Color32, Painter, Pos2, Stroke};
+use cadcraft_render::{DPrim, DisplayList, Kind, Options, SpatialSnap};
+use egui::{Color32, Painter, Pos2, Rect, Stroke};
 
 use super::point_cloud::OrbitFrame;
 use super::{CadApp, ListKey, Tokens, rebuild};
@@ -22,6 +23,14 @@ impl Default for Extent {
 }
 
 impl Extent {
+    fn include(&mut self, point: Vec3) {
+        if point.is_finite() {
+            self.xy.add(point.xy());
+            self.z[0] = self.z[0].min(point.z);
+            self.z[1] = self.z[1].max(point.z);
+        }
+    }
+
     pub fn union(self, other: Self) -> Self {
         Self { xy: self.xy.union(&other.xy), z: [self.z[0].min(other.z[0]), self.z[1].max(other.z[1])] }
     }
@@ -35,26 +44,90 @@ impl Extent {
     }
 }
 
+struct PickRanges {
+    extent: Extent,
+    groups: Vec<(Extent, Range<usize>)>,
+}
+
+impl PickRanges {
+    fn build<T>(items: &[T], mut extent: impl FnMut(&T, &mut Extent)) -> Self {
+        const CHUNK: usize = 64;
+        let mut extent_all = Extent::default();
+        let groups = items
+            .chunks(CHUNK)
+            .enumerate()
+            .map(|(chunk, items)| {
+                let mut bounds = Extent::default();
+                for item in items {
+                    extent(item, &mut bounds);
+                }
+                let start = chunk * CHUNK;
+                extent_all = extent_all.union(bounds);
+                (bounds, start..start + items.len())
+            })
+            .collect();
+        Self { extent: extent_all, groups }
+    }
+
+    fn near<'a>(&'a self, frame: &'a OrbitFrame, at: Pos2, radius: f32) -> impl Iterator<Item = usize> + 'a {
+        let xy = frame.pick_bounds(self.extent.z, at, radius);
+        let area = Rect::from_center_size(at, egui::Vec2::splat(radius * 2.0));
+        self.groups
+            .iter()
+            .filter_map(move |(bounds, range)| {
+                let near = bounds.xy.intersects(&xy) && projected_bounds(frame, *bounds).is_none_or(|projected| projected.intersects(area));
+                near.then(|| range.clone())
+            })
+            .flatten()
+    }
+}
+
+fn projected_bounds(frame: &OrbitFrame, extent: Extent) -> Option<Rect> {
+    let mut rect = Rect::NOTHING;
+    for xy in extent.xy.corners() {
+        for z in extent.z {
+            let (at, depth) = frame.project(xy.to3(z));
+            if frame.camera.weight(depth) <= 0.01 {
+                return None;
+            }
+            rect.extend_with(at);
+        }
+    }
+    Some(rect)
+}
+
+struct PickData {
+    primitives: PickRanges,
+    snaps: PickRanges,
+    infinite: Vec<usize>,
+    by_handle: Vec<(Handle, usize)>,
+}
+
 #[derive(Clone)]
 pub(super) struct Model {
     pub list: Arc<DisplayList>,
+    pick_data: Arc<PickData>,
     pub extent: Extent,
     pub missing: usize,
 }
 
 impl Model {
     fn new(list: DisplayList, doc: &cadcraft_doc::Drawing) -> Self {
-        let mut extent = Extent::default();
-        for prim in &list.prims {
+        let primitives = PickRanges::build(&list.prims, |prim, extent| {
             let count = if matches!(prim.kind, Kind::Infinite { .. }) { 1 } else { usize::MAX };
             for point in list.spatial_points(prim).take(count) {
-                if point.is_finite() {
-                    extent.xy.add(point.xy());
-                    extent.z[0] = extent.z[0].min(point.z);
-                    extent.z[1] = extent.z[1].max(point.z);
-                }
+                extent.include(point);
             }
-        }
+        });
+        let snaps = PickRanges::build(&list.spatial_snaps, |snap, extent| {
+            for point in snap.positions() {
+                extent.include(point);
+            }
+        });
+        let infinite = list.prims.iter().enumerate().filter(|(_, p)| matches!(p.kind, Kind::Infinite { .. })).map(|(i, _)| i).collect();
+        let mut by_handle: Vec<_> = list.prims.iter().enumerate().map(|(i, p)| (p.handle, i)).collect();
+        by_handle.sort_unstable();
+        let extent = primitives.extent;
         let missing = doc
             .model
             .iter()
@@ -65,7 +138,8 @@ impl Model {
                     && doc.layer(&e.common.layer).is_none_or(|layer| layer.on && !layer.frozen)
             })
             .count();
-        Self { list: Arc::new(list), extent, missing }
+        let pick_data = Arc::new(PickData { primitives, snaps, infinite, by_handle });
+        Self { list: Arc::new(list), pick_data, extent, missing }
     }
 
     pub fn paint_images(&self, painter: &Painter, frame: &OrbitFrame) {
@@ -130,57 +204,94 @@ impl Model {
 
     /// Real XYZ under the cursor, with perspective-correct interpolation on edges and faces.
     pub fn pick(&self, frame: &OrbitFrame, cursor: Pos2, radius: f32) -> Option<Vec3> {
-        let mut best: Option<(f32, f64, Vec3)> = None;
-        self.visit(|geometry, p| {
+        self.pick_object(frame, cursor, radius).map(|(_, point)| point)
+    }
+
+    pub fn pick_object(&self, frame: &OrbitFrame, cursor: Pos2, radius: f32) -> Option<(Handle, Vec3)> {
+        let mut best: Option<(f32, f64, Handle, Vec3)> = None;
+        let indices = self.pick_data.primitives.near(frame, cursor, radius).chain(self.pick_data.infinite.iter().copied());
+        for index in indices {
+            let p = &self.list.prims[index];
             if p.kind == Kind::Mask {
-                return;
+                continue;
             }
-            let candidate = match geometry {
-                Geometry::Point(point) => Some((frame.project(point).0.distance(cursor), point)),
-                Geometry::Line(points) => edge(frame, cursor, points),
-                Geometry::Triangle(points) => triangle(frame, cursor, points),
-            };
-            let Some((distance, point)) = candidate.filter(|(d, _)| *d <= radius) else { return };
-            let depth = frame.project(point).1;
-            if best.is_none_or(|(old_d, old_z, _)| distance < old_d || (distance == old_d && depth > old_z)) {
-                best = Some((distance, depth, point));
+            self.visit_prim(p, |geometry| {
+                let candidate = match geometry {
+                    Geometry::Point(point) => Some((frame.project(point).0.distance(cursor), point)),
+                    Geometry::Line(points) => edge(frame, cursor, points),
+                    Geometry::Triangle(points) => triangle(frame, cursor, points),
+                };
+                let Some((distance, point)) = candidate.filter(|(d, _)| *d <= radius) else { return };
+                let depth = frame.project(point).1;
+                if frame.camera.weight(depth) > 0.01
+                    && best.is_none_or(|(old_d, old_z, _, _)| distance < old_d || (distance == old_d && depth >= old_z))
+                {
+                    best = Some((distance, depth, p.handle, point));
+                }
+            });
+        }
+        best.map(|(_, _, handle, point)| (handle, point))
+    }
+
+    pub fn snaps_near<'a>(&'a self, frame: &'a OrbitFrame, at: Pos2, radius: f32) -> impl Iterator<Item = SpatialSnap> + 'a {
+        self.pick_data.snaps.near(frame, at, radius).map(|i| self.list.spatial_snaps[i])
+    }
+
+    pub fn highlight(&self, painter: &Painter, frame: &OrbitFrame, handles: &[Handle], color: Color32, width: f32) {
+        let stroke = Stroke::new(width, color);
+        for handle in handles {
+            let entries = &self.pick_data.by_handle;
+            let start = entries.partition_point(|(h, _)| h < handle);
+            for &(_, index) in entries[start..].iter().take_while(|(h, _)| h == handle) {
+                self.visit_prim(&self.list.prims[index], |geometry| match geometry {
+                    Geometry::Point(p) => {
+                        painter.circle_stroke(frame.project(p).0, 3.0, stroke);
+                    }
+                    Geometry::Line(points) => {
+                        painter.line_segment(points.map(|p| frame.project(p).0), stroke);
+                    }
+                    Geometry::Triangle(_) => {}
+                });
             }
-        });
-        best.map(|(_, _, point)| point)
+        }
     }
 
     fn visit(&self, mut visit: impl FnMut(Geometry, &DPrim)) {
         for p in &self.list.prims {
-            let mut points = self.list.spatial_points(p);
-            match p.kind {
-                Kind::Point => {
-                    if let Some(point) = points.next() {
-                        visit(Geometry::Point(point), p);
+            self.visit_prim(p, |geometry| visit(geometry, p));
+        }
+    }
+
+    fn visit_prim(&self, p: &DPrim, mut visit: impl FnMut(Geometry)) {
+        let mut points = self.list.spatial_points(p);
+        match p.kind {
+            Kind::Point => {
+                if let Some(point) = points.next() {
+                    visit(Geometry::Point(point));
+                }
+            }
+            Kind::Polyline => {
+                if let Some(mut a) = points.next() {
+                    for b in points {
+                        visit(Geometry::Line([a, b]));
+                        a = b;
                     }
                 }
-                Kind::Polyline => {
-                    if let Some(mut a) = points.next() {
-                        for b in points {
-                            visit(Geometry::Line([a, b]), p);
-                            a = b;
-                        }
-                    }
+            }
+            Kind::Infinite { ray } => {
+                if let Some((base, dir)) = points.next().zip(points.next()) {
+                    visit(Geometry::Line(crate::orbit_gpu::infinite(base, dir, ray, self.extent.center(), self.extent.span())));
                 }
-                Kind::Infinite { ray } => {
-                    if let Some((base, dir)) = points.next().zip(points.next()) {
-                        visit(Geometry::Line(crate::orbit_gpu::infinite(base, dir, ray, self.extent.center(), self.extent.span())), p);
-                    }
+            }
+            Kind::Tris | Kind::Mask => {
+                while let (Some(a), Some(b), Some(c)) = (points.next(), points.next(), points.next()) {
+                    visit(Geometry::Triangle([a, b, c]));
                 }
-                Kind::Tris | Kind::Mask => {
-                    while let (Some(a), Some(b), Some(c)) = (points.next(), points.next(), points.next()) {
-                        visit(Geometry::Triangle([a, b, c]), p);
-                    }
-                }
-                Kind::Image { .. } => {
-                    if let (Some(a), Some(b), Some(c), Some(d)) = (points.next(), points.next(), points.next(), points.next()) {
-                        visit(Geometry::Triangle([a, b, c]), p);
-                        visit(Geometry::Triangle([a, c, d]), p);
-                    }
+            }
+            Kind::Image { .. } => {
+                if let (Some(a), Some(b), Some(c), Some(d)) = (points.next(), points.next(), points.next(), points.next()) {
+                    visit(Geometry::Triangle([a, b, c]));
+                    visit(Geometry::Triangle([a, c, d]));
                 }
             }
         }
@@ -193,7 +304,7 @@ enum Geometry {
     Triangle([Vec3; 3]),
 }
 
-fn edge(frame: &OrbitFrame, cursor: Pos2, points: [Vec3; 2]) -> Option<(f32, Vec3)> {
+pub(super) fn edge(frame: &OrbitFrame, cursor: Pos2, points: [Vec3; 2]) -> Option<(f32, Vec3)> {
     let [a, b] = points.map(|point| frame.project(point).0);
     let line = b - a;
     let distance = line.length_sq();

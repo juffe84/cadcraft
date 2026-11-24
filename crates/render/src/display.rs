@@ -95,6 +95,8 @@ pub struct DisplayList {
     pub tris: Vec<Vec2>,
     /// Model-space Z coordinates for orbit lists, parallel to the planar arrays.
     pub heights: Option<Heights>,
+    /// Authored object-snap geometry, independent of line dashes and tessellation.
+    pub spatial_snaps: Vec<SpatialSnap>,
     /// The raster images drawn by [`Kind::Image`] primitives.
     pub images: Vec<DImage>,
     /// Plots ([`build_plot`]): for each primitive, the index in [`Drawing::layers`] of the layer
@@ -118,6 +120,30 @@ pub struct DisplayList {
     /// Plot style end, join and fill style per primitive (parallel to `prims`; missing entries
     /// are "use object"), turned into geometry by [`pen::apply`].
     pub pens: Vec<Pen>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub enum SpatialSnap {
+    End(Vec3),
+    Mid(Vec3),
+    Center(Vec3),
+    Quadrant(Vec3),
+    Node(Vec3),
+    Insertion(Vec3),
+    /// The original endpoints and the visible interval of the segment after clipping.
+    Segment {
+        ends: [Vec3; 2],
+        range: [f64; 2],
+    },
+}
+
+impl SpatialSnap {
+    pub fn positions(self) -> [Vec3; 2] {
+        match self {
+            Self::Segment { ends: [a, b], range: [lo, hi] } => [a + (b - a) * lo, a + (b - a) * hi],
+            Self::End(p) | Self::Mid(p) | Self::Center(p) | Self::Quadrant(p) | Self::Node(p) | Self::Insertion(p) => [p; 2],
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -228,6 +254,7 @@ pub(crate) fn append(dst: &mut DisplayList, src: DisplayList) {
         p
     }));
     dst.images.extend(src.images);
+    dst.spatial_snaps.extend(src.spatial_snaps);
     dst.verts.extend(src.verts);
     dst.tris.extend(src.tris);
     if let (Some(dst), Some(src)) = (&mut dst.heights, src.heights) {

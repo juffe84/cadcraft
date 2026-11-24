@@ -91,6 +91,7 @@ fn entity_parts(b: &mut Builder, ctx: &Ctx, e: &Entity) {
     let lw = if b.opts.lineweights { lw } else { 0.0 };
     let elevation;
     let ctx = if b.opts.spatial {
+        super::spatial::snaps(b, ctx, e);
         if super::spatial::draw(b, ctx, e, rgb, lw, tol) {
             return;
         }

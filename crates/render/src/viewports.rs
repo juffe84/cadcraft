@@ -1,6 +1,6 @@
 #[cfg(not(target_arch = "wasm32"))]
 use super::display::append;
-use super::display::{DImage, DPrim, DisplayList, Kind, NO_LAYER, PlotText, VIEWPORT_CONTENT};
+use super::display::{DImage, DPrim, DisplayList, Kind, NO_LAYER, PlotText, SpatialSnap, VIEWPORT_CONTENT};
 use super::draw::entity;
 #[cfg(not(target_arch = "wasm32"))]
 use super::pipeline::PARALLEL_CHUNK;
@@ -223,8 +223,46 @@ pub(crate) enum Clip<'a> {
     Outside(&'a clip::PolyClip),
 }
 
+impl Clip<'_> {
+    fn contains(&self, point: Vec2) -> bool {
+        match self {
+            Self::Rect(rect) => rect.contains(point),
+            Self::Poly(poly) => poly.contains(point),
+            Self::Outside(poly) => !poly.contains(point),
+        }
+    }
+
+    fn line_pieces(&self, line: &[Vec2]) -> Vec<Vec<Vec2>> {
+        match self {
+            Self::Rect(rect) => clip::clip_polyline(line, rect),
+            Self::Poly(poly) => poly.clip_polyline(line),
+            Self::Outside(poly) => poly.clip_polyline_outside(line),
+        }
+    }
+}
+
+fn clip_snaps(dst: &mut DisplayList, src: &DisplayList, clip: &Clip) {
+    for &snap in &src.spatial_snaps {
+        let [a, b] = snap.positions().map(|p| p.xy());
+        if let SpatialSnap::Segment { ends, range } = snap
+            && a != b
+        {
+            let dir = b - a;
+            let parameter = |p: Vec2| range[0] + (range[1] - range[0]) * ((p - a).dot(dir) / dir.dot(dir)).clamp(0.0, 1.0);
+            for piece in clip.line_pieces(&[a, b]) {
+                if let Some((first, last)) = piece.first().zip(piece.last()) {
+                    dst.spatial_snaps.push(SpatialSnap::Segment { ends, range: [parameter(*first), parameter(*last)] });
+                }
+            }
+        } else if clip.contains(a) {
+            dst.spatial_snaps.push(snap);
+        }
+    }
+}
+
 /// Append `src` to `dst`, clipped to `clip`.
 pub(crate) fn append_clipped(dst: &mut DisplayList, src: &DisplayList, clip: &Clip) {
+    clip_snaps(dst, src, clip);
     for p in &src.prims {
         clip_prim(dst, src, p, clip);
     }
@@ -233,6 +271,7 @@ pub(crate) fn append_clipped(dst: &mut DisplayList, src: &DisplayList, clip: &Cl
 /// Append `src` to `dst` clipped to `clip`, keeping each primitive's plot style pen and, for a
 /// glyph that the clip leaves whole, its plotted text (an XCLIP-clipped block reference).
 pub(crate) fn append_clipped_keep(dst: &mut DisplayList, src: &DisplayList, clip: &Clip) {
+    clip_snaps(dst, src, clip);
     let texts: std::collections::HashMap<usize, &PlotText> =
         src.texts.iter().filter(|t| t.prim != PlotText::NONE && t.prim != PlotText::CLIPPED).map(|t| (t.prim as usize, t)).collect();
     for (i, p) in src.prims.iter().enumerate() {
@@ -280,11 +319,7 @@ fn clip_prim(dst: &mut DisplayList, src: &DisplayList, p: &DPrim, clip: &Clip) {
         }
         return;
     }
-    let inside = |q: Vec2| match clip {
-        Clip::Rect(rect) => rect.contains(q),
-        Clip::Poly(poly) => poly.contains(q),
-        Clip::Outside(poly) => !poly.contains(q),
-    };
+    let inside = |q: Vec2| clip.contains(q);
     let line_height = |q: Vec2, a: Vec2, direction: Vec2, za: f64, dz: f64| {
         let den = direction.dot(direction);
         if den == 0.0 { za } else { za + (q - a).dot(direction) * dz / den }
@@ -378,11 +413,7 @@ fn clip_vertical_triangle(dst: &mut DisplayList, p: &DPrim, xy: &[Vec2], z: &[f6
     let low = xy.iter().copied().min_by(|a, b| axis(*a).total_cmp(&axis(*b))).unwrap_or(a);
     let high = xy.iter().copied().max_by(|a, b| axis(*a).total_cmp(&axis(*b))).unwrap_or(c);
     let line = [low, high];
-    let pieces = match clip {
-        Clip::Rect(rect) => clip::clip_polyline(&line, rect),
-        Clip::Poly(poly) => poly.clip_polyline(&line),
-        Clip::Outside(poly) => poly.clip_polyline_outside(&line),
-    };
+    let pieces = clip.line_pieces(&line);
     for piece in pieces {
         let Some((a, c)) = piece.first().zip(piece.last()) else { continue };
         let mut polygon = points.to_vec();
