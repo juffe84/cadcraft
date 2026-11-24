@@ -73,6 +73,9 @@ pub const REFUSED: &[(&str, &str)] = &[
 
 /// Commands that touch no file.
 pub const NO_FILES: &[&str] = &[
+    "tin",
+    "tin.contours",
+    "tin.volumes",
     "ucs",
     "ucs.3point",
     "ucs.origin",

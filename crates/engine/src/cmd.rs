@@ -48,6 +48,7 @@ mod selecttools;
 mod settings;
 mod spline_opts;
 mod table;
+mod terrain;
 mod tolerance;
 mod trimextend;
 mod txt2mtxt;
@@ -192,6 +193,7 @@ pub fn command_specs() -> &'static [CommandSpec] {
         v.extend(ucs::specs());
         v.extend(draw::specs());
         v.extend(draw2::specs());
+        v.extend(terrain::specs());
         v.extend(annotate::specs());
         v.extend(dimstyles::specs());
         v.extend(dimstyle_cli::specs());
