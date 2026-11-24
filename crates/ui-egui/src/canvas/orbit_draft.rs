@@ -80,8 +80,13 @@ pub(super) fn draw(
     }
     let (steps, hover, shift) = painter.ctx().input(|input| (press::steps(&input.events), input.pointer.hover_pos(), input.modifiers.shift));
     let bar = app.cmd.ime_rect.map(|(bar, _)| bar).filter(|_| app.ui.show_command_line);
-    let on_canvas =
-        |at: Pos2| frame.rect.contains(at) && bar.is_none_or(|bar| !bar.contains(at)) && painter.ctx().layer_id_at(at) == Some(response.layer_id);
+    let orbit_button = app.canvas.orbit_button;
+    let on_canvas = |at: Pos2| {
+        frame.rect.contains(at)
+            && bar.is_none_or(|bar| !bar.contains(at))
+            && orbit_button.is_none_or(|button| !button.contains(at))
+            && painter.ctx().layer_id_at(at) == Some(response.layer_id)
+    };
     for step in steps {
         if let press::Step::Down(at, mods) = step
             && on_canvas(at)
@@ -110,7 +115,7 @@ pub(super) fn draw(
             painter.ctx().request_repaint();
         }
     }
-    if response.secondary_clicked() && app.session.prompting() {
+    if response.secondary_clicked() && response.interact_pointer_pos().is_some_and(on_canvas) && app.session.prompting() {
         crate::cmdline::submit(app);
         painter.ctx().request_repaint();
     }

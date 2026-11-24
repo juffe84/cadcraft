@@ -125,6 +125,7 @@ pub struct CanvasState {
     pub gpu_device: Option<egui_wgpu::wgpu::Device>,
     cloud_orbit_focus: Option<point_cloud::OrbitFocus>,
     orbit_scene: orbit_scene::Scene,
+    orbit_button: Option<Rect>,
     pub(crate) orbit_cursor: Option<orbit_draft::DraftPoint>,
     pub(crate) draft_cursor: Option<cadcraft_geom::Vec3>,
     pub(crate) orbit_keyboard_focus: bool,
@@ -220,6 +221,10 @@ pub struct CanvasState {
 type CycleKey = (Option<String>, Option<String>, u64, u64, Vec2, f64);
 
 impl CanvasState {
+    fn over_orbit_button(&self, at: Pos2) -> bool {
+        self.orbit_button.is_some_and(|rect| rect.contains(at))
+    }
+
     /// The active MSPACE viewport's contents when they are drawn apart from the layout's list
     /// (see [`VpContent`]): where they are on paper at the viewport's current view, and how many
     /// times they have been built.
@@ -287,7 +292,9 @@ struct Navigation<'a> {
 
 fn navigate_canvas(app: &mut CadApp, ui: &mut egui::Ui, nav: &Navigation<'_>) -> Option<(bool, bool)> {
     let p = nav.pointer;
-    let inside = p.hover_pos.is_some_and(|at| nav.rect.contains(at) && ui.ctx().layer_id_at(at) == Some(ui.layer_id()) && nav.response.hovered());
+    let inside = p.hover_pos.is_some_and(|at| {
+        nav.rect.contains(at) && !app.canvas.over_orbit_button(at) && ui.ctx().layer_id_at(at) == Some(ui.layer_id()) && nav.response.hovered()
+    });
     let on_menu = p.hover_pos.is_some_and(|at| over_canvas_menu(app, at));
     app.session.ctrl_down = p.mods.ctrl;
     ui.input(|i| {
@@ -313,6 +320,7 @@ fn navigate_canvas(app: &mut CadApp, ui: &mut egui::Ui, nav: &Navigation<'_>) ->
     if p.pressed_primary
         && let Some(at) = p.hover_pos
         && !nav.rect.contains(at)
+        && !app.canvas.over_orbit_button(at)
         && let Some(i) = nav.tiles.iter().position(|(r, _)| r.contains(at))
     {
         if let Err(e) = app.session.click_tile(i) {
@@ -753,7 +761,7 @@ fn handle_presses(app: &mut CadApp, ui: &egui::Ui, context: &PressContext) -> bo
         match step {
             press::Step::Down(pos, m) => {
                 app.canvas.press = None;
-                if !inside || !rect.contains(pos) || middle_down {
+                if !inside || !rect.contains(pos) || app.canvas.over_orbit_button(pos) || middle_down {
                     continue;
                 }
                 // A press on the Dynamic Input options menu is the menu's (picked on release);
@@ -835,16 +843,19 @@ pub(crate) fn right_click_cancels_placing(app: &CadApp) -> bool {
 /// visible (#1701), and so do the menus painted on the canvas itself (see [`over_canvas_menu`]).
 pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     let t = Tokens::get();
-    if app.session.state().is_ok_and(|state| state.space == cadcraft_doc::Space::Model && state.doc.point_cloud.is_some()) {
-        point_cloud::controls(app, ui);
+    let model = app.session.state().is_ok_and(|state| state.space == cadcraft_doc::Space::Model && state.block_editor().is_none());
+    app.canvas.orbit_button = if model { point_cloud::orbit_button_rect(ui.available_rect_before_wrap()) } else { None };
+    if model {
+        point_cloud::navigation_bar(app, ui);
     }
-    if app.session.state().is_ok_and(|state| state.space == cadcraft_doc::Space::Model && state.block_editor().is_none() && state.orbit.is_some()) {
+    if model && app.session.state().is_ok_and(|state| state.orbit.is_some()) {
         let full = ui.available_rect_before_wrap();
         point_cloud::orbit(app, ui);
         crate::cmdline::keyboard(app, ui.ctx());
         if app.ui.show_command_line {
             crate::cmdline::show(app, ui, full);
         }
+        point_cloud::show_orbit_button(app, ui);
         return;
     }
     app.canvas.cloud_orbit_focus = None;
@@ -1032,6 +1043,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         hover_pos,
         raw_world,
     });
+    point_cloud::show_orbit_button(app, ui);
 }
 
 /// Put the cursor at `raw` (world, `None` off the canvas): snaps, ortho and polar, a locked

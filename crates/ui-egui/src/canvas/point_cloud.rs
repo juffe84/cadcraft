@@ -8,14 +8,51 @@ use egui::{Key, PointerButton, Sense};
 use serde_json::json;
 use std::sync::{Arc, Weak};
 
-pub(super) fn controls(app: &mut CadApp, ui: &mut egui::Ui) {
+pub(super) fn navigation_bar(app: &mut CadApp, ui: &mut egui::Ui) {
+    let orbit = app.session.state().ok().and_then(|state| state.orbit);
+    let has_cloud = cloud(app).is_some();
+    if !has_cloud && orbit.is_none() {
+        return;
+    }
+    let mut content = ui.available_rect_before_wrap();
+    if let Some(toggle) = app.canvas.orbit_button {
+        content.max.x = (toggle.left() - 8.0).max(content.left());
+    }
+    ui.scope_builder(egui::UiBuilder::new().max_rect(content), |ui| {
+        if has_cloud {
+            controls(app, ui);
+        }
+        if let Some(orbit) = orbit {
+            orbit_controls(app, ui, orbit);
+        }
+    });
+}
+
+pub(super) fn orbit_button_rect(workspace: Rect) -> Option<Rect> {
+    let size = vec2(28.0, 28.0);
+    let rect = Rect::from_min_size(workspace.right_top() + vec2(-size.x - 8.0, 8.0), size);
+    workspace.contains_rect(rect).then_some(rect)
+}
+
+pub(super) fn show_orbit_button(app: &mut CadApp, ui: &mut egui::Ui) {
+    let Some(rect) = app.canvas.orbit_button else { return };
+    let active = app.session.state().is_ok_and(|state| state.orbit.is_some());
+    ui.painter().rect_filled(rect, 3.0, Tokens::get().panel);
+    let mut child = ui.new_child(egui::UiBuilder::new().id_salt("orbit_button").max_rect(rect).layout(egui::Layout::top_down(egui::Align::Min)));
+    let button = crate::icons::button(&mut child, crate::icons::Icon::Orbit, rect.width(), "3D Orbit", active);
+    if button.clicked() {
+        let _ = app.run("3dorbit", json!({ "enabled": !active }));
+    }
+}
+
+fn controls(app: &mut CadApp, ui: &mut egui::Ui) {
     let orbit = app.session.state().is_ok_and(|state| state.orbit.is_some());
     let streaming = cloud(app).is_some_and(|cloud| cloud.detail.is_some());
     let status = cloud(app).map(|cloud| view(cloud, cloud.bounds(), app, false)).unwrap_or_default();
     if status.pending {
         ui.ctx().request_repaint_after(std::time::Duration::from_millis(125));
     }
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         let mut size = app.session.settings.point_cloud_size;
         let mut snap = app.session.settings.point_cloud_snap;
         if ui.add(egui::Slider::new(&mut size, 1.0..=12.0).step_by(0.5).text(crate::i18n::t("Point size"))).changed() {
@@ -23,9 +60,6 @@ pub(super) fn controls(app: &mut CadApp, ui: &mut egui::Ui) {
         }
         if ui.checkbox(&mut snap, crate::i18n::t("Snap to cloud points")).changed() {
             let _ = app.run("pointcloud.settings", json!({ "snap": snap }));
-        }
-        if ui.selectable_label(orbit, crate::i18n::t("3D Orbit")).clicked() {
-            let _ = app.run("3dorbit", json!({ "enabled": !orbit }));
         }
         if streaming {
             ui.menu_button(crate::i18n::t("Detail loading"), |ui| {
@@ -497,11 +531,6 @@ fn orbit_controls(app: &mut CadApp, ui: &mut egui::Ui, orbit: OrbitView) {
         if toggle.changed() {
             let _ = app.run("3dorbit", json!({ "wireframe": wireframe }));
         }
-        let exit = ui.button(crate::i18n::t("Exit Orbit"));
-        crate::control::record_widget(ui, &exit, "Exit Orbit", "button", None);
-        if exit.clicked() {
-            let _ = app.run("3dorbit", json!({ "enabled": false }));
-        }
     });
 }
 
@@ -542,9 +571,6 @@ fn pick_target(
 pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     app.canvas.orbit_keyboard_focus = false;
     let Ok(state) = app.session.state() else { return };
-    let Some(orbit) = state.orbit else { return };
-    orbit_controls(app, ui, orbit);
-    let Ok(state) = app.session.state() else { return };
     let Some(mut orbit) = state.orbit else { return };
     let plan = state.view();
     let document = state.uid;
@@ -578,7 +604,7 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     let focused = response.has_focus();
     let lost_focus = response.lost_focus();
     app.canvas.orbit_keyboard_focus = focused;
-    let hovered = response.hovered();
+    let hovered = response.hovered() && !response.hover_pos().is_some_and(|at| app.canvas.over_orbit_button(at));
     let (arrows, keyboard_pan, scroll, escape, fit, press, pointer) = ui.input(|input| {
         let key = |k| f32::from(focused && input.key_pressed(k));
         let arrows = vec2(key(Key::ArrowRight) - key(Key::ArrowLeft), key(Key::ArrowDown) - key(Key::ArrowUp));
@@ -631,7 +657,7 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     let mut updated = false;
     let mut hint = None;
     if press
-        && let Some(cursor) = pointer.filter(|p| rect.contains(*p))
+        && let Some(cursor) = pointer.filter(|p| rect.contains(*p) && !app.canvas.over_orbit_button(*p))
         && let Some(pivot) = pick_target(app, root.as_ref(), model.as_ref(), &frame, cursor, 8.0)
     {
         // Changing the pivot must leave the picked point at the same pixel.
@@ -935,7 +961,11 @@ mod tests {
             },
             app,
         );
-        harness.get_by_label("Orbit").click();
+        let toggle = harness.get_by_label("3D Orbit");
+        let plan = harness.state().canvas.rect.unwrap();
+        assert!(toggle.rect().top() <= plan.top() + 9.0 && (toggle.rect().right() + 8.0 - plan.right()).abs() < 1.0);
+        let toggle_position = toggle.rect().min;
+        toggle.click();
         harness.run();
         let before = harness.state().session.state().unwrap().orbit.unwrap();
         let at = harness.get_by_label("Model 3D view").rect().center() - vec2(70.0, 60.0);
@@ -947,7 +977,17 @@ mod tests {
         }
         let after = harness.state().session.state().unwrap().orbit.unwrap();
         assert_ne!(before.yaw, after.yaw);
+        let orbit_toggle = harness.get_by_label("3D Orbit");
+        let button = orbit_toggle.rect();
+        let canvas = harness.get_by_label("Model 3D view").rect();
+        assert!((button.min - toggle_position).length() < 1.0 && (button.right() + 8.0 - canvas.right()).abs() < 1.0);
+        orbit_toggle.click();
+        harness.run();
+        assert!(harness.state().session.state().unwrap().orbit.is_none());
+        harness.get_by_label("Orbit").click();
+        harness.run();
         let session = &mut harness.state_mut().session;
+        assert!(session.state().unwrap().orbit.is_some());
         session.cmdline("@0,0,3").unwrap();
         session.cmdline("'3dorbit").unwrap();
         assert!(session.state().unwrap().orbit.is_none());
