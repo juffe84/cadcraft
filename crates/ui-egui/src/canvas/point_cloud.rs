@@ -5,7 +5,7 @@ use cadcraft_doc::Space;
 use cadcraft_doc::point_cloud::{CloudPoint, CloudRegion, CloudView, PointCloud};
 use cadcraft_engine::OrbitView;
 use cadcraft_geom::{Bounds2, Vec3};
-use egui::{Key, PointerButton, Sense};
+use egui::{Key, PointerButton, Pos2, Sense};
 use serde_json::json;
 use std::sync::{Arc, Weak};
 
@@ -16,7 +16,7 @@ pub(super) fn navigation_bar(app: &mut CadApp, ui: &mut egui::Ui) {
         return;
     }
     let mut content = ui.available_rect_before_wrap();
-    if let Some(toggle) = app.canvas.orbit_button {
+    if let Some(toggle) = app.canvas.terrain_display_button.or(app.canvas.orbit_button) {
         content.max.x = (toggle.left() - 8.0).max(content.left());
     }
     ui.scope_builder(egui::UiBuilder::new().max_rect(content), |ui| {
@@ -35,7 +35,8 @@ pub(super) fn orbit_button_rect(workspace: Rect) -> Option<Rect> {
     workspace.contains_rect(rect).then_some(rect)
 }
 
-pub(super) fn show_orbit_button(app: &mut CadApp, ui: &mut egui::Ui) {
+pub(super) fn show_viewport_tools(app: &mut CadApp, ui: &mut egui::Ui) {
+    crate::terrain_display::viewport_button(app, ui, app.canvas.terrain_display_button);
     let Some(rect) = app.canvas.orbit_button else { return };
     let active = app.session.state().is_ok_and(|state| state.orbit.is_some());
     ui.painter().rect_filled(rect, 3.0, Tokens::get().panel);
@@ -680,7 +681,7 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     let focused = response.has_focus();
     let lost_focus = response.lost_focus();
     app.canvas.orbit_view_id = Some(response.id);
-    let hovered = response.hovered() && !response.hover_pos().is_some_and(|at| app.canvas.over_orbit_button(at));
+    let hovered = response.hovered() && !response.hover_pos().is_some_and(|at| app.canvas.over_viewport_tools(at));
     let (arrows, keyboard_pan, scroll, escape, fit, press, pointer) = ui.input(|input| {
         let key = |k| f32::from(focused && input.key_pressed(k));
         let arrows = vec2(key(Key::ArrowRight) - key(Key::ArrowLeft), key(Key::ArrowDown) - key(Key::ArrowUp));
@@ -696,7 +697,9 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     });
     if escape {
         ui.input_mut(|i| i.consume_key(egui::Modifiers::NONE, Key::Escape));
-        if app.session.prompting() || !app.session.selection().is_empty() || super::cloud_selection::active(app) {
+        if crate::surface_editor::cancel_source_pick(app) {
+            response.request_focus();
+        } else if app.session.prompting() || !app.session.selection().is_empty() || super::cloud_selection::active(app) {
             crate::cmdline::escape(app);
             response.request_focus();
         } else {
@@ -734,7 +737,7 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     let mut updated = false;
     let mut hint = None;
     if press
-        && let Some(cursor) = pointer.filter(|p| rect.contains(*p) && !app.canvas.over_orbit_button(*p))
+        && let Some(cursor) = pointer.filter(|p| rect.contains(*p) && !app.canvas.over_viewport_tools(*p))
         && let Some(pivot) = pick_target(app, root.as_ref(), model.as_ref(), &frame, cursor, 8.0)
     {
         // Changing the pivot must leave the picked point at the same pixel.
@@ -813,8 +816,17 @@ pub(super) fn orbit(app: &mut CadApp, ui: &mut egui::Ui) {
     if let Some(model) = &model {
         model.paint(&painter, &frame, crate::orbit_gpu::available(app.canvas.gpu));
     }
-    super::orbit_draft::draw(app, &painter, &frame, &response, model.as_ref(), shown, dragging || cloud_select);
+    let source_pick = super::terrain_source::orbit(app, &response, &frame, model.as_ref(), shown, dragging, &painter);
+    super::orbit_draft::draw(app, &painter, &frame, &response, model.as_ref(), shown, source_pick || dragging || cloud_select);
+    crate::road_design::paint_preview(app, &painter, |p| project_source(&frame, p).map(|(pos, _)| pos));
+    crate::surface_editor::paint_sources(app, &painter, |p| project_source(&frame, p).map(|(pos, _)| pos));
     super::cloud_selection::draw(app, &painter, &response, rect);
+}
+
+pub(super) fn project_source(frame: &OrbitFrame, point: Vec3) -> Option<(Pos2, f64)> {
+    let (position, depth) = frame.project(point);
+    let weight = frame.camera.weight(depth);
+    (weight > 0.01 && position.x.is_finite() && position.y.is_finite()).then_some((position, weight))
 }
 
 fn paint_cloud_in_orbit(app: &CadApp, painter: &egui::Painter, frame: &OrbitFrame, root: &Arc<PointCloud>, snapshot: &CloudView, moving: bool) {

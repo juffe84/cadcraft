@@ -60,7 +60,7 @@ pub fn dyn_frame(app: &CadApp) -> Option<crate::dyninput::Frame> {
     let spatial = app.session.spatial_draft_reference();
     let ucs = if spatial.is_some() { app.session.spatial_draft_ucs() } else { app.session.input_ucs() };
     let xyz = spatial.is_some()
-        && (app.session.running.as_ref().is_some_and(|r| r.id == "3dpoly")
+        && (app.session.running.as_ref().is_some_and(|r| matches!(r.id.as_str(), "3dpoly" | crate::surface_editor::DRAW_SOURCE))
             || app.session.state().is_ok_and(|state| state.orbit.is_some())
             || (p.base.is_some() && spatial.is_some_and(|base| ucs.to_ucs3(base).z.abs() > 1e-9)));
     // The spatial fields show the actual XYZ of the next vertex. Explicit @
@@ -303,7 +303,7 @@ fn enable_ime(app: &mut CadApp, ctx: &egui::Context) {
 
 /// Handle keyboard input destined for the command line (when no text field has focus).
 pub fn keyboard(app: &mut CadApp, ctx: &egui::Context) {
-    if ctx.egui_wants_keyboard_input() && !app.canvas.drawing_has_focus(ctx) {
+    if crate::terrain_display::viewport_popup_open(ctx) || ctx.egui_wants_keyboard_input() && !app.canvas.drawing_has_focus(ctx) {
         app.cmd.preedit.clear();
         app.cmd.ime_on = false;
         return;
@@ -432,6 +432,7 @@ pub fn escape(app: &mut CadApp) {
     app.cmd.buffer.clear();
     app.cmd.preedit.clear();
     app.canvas.cloud_rectangle = None;
+    crate::surface_editor::cancel_source_pick(app);
     app.session.cancel();
 }
 

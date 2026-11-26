@@ -50,6 +50,17 @@ pub fn io() -> Option<&'static IoHooks> {
     IO.get()
 }
 
+type SurveyLandXmlWriter = fn(&Drawing) -> std::result::Result<Vec<u8>, String>;
+static SURVEY_LANDXML_WRITER: OnceLock<SurveyLandXmlWriter> = OnceLock::new();
+
+pub fn set_survey_landxml_writer(writer: SurveyLandXmlWriter) {
+    let _ = SURVEY_LANDXML_WRITER.set(writer);
+}
+
+pub(super) fn survey_landxml_writer() -> Option<SurveyLandXmlWriter> {
+    SURVEY_LANDXML_WRITER.get().copied()
+}
+
 /// A streaming point-cloud reader, installed by native hosts.
 #[cfg(not(target_arch = "wasm32"))]
 type PointCloudReader = fn(std::io::BufReader<std::fs::File>, u16, Option<OverviewProgress<'_>>) -> std::result::Result<Drawing, String>;

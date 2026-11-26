@@ -104,6 +104,11 @@ fn entity_parts(b: &mut Builder, ctx: &Ctx, e: &Entity) {
         elevation = ctx.at_height(super::spatial::elevation(&e.kind));
         &elevation
     } else {
+        // Conflict flags have filled cloth even in plan. Use the same mesh faces as orbit.
+        if e.common.layer.eq_ignore_ascii_case(cadcraft_doc::TIN_CONFLICT_LAYER) && matches!(e.kind, EntityKind::PolyfaceMesh(_)) {
+            super::spatial::draw(b, ctx, e, rgb, lw, tol);
+            return;
+        }
         ctx
     };
     // Stroke a polyline with the entity's linetype.

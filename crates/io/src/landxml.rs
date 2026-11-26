@@ -1,8 +1,11 @@
-//! Read the explicit TIN triangles of a LandXML or Inframodel surface.
+//! Read LandXML 1.2 surfaces and alignments, and write TIN surfaces.
+mod alignment;
+mod write;
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
 };
+pub(crate) use write::{write, write_survey};
 
 use cadcraft_doc::{Common, Drawing, EntityKind, Face3d, Group, Space};
 use cadcraft_geom::Vec3;
@@ -23,6 +26,7 @@ enum Tag {
     Metric,
     Imperial,
     Surfaces,
+    Alignments,
     Surface,
     Definition,
     Points,
@@ -53,6 +57,7 @@ pub(crate) fn read(bytes: &[u8]) -> Result<Drawing> {
     let mut names = HashSet::new();
     let mut root_seen = false;
     let mut records = 0;
+    let mut alignment_samples = MAX_RECORDS;
     let mut skipped_surfaces = 0;
     loop {
         match reader.read_event().map_err(error)? {
@@ -72,6 +77,11 @@ pub(crate) fn read(bytes: &[u8]) -> Result<Drawing> {
                     "Metric" => Metric,
                     "Imperial" => Imperial,
                     "Surfaces" => Surfaces,
+                    "Alignments" => Alignments,
+                    "Alignment" if path.as_slice() == [LandXml, Alignments] => {
+                        alignment::read(&mut reader, &start, &mut records)?.add_to(&mut drawing, &mut names, &mut alignment_samples)?;
+                        continue;
+                    }
                     "Surface" => Surface,
                     "Definition" => Definition,
                     "Pnts" => Points,
@@ -83,7 +93,7 @@ pub(crate) fn read(bytes: &[u8]) -> Result<Drawing> {
                         {
                             records += 1;
                             if records > MAX_RECORDS {
-                                return Err(error("more than 2,000,000 TIN point and face records"));
+                                return Err(error("more than 2,000,000 geometry records"));
                             }
                             let content = reader.read_text(start.name()).map_err(error)?;
                             let raw = content.xml_content(XmlVersion::Implicit1_0);
@@ -130,8 +140,9 @@ pub(crate) fn read(bytes: &[u8]) -> Result<Drawing> {
     if !path.is_empty() || !root_seen {
         return Err(error("incomplete LandXML document"));
     }
-    if drawing.groups.is_empty() {
-        return Err(error("no surfaces with visible TIN triangles were found"));
+    if drawing.groups.is_empty() && drawing.layouts.iter().all(|layout| layout.entities.is_empty()) {
+        let details = drawing.read_notes.first().map_or(String::new(), |note| format!(". {note}"));
+        return Err(error(format!("no supported TIN surfaces or alignment geometry were found{details}")));
     }
     if skipped_surfaces > 0 {
         drawing.read_notes.push(format!("LandXML: {skipped_surfaces} surfaces had no supported visible TIN triangles."));
@@ -157,7 +168,7 @@ impl Surface {
         if self.faces.is_empty() {
             return Ok(false);
         }
-        let name = group_name(&self.name, names);
+        let name = group_name(&self.name, "LandXML Surface", names);
         let mut members = Vec::with_capacity(self.faces.len());
         let point = |id: u64| self.points.get(&id).copied().ok_or_else(|| error(format!("surface {name}: face references missing point {id}")));
         for [a, b, c] in self.faces {
@@ -170,7 +181,7 @@ impl Surface {
     }
 }
 
-fn group_name(name: &str, names: &mut HashSet<String>) -> String {
+fn group_name(name: &str, fallback: &str, names: &mut HashSet<String>) -> String {
     let mut base = String::new();
     for ch in name.trim().chars() {
         let ch = if ch.is_control() || "<>/\\\":;?*|,=`".contains(ch) { '_' } else { ch };
@@ -181,7 +192,7 @@ fn group_name(name: &str, names: &mut HashSet<String>) -> String {
         base.push(ch);
     }
     if base.trim().is_empty() {
-        base = "LandXML Surface".into();
+        base = fallback.into();
     }
     let mut name = base.trim_end().to_string();
     let mut suffix = names.len() + 1;
@@ -211,6 +222,21 @@ fn set_units(drawing: &mut Drawing, start: &BytesStart<'_>, metric: bool) -> Res
     drawing.header.set_i64("MEASUREMENT", i64::from(metric));
     drawing.header.set_i64("INSUNITS", code);
     Ok(())
+}
+
+fn metres_per_unit(unit: &str) -> Option<f64> {
+    Some(match unit {
+        "millimeter" => 0.001,
+        "centimeter" => 0.01,
+        "meter" => 1.0,
+        "kilometer" => 1000.0,
+        "inch" => 0.0254,
+        "foot" => 0.3048,
+        "yard" => 0.9144,
+        "mile" => 1609.344,
+        "USSurveyFoot" => 1200.0 / 3937.0,
+        _ => return None,
+    })
 }
 
 fn triple<T: std::str::FromStr>(text: &str, description: &str) -> Result<[T; 3]> {
@@ -291,5 +317,38 @@ mod tests {
         let first_face = &drawing.model.get(first.members[0]).unwrap().kind;
         let second_face = &drawing.model.get(second.members[0]).unwrap().kind;
         assert_ne!(first_face, second_face);
+    }
+
+    #[test]
+    fn writes_current_faces_with_xyz_source_breaklines_and_spot_heights() {
+        let mut drawing = crate::read(MESH.as_bytes(), "site.xml").unwrap();
+        drawing.groups[0].description = format!("{}A", cadcraft_doc::LINKED_TIN_PREFIX);
+        let line = drawing
+            .add(
+                &Space::Model,
+                Common { visible: false, ..Common::default() },
+                EntityKind::Line(cadcraft_doc::Line { a: Vec3::new(450000.0, 7000000.0, 4.0), b: Vec3::new(450010.0, 7000000.0, 5.0) }),
+            )
+            .unwrap();
+        let spot = drawing
+            .add(&Space::Model, Common::default(), EntityKind::Point(cadcraft_doc::Point { p: Vec3::new(450000.0, 7000010.0, 6.0), angle: 0.0 }))
+            .unwrap();
+        drawing.groups.push(Group {
+            name: "*A1".into(),
+            description: format!("{}A", cadcraft_doc::terrain::SOURCE_PREFIX),
+            selectable: false,
+            members: vec![line, spot],
+        });
+        let file = crate::write(&drawing, "site.landxml").unwrap();
+        let text = std::str::from_utf8(&file).unwrap();
+        assert!(text.contains("version=\"1.2\""));
+        assert!(text.contains("<Breakline ") && text.contains("<PntList3D>7000000 450000 4 7000000 450010 5</PntList3D>"));
+        assert!(text.contains("<DataPoints><PntList3D>7000010 450000 6</PntList3D></DataPoints>"));
+        let reopened = crate::read(&file, "site.xml").unwrap();
+        let [surface] = reopened.groups.as_slice() else { panic!("expected one terrain group") };
+        assert_eq!(surface.name, drawing.groups[0].name);
+        assert_eq!(reopened.header.i64("INSUNITS", 0), 6);
+        assert_eq!(surface.members.len(), 1);
+        assert_eq!(reopened.model.get(surface.members[0]).unwrap().kind, drawing.model.get(drawing.groups[0].members[0]).unwrap().kind);
     }
 }

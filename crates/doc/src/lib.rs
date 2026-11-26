@@ -19,8 +19,10 @@ mod plotter;
 pub mod point_cloud;
 mod raster;
 mod refedit;
+pub mod road;
 mod store;
 mod tables;
+pub mod terrain;
 mod xclip;
 
 use std::collections::{BTreeMap, BTreeSet};

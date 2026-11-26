@@ -25,29 +25,7 @@ pub fn signed_area2(triangle: Triangle) -> f64 {
 /// had no surface stay empty, even if they lie on the retained side.
 pub fn clip_surface(triangles: &[Triangle], outline: &[Vec2], keep_inside: bool, limit: usize) -> Result<Vec<(usize, Triangle)>, &'static str> {
     validate_outline(outline)?;
-    let mut input = Inputs::default();
-    let mut indices = HashMap::with_capacity(triangles.len());
-    for (i, &triangle) in triangles.iter().enumerate() {
-        if signed_area2(triangle) == 0.0 || indices.insert(triangle_key(triangle), i).is_some() {
-            return Err("The terrain contains a degenerate or duplicate triangle.");
-        }
-        input.path(&triangle, true)?;
-    }
-    let mut crossing = false;
-    let original = ConstrainedDelaunayTriangulation::<Sample>::try_bulk_load_cdt(input.vertices, input.edges.into_iter().collect(), |_| {
-        crossing = true;
-    })
-    .map_err(|_| "Could not index the terrain triangles.")?;
-    let mut source = HashMap::with_capacity(indices.len());
-    for face in original.inner_faces() {
-        let k = triangle_key(face.vertices().map(|v| v.data().0));
-        if let Some(&index) = indices.get(&k) {
-            source.insert(face.fix(), index);
-        }
-    }
-    if crossing || source.len() != triangles.len() {
-        return Err("The terrain has overlapping faces or vertices that split another face's edge.");
-    }
+    let (original, source) = index_surface(triangles)?;
     let height = original.barycentric();
     let on_surface = |p: Point2<f64>| {
         let z = height.interpolate(|v| v.data().0.z, p).unwrap_or_else(|| {
@@ -86,22 +64,12 @@ pub fn clip_surface(triangles: &[Triangle], outline: &[Vec2], keep_inside: bool,
         if signed_area2(t) == 0.0 {
             continue;
         }
-        let [a, b, c] = t;
-        let center = a.xy() + ((b - a).xy() + (c - a).xy()) * (1.0 / 3.0);
+        let center = centroid(t);
         if (bounds.contains(center) && point_in_polygon(outline, center)) != keep_inside {
             continue;
         }
-        if let PositionInTriangulation::OnFace(location) = original.locate(Point2::new(center.x, center.y))
-            && let Some(&index) = source.get(&location)
-        {
-            // Preserve the existing corners and winding on unchanged triangles.
-            let output = if triangle_key(t) == triangle_key(triangles[index]) {
-                triangles[index]
-            } else if signed_area2(t).signum() == signed_area2(triangles[index]).signum() {
-                t
-            } else {
-                [a, c, b]
-            };
+        if let Some(index) = source_face(&original, &source, t) {
+            let output = match_winding(t, triangles[index]);
             kept_area[index] += signed_area2(output).abs();
             result.push((index, output));
             if result.len() > limit {
@@ -127,6 +95,170 @@ pub fn clip_surface(triangles: &[Triangle], outline: &[Vec2], keep_inside: bool,
     result.retain(|(i, _)| !unchanged[*i]);
     result.extend(triangles.iter().copied().enumerate().filter(|(i, _)| unchanged[*i]));
     Ok(result)
+}
+
+type Mesh = ConstrainedDelaunayTriangulation<Sample>;
+type SourceFaces = HashMap<spade::handles::FixedFaceHandle<spade::handles::InnerTag>, usize>;
+
+fn index_surface(triangles: &[Triangle]) -> Result<(Mesh, SourceFaces), &'static str> {
+    let mut input = Inputs::default();
+    let mut indices = HashMap::with_capacity(triangles.len());
+    for (i, &triangle) in triangles.iter().enumerate() {
+        if signed_area2(triangle) == 0.0 || indices.insert(triangle_key(triangle), i).is_some() {
+            return Err("The terrain contains a degenerate or duplicate triangle.");
+        }
+        input.path(&triangle, true)?;
+    }
+    let mut crossing = false;
+    let original = ConstrainedDelaunayTriangulation::<Sample>::try_bulk_load_cdt(input.vertices, input.edges.into_iter().collect(), |_| {
+        crossing = true;
+    })
+    .map_err(|_| "Could not index the terrain triangles.")?;
+    let mut source = HashMap::with_capacity(indices.len());
+    for face in original.inner_faces() {
+        let k = triangle_key(face.vertices().map(|v| v.data().0));
+        if let Some(&index) = indices.get(&k) {
+            source.insert(face.fix(), index);
+        }
+    }
+    if crossing || source.len() != triangles.len() {
+        return Err("The terrain has overlapping faces or vertices that split another face's edge.");
+    }
+    Ok((original, source))
+}
+
+fn centroid([a, b, c]: Triangle) -> Vec2 {
+    a.xy() + ((b - a).xy() + (c - a).xy()) * (1.0 / 3.0)
+}
+
+fn source_face(mesh: &Mesh, source: &SourceFaces, t: Triangle) -> Option<usize> {
+    let center = centroid(t);
+    match mesh.locate(Point2::new(center.x, center.y)) {
+        PositionInTriangulation::OnFace(face) => source.get(&face).copied(),
+        _ => None,
+    }
+}
+
+fn match_winding(t: Triangle, original: Triangle) -> Triangle {
+    if triangle_key(t) == triangle_key(original) {
+        original
+    } else if signed_area2(t).signum() == signed_area2(original).signum() {
+        t
+    } else {
+        [t[0], t[2], t[1]]
+    }
+}
+
+/// Replace a diagonal between two faces of a convex quadrilateral.
+pub fn swap_diagonal(first: Triangle, second: Triangle) -> Result<[Triangle; 2], &'static str> {
+    let shared: Vec<_> = first.into_iter().filter(|p| second.contains(p)).collect();
+    let [a, b] = shared.as_slice() else { return Err("The faces must share exactly one edge with matching elevations.") };
+    let c = first.into_iter().find(|p| !shared.contains(p)).ok_or("The first face is degenerate.")?;
+    let d = second.into_iter().find(|p| !shared.contains(p)).ok_or("The second face is degenerate.")?;
+    let opposite = |u, v, p, q| {
+        let p = signed_area2([u, v, p]);
+        let q = signed_area2([u, v, q]);
+        p.is_finite() && q.is_finite() && p != 0.0 && q != 0.0 && p.is_sign_positive() != q.is_sign_positive()
+    };
+    if !opposite(*a, *b, c, d) || !opposite(c, d, *a, *b) {
+        return Err("The shared edge can be swapped only across a convex pair of triangles.");
+    }
+    Ok([match_winding([c, d, *a], first), match_winding([d, c, *b], second)])
+}
+
+/// Imprint a 3D line into the existing triangles, keeping the original footprint.
+/// Insertions split crossed edges, and vertices on the line take its design height.
+pub fn imprint_breakline(triangles: &[Triangle], line: &[Vec3], limit: usize) -> Result<Vec<(usize, Triangle)>, &'static str> {
+    validate_breakline(line)?;
+    let (original, source) = index_surface(triangles)?;
+    let mut mesh = original.clone();
+    let mut path = Vec::with_capacity(line.len());
+    for &vertex in line {
+        let xy = Point2::new(vertex.x, vertex.y);
+        let id = match mesh.locate(xy) {
+            PositionInTriangulation::OnVertex(id) => id,
+            _ => mesh.insert(Sample(vertex)).map_err(|_| "Could not insert a breakline vertex.")?,
+        };
+        path.push(id);
+    }
+    for (segment, vertices) in line.windows(2).zip(path.windows(2)) {
+        let (a, b) = (segment[0], segment[1]);
+        let (start, end) = (vertices[0], vertices[1]);
+        let direction = (b - a).xy();
+        let height = |p: Point2<f64>| {
+            let station = ((Vec2::new(p.x, p.y) - a.xy()).dot(direction) / direction.len2()).clamp(0.0, 1.0);
+            if station == 0.0 {
+                a.z
+            } else if station == 1.0 {
+                b.z
+            } else {
+                a.z + station * (b.z - a.z)
+            }
+        };
+        let edges = mesh.add_constraint_and_split(start, end, |p| Sample(Vec3::new(p.x, p.y, height(p))));
+        if edges.is_empty() || mesh.num_vertices() > limit * 2 {
+            return Err("Could not form the breakline within the editable terrain vertex limit.");
+        }
+        for handle in edges {
+            let edge = mesh.directed_edge(handle);
+            let belongs = [edge, edge.rev()]
+                .into_iter()
+                .filter_map(|e| e.face().as_inner())
+                .any(|f| source_face(&original, &source, f.vertices().map(|v| v.data().0)).is_some());
+            if !belongs {
+                return Err("The breakline crosses an area without terrain. Keep the entire line on the surface.");
+            }
+            let vertices = edge.vertices().map(|v| (v.fix(), v.position()));
+            for (id, p) in vertices {
+                mesh.vertex_data_mut(id).0.z = if id == start {
+                    a.z
+                } else if id == end {
+                    b.z
+                } else {
+                    height(p)
+                };
+            }
+        }
+    }
+    let mut result = Vec::new();
+    for face in mesh.inner_faces() {
+        let t = face.vertices().map(|v| v.data().0);
+        if signed_area2(t) != 0.0
+            && let Some(i) = source_face(&original, &source, t)
+        {
+            result.push((i, match_winding(t, triangles[i])));
+            if result.len() > limit {
+                return Err("The breakline would exceed the editable terrain triangle limit.");
+            }
+        }
+    }
+    Ok(result)
+}
+
+fn validate_breakline(line: &[Vec3]) -> Result<(), &'static str> {
+    if !(2..=MAX_BOUNDARY_POINTS).contains(&line.len()) || line.iter().any(|p| !p.is_finite() || p.x.abs().max(p.y.abs()).max(p.z.abs()) > 1e12) {
+        return Err("A breakline needs 2 to 1,024 valid XYZ points.");
+    }
+    let xy: Vec<_> = line.iter().map(|p| p.xy()).collect();
+    if xy.first() == xy.last() {
+        if line.first() != line.last() {
+            return Err("The closing points of the breakline must have the same elevation.");
+        }
+        return validate_outline(&xy[..xy.len() - 1]);
+    }
+    let edges: Vec<_> = xy.windows(2).map(|p| (p[0], p[1])).collect();
+    for (i, &(a, b)) in edges.iter().enumerate() {
+        if a == b {
+            return Err("Consecutive breakline vertices must have distinct XY locations.");
+        }
+        for (j, &(c, d)) in edges.iter().enumerate().skip(i + 1) {
+            let adjacent_overlap = j == i + 1 && (a - b).cross(d - c) == 0.0 && (a - b).dot(d - c) > 0.0;
+            if adjacent_overlap || (j > i + 1 && intersects(a, b, c, d)) {
+                return Err("A breakline cannot cross or retrace itself.");
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_outline(outline: &[Vec2]) -> Result<(), &'static str> {
@@ -159,7 +291,7 @@ fn validate_outline(outline: &[Vec2]) -> Result<(), &'static str> {
     Ok(())
 }
 
-fn intersects(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> bool {
+pub(super) fn intersects(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> bool {
     if !Bounds2::new(a, b).intersects(&Bounds2::new(c, d)) {
         return false;
     }
@@ -220,5 +352,38 @@ mod tests {
         let clipped: Vec<_> = clip_surface(&source, &outline, false, 100).unwrap().into_iter().map(|(_, t)| t).collect();
         let second: Vec<_> = clip_surface(&clipped, &outline, false, 100).unwrap().into_iter().map(|(_, t)| t).collect();
         assert_eq!(second, clipped);
+    }
+    #[test]
+    fn breakline_inserts_a_continuous_graded_edge_and_keeps_the_footprint() {
+        let p = |x, y| Vec3::new(x, y, 0.0);
+        let original = [[p(0.0, 0.0), p(10.0, 0.0), p(10.0, 10.0)], [p(0.0, 0.0), p(10.0, 10.0), p(0.0, 10.0)]];
+        let a = Vec3::new(2.0, 5.0, 1.0);
+        let b = Vec3::new(8.0, 5.0, 4.0);
+        let cross = Vec3::new(5.0, 5.0, 2.5);
+        let mesh = imprint_breakline(&original, &[a, b], 100).unwrap();
+        let area: f64 = mesh.iter().map(|(_, t)| signed_area2(*t).abs() * 0.5).sum();
+        assert!((area - 100.0).abs() < 1e-9);
+        for edge in [[a, cross], [cross, b]] {
+            assert_eq!(mesh.iter().filter(|(_, t)| t.contains(&edge[0]) && t.contains(&edge[1])).count(), 2);
+        }
+        let outside = Vec3::new(12.0, 5.0, 1.0);
+        assert!(imprint_breakline(&original, &[a, outside], 100).is_err());
+    }
+
+    #[test]
+    fn diagonal_swap_preserves_the_outline_and_rejects_a_fold() {
+        let a = Vec3::new(0.0, 0.0, 0.0);
+        let b = Vec3::new(10.0, 0.0, 1.0);
+        let c = Vec3::new(10.0, 10.0, 2.0);
+        let d = Vec3::new(0.0, 10.0, 3.0);
+        let old = [[a, b, c], [a, c, d]];
+        let new = swap_diagonal(old[0], old[1]).unwrap();
+        assert!(new.iter().all(|t| t.contains(&b) && t.contains(&d)));
+        let area = |ts: [Triangle; 2]| ts.into_iter().map(|t| signed_area2(t).abs()).sum::<f64>();
+        assert_eq!(area(old), area(new));
+        let concave = Vec3::new(8.0, 9.0, 3.0);
+        let other = Vec3::new(13.0, 15.0, 1.0);
+        assert!(swap_diagonal([a, b, c], [a, c, other]).is_err());
+        assert!(swap_diagonal(old[0], [a, b, concave]).is_err());
     }
 }

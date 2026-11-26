@@ -23,7 +23,7 @@ use super::{CommandSpec, always, bad, point_value, str_param};
 use crate::{EngineError, Result, Session};
 
 /// Formats EXPORT writes (the io layer picks the writer from the extension).
-pub const EXPORT_FORMATS: &[&str] = &["dxf", "dwg", "svg", "png", "pdf"];
+pub const EXPORT_FORMATS: &[&str] = &["dxf", "dwg", "svg", "png", "pdf", "xml", "landxml"];
 /// Default and largest plot preview width, in pixels.
 const PREVIEW_PX: u64 = 1200;
 const MAX_PREVIEW_PX: u64 = 4096;
@@ -39,7 +39,7 @@ pub fn specs() -> Vec<CommandSpec> {
         CommandSpec::new("export", "Export...", run_export)
             .menu(&["File", "Export..."])
             .alias(&["exp"])
-            .params("{path? (else returns base64 `data`), format?: dxf|dwg|svg|png|pdf|laz (LAZ requires path) (default: the path's extension)} → {format, bytes, path? | data}")
+            .params("{path? (else returns base64 `data`), format?: dxf|dwg|svg|png|pdf|laz|landxml (default: path extension), group?: LandXML surface name, unit?: LandXML drawing unit code, surveyCompatibility?: LandXML millimetre plan grid (default: false)} → {format, bytes, path? | data}")
             .noundo(),
         CommandSpec::new("preview", "Plot Preview", run_preview)
             .menu(&["File", "Plot Preview"])
@@ -362,6 +362,7 @@ pub(super) fn deliver_file(cmd: &str, path: &str, bytes: &[u8], hook: Option<sup
         "svg" => "image/svg+xml",
         "png" => "image/png",
         "pdf" => "application/pdf",
+        "xml" | "landxml" => "application/xml",
         _ => "application/octet-stream",
     };
     let deliver = hook.ok_or_else(|| bad(cmd, "files can't be written in this build; omit `path` to get the file as base64 `data`"))?;
@@ -381,10 +382,28 @@ fn run_export(s: &mut Session, p: &Value) -> Result<Value> {
     }
     let hooks = io().ok_or_else(|| bad("export", "file formats are not available in this build"))?;
     if !EXPORT_FORMATS.contains(&format.as_str()) {
-        return Err(bad("export", "`format` must be dxf, dwg, svg, png, pdf or laz (or give a `path` with one of those extensions)"));
+        return Err(bad("export", "Choose DXF, DWG, SVG, PNG, PDF, LAZ or LandXML as the export format."));
     }
     let file = format!("export.{format}");
-    let bytes = (hooks.write)(s.doc()?, &file).map_err(|e| bad("export", e))?;
+    let drawing = s.doc()?;
+    let landxml = if matches!(format.as_str(), "xml" | "landxml") { landxml_drawing(drawing, p)? } else { None };
+    let drawing = landxml.as_ref().unwrap_or(drawing);
+    let survey = p
+        .get("surveyCompatibility")
+        .map(|v| v.as_bool().ok_or_else(|| bad("export", "surveyCompatibility must be true or false.")))
+        .transpose()?
+        .unwrap_or(false);
+    let bytes = if survey {
+        if !matches!(format.as_str(), "xml" | "landxml") {
+            return Err(bad("export", "Survey compatibility requires LandXML output."));
+        }
+        let writer =
+            super::file::survey_landxml_writer().ok_or_else(|| bad("export", "Survey-compatible LandXML is not available in this build."))?;
+        writer(drawing)
+    } else {
+        (hooks.write)(drawing, &file)
+    }
+    .map_err(|e| bad("export", e))?;
     let folder = path.and_then(super::file::new_folder);
     let mut r = match path {
         Some(path) => {
@@ -396,6 +415,24 @@ fn run_export(s: &mut Session, p: &Value) -> Result<Value> {
     super::file::report_new_folder(s, &mut r, folder);
     super::file::report_loss(s, &mut r, &file);
     Ok(r)
+}
+
+fn landxml_drawing(drawing: &Drawing, params: &Value) -> Result<Option<Drawing>> {
+    let group = params.get("group").filter(|value| !value.is_null());
+    let unit = params.get("unit").filter(|value| !value.is_null());
+    if group.is_none() && unit.is_none() {
+        return Ok(None);
+    }
+    let mut output = drawing.clone();
+    if let Some(group) = group {
+        let name = group.as_str().ok_or_else(|| bad("export", "Specify a LandXML terrain surface name."))?;
+        output.groups.retain(|g| !g.is_terrain_surface() || g.name.eq_ignore_ascii_case(name));
+    }
+    if let Some(unit) = unit {
+        let unit = unit.as_i64().ok_or_else(|| bad("export", "Specify a numeric drawing unit code for LandXML."))?;
+        output.header.set_i64("INSUNITS", unit);
+    }
+    Ok(Some(output))
 }
 
 // ---------- IMPORT ----------

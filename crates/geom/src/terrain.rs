@@ -6,7 +6,14 @@ use spade::{ConstrainedDelaunayTriangulation, HasPosition, Point2, Triangulation
 use crate::{Vec2, Vec3, point_in_polygon};
 
 mod edit;
-pub use edit::{MAX_BOUNDARY_POINTS, clip_surface, signed_area2};
+mod grading;
+mod grid;
+mod linked;
+pub mod road;
+pub use edit::{MAX_BOUNDARY_POINTS, clip_surface, imprint_breakline, signed_area2, swap_diagonal};
+pub use grading::{GradeTarget, grade_path};
+pub use grid::{snap_terrain_mesh, snap_terrain_paths};
+pub use linked::triangulate_linked;
 
 pub type Triangle = [Vec3; 3];
 type Key = [u64; 3];

@@ -43,6 +43,7 @@ pub use draw2::breakline::BreaklineOptions;
 pub use props::MatchProps;
 pub(crate) use props::UNIT_RANGES;
 pub(crate) use props::{current_color_value, set_current_color_value};
+pub use terrain::road::{RoadPreviewLayer, preview_road_surfaces};
 mod qselect;
 mod selecttools;
 mod settings;

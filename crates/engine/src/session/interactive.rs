@@ -553,9 +553,18 @@ impl Session {
                 self.running = Some(run);
                 Ok(())
             }
+            Ok(Step::Checkpoint) => {
+                self.finish(&run);
+                let st = self.state()?;
+                run.before = st.doc.clone();
+                run.selection_before = st.selection.clone();
+                run.draft_height = None;
+                self.running = Some(run);
+                Ok(())
+            }
             Ok(Step::Done) => {
                 let seed = run.before.handseed;
-                self.finish(run, false);
+                self.finish(&run);
                 let added = self.doc().is_ok_and(|d| d.handseed != seed);
                 // A transparent command ending inside another (`'ZOOM` in an INSERT) is not that
                 // command ending: it shares its number.
@@ -567,7 +576,7 @@ impl Session {
             }
             Ok(Step::Cancel) => {
                 self.echo("*Cancel*");
-                self.finish(run, true);
+                self.finish(&run);
                 self.resume_suspended();
                 Ok(())
             }
@@ -592,9 +601,9 @@ impl Session {
     /// End a command: every way out of one comes through here. The passes after a command
     /// (constraints, associativity, groups) can panic like the command itself; a panic restores
     /// the drawing as it was before the command, as a panic in its `input` does.
-    fn finish(&mut self, run: Running, cancelled: bool) {
+    fn finish(&mut self, run: &Running) {
         let (id, before, selection) = (run.id.clone(), run.before.clone(), run.selection_before.clone());
-        if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.finish_guarded(run, cancelled))) {
+        if let Err(p) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| self.finish_guarded(run))) {
             if let Ok(st) = self.state_mut() {
                 st.doc = before;
                 st.selection = selection;
@@ -603,7 +612,7 @@ impl Session {
         }
     }
 
-    fn finish_guarded(&mut self, run: Running, cancelled: bool) {
+    fn finish_guarded(&mut self, run: &Running) {
         // A typed selection mode or SIngle never outlives its command.
         self.select_mode = None;
         self.select_single = false;
@@ -621,7 +630,6 @@ impl Session {
         self.pending_window = None;
         self.select_mode = None;
         let label = find_command(&run.id).map(|c| c.label).unwrap_or("Command");
-        let _ = cancelled;
         if let Some(m) = cmd::blocks::refedit::after_command(self, &run.before, &run.id) {
             self.echo(m);
         }
@@ -635,7 +643,7 @@ impl Session {
             {
                 st.revision += 1;
                 if self.suspended.is_none() {
-                    self.lisp_record_step(Snapshot { label: label.to_string(), doc: run.before, selection: run.selection_before });
+                    self.lisp_record_step(Snapshot { label: label.to_string(), doc: run.before.clone(), selection: run.selection_before.clone() });
                 }
             }
             return;
@@ -643,7 +651,7 @@ impl Session {
         if let Ok(st) = self.state_mut()
             && !Arc::ptr_eq(&run.before, &st.doc)
         {
-            st.push_undo(Snapshot { label: label.to_string(), doc: run.before, selection: run.selection_before });
+            st.push_undo(Snapshot { label: label.to_string(), doc: run.before.clone(), selection: run.selection_before.clone() });
             st.revision += 1;
         }
     }
@@ -662,6 +670,7 @@ impl Session {
         cmd::groups::after_command(self, before);
         cmd::constraints::after_command(self, before, ok);
         assoc::after_command(self, before, uid);
+        cmd::terrain::linked::after_command(self, before, uid, ok);
     }
 
     fn resume_suspended(&mut self) {
@@ -688,7 +697,7 @@ impl Session {
             if self.suspended.is_some() {
                 if let Some(mut nested) = self.running.take() {
                     nested.machine.cancelled(self);
-                    self.finish(nested, true);
+                    self.finish(&nested);
                 }
                 self.running = self.suspended.take();
             }

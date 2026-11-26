@@ -766,6 +766,7 @@ dependencies = [
 name = "cadcraft-geom"
 version = "0.21.0"
 dependencies = [
+ "rstar",
  "serde",
  "spade",
 ]
@@ -780,6 +781,7 @@ dependencies = [
  "cadcraft-fonts",
  "cadcraft-geom",
  "cadcraft-render",
+ "chrono",
  "craft-dwg",
  "craft-dxf",
  "craft-image-codecs",
@@ -797,6 +799,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tiff",
  "tiny-skia",
+ "web-time",
 ]
 
 [[package]]

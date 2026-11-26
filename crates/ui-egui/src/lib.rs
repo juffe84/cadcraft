@@ -69,8 +69,10 @@ pub mod palettes;
 pub mod parametric;
 pub mod plotstyles;
 pub mod quick;
+mod road_design;
 pub mod save_loss;
 pub mod shortcut_menus;
+mod surface_editor;
 mod terrain_display;
 pub mod theme;
 #[cfg(not(target_arch = "wasm32"))]
@@ -248,16 +250,17 @@ pub struct Services {
     pub no_file_system: bool,
     /// Pick a `.pgp` alias file, starting in the folder given (the last import's).
     pub pick_pgp: Option<Box<dyn Fn(Option<&str>) -> Option<String>>>,
+    pub pick_road_instructions: Option<Box<dyn Fn() -> Option<String>>>,
 }
 
-/// The file dialog to show: Open, Save with the suggested file name, APPLOAD's `.lsp` picker or
-/// ALIASEDIT's `.pgp` picker, starting in the given folder (empty for the default one).
+/// The file dialog to show. Save takes a suggested name; Lisp and Pgp take a starting folder.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Pick {
     Open,
     Save(String),
     Lisp(String),
     Pgp(String),
+    RoadInstructions,
 }
 
 /// Shows a file dialog without waiting for it and calls the callback (from any thread) with the
@@ -384,6 +387,8 @@ pub struct CadApp {
     pub wblock: wblock::State,
     earthwork: Option<earthwork::State>,
     terrain_display_focus: bool,
+    surface_editor: surface_editor::State,
+    road_design: road_design::State,
     /// A file dialog shown with [`Services::start_pick`]: its answer, and what to do with it.
     pending_pick: Option<PendingPick>,
     /// The startup update check and its prompt (desktop; [`updates_ui`]).
@@ -454,6 +459,8 @@ impl CadApp {
             wblock: wblock::State::default(),
             earthwork: None,
             terrain_display_focus: false,
+            surface_editor: surface_editor::State::default(),
+            road_design: road_design::State::default(),
             #[cfg(not(target_arch = "wasm32"))]
             updates_rt: updates_ui::Runtime::default(),
             pending_pick: None,
@@ -495,6 +502,7 @@ impl CadApp {
             Pick::Save(_) => self.services.pick_save.is_some(),
             Pick::Lisp(_) => self.services.pick_lisp.is_some(),
             Pick::Pgp(_) => self.services.pick_pgp.is_some(),
+            Pick::RoadInstructions => self.services.pick_road_instructions.is_some(),
         };
         if !available {
             return None;
@@ -527,6 +535,7 @@ impl CadApp {
             Pick::Save(name) => self.services.pick_save.as_ref().and_then(|f| f(name)),
             Pick::Lisp(dir) => self.services.pick_lisp.as_ref().and_then(|f| f(dir)),
             Pick::Pgp(dir) => self.services.pick_pgp.as_ref().and_then(|f| f(Some(dir.as_str()).filter(|d| !d.is_empty()))),
+            Pick::RoadInstructions => self.services.pick_road_instructions.as_ref().and_then(|f| f()),
         };
         Some(match path {
             Some(path) => then(self, path),

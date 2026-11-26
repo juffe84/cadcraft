@@ -10,6 +10,11 @@ impl Session {
         if let Some(z) = hit.world_z {
             return Some(self.project_spatial_snap(hit.point.to3(z)));
         }
+        self.authored_snap_xyz(hit, aperture, |_| true).map(|point| self.project_spatial_snap(point))
+    }
+
+    /// Lift a plan-view snap to authored XYZ, optionally restricting which entities can supply it.
+    pub fn authored_snap_xyz(&self, hit: SnapHit, aperture: f64, accepts: impl Fn(cadcraft_doc::Handle) -> bool) -> Option<Vec3> {
         if hit.deferred.is_some() || hit.viewport.is_some() {
             return None;
         }
@@ -23,7 +28,9 @@ impl Session {
         let index = crate::spatial::index(doc, &space);
         let candidates = crate::select::candidates(doc, &space, &index, &probe, false, false)?
             .filter(|(entity, known)| {
-                crate::select::selectable(doc, entity, self.viewport_frozen()) && crate::select::bounds_of(doc, entity, *known).intersects(&probe)
+                accepts(entity.handle)
+                    && crate::select::selectable(doc, entity, self.viewport_frozen())
+                    && crate::select::bounds_of(doc, entity, *known).intersects(&probe)
             })
             .take(2000)
             .map(|(entity, _)| entity);
@@ -35,15 +42,9 @@ impl Session {
             // An XY crossing gives an intersection in space only where the two heights agree.
             let mut heights: Vec<f64> = matches.map(|point| point.z).collect();
             heights.sort_unstable_by(f64::total_cmp);
-            return heights
-                .windows(2)
-                .rev()
-                .find(|pair| (pair[1] - pair[0]).abs() <= tolerance)
-                .map(|pair| self.project_spatial_snap(hit.point.to3(pair[1])));
+            return heights.windows(2).rev().find(|pair| (pair[1] - pair[0]).abs() <= tolerance).map(|pair| hit.point.to3(pair[1]));
         }
-        matches
-            .max_by(|a, b| b.xy().dist(hit.point).total_cmp(&a.xy().dist(hit.point)).then_with(|| a.z.total_cmp(&b.z)))
-            .map(|point| self.project_spatial_snap(point))
+        matches.max_by(|a, b| b.xy().dist(hit.point).total_cmp(&a.xy().dist(hit.point)).then_with(|| a.z.total_cmp(&b.z)))
     }
 }
 

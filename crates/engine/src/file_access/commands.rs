@@ -58,6 +58,8 @@ pub const FILES: &[&str] = &[
     "share",
     "stylesmanager",
     "tableexport",
+    "tin.road.instructions.load",
+    "tin.road.instructions.save",
     "wblock",
     "xattach",
     "xbind",
@@ -74,13 +76,39 @@ pub const REFUSED: &[(&str, &str)] = &[
 /// Commands that touch no file.
 pub const NO_FILES: &[&str] = &[
     "tin",
+    "tin.link",
+    "tin.source.points",
+    "tin.source.elevation",
+    "tin.source.chain.elevation",
+    "tin.source.chain.copy",
+    "tin.source.chain.preview",
+    "tin.source.move",
+    "tin.source.remove",
+    "tin.source.delete",
+    "tin.source.insert",
+    "tin.source.extend",
+    "tin.source.draw",
+    "tin.removecrossed",
+    "tin.restorecrossed",
+    "tin.cuts.preview",
+    "tin.cuts.restore",
     "tin.contours",
     "tin.elevation",
     "tin.movevertex",
     "tin.removetriangles",
     "tin.clip",
     "tin.cuthole",
+    "tin.swapedge",
+    "tin.breakline",
+    "tin.road.axis",
+    "tin.road.build",
+    "tin.road.editable",
+    "tin.road.get",
+    "tin.road.list",
+    "tin.road.preview",
+    "tin.road.section",
     "tin.surfaces",
+    "tin.surface.visibility",
     "tin.volumes",
     "ucs",
     "ucs.3point",
@@ -530,9 +558,9 @@ mod tests {
     use std::collections::BTreeSet;
 
     /// Words in a command's parameter doc that usually name a file. In these commands they don't:
-    /// `array` and `arraypath` follow a path of objects, and `blocks.reference.grips` reports a
-    /// direction.
-    const NOT_FILES: &[&str] = &["array", "arraypath", "blocks.reference.grips"];
+    /// `array` and `arraypath` follow a path of objects, `blocks.reference.grips` reports a
+    /// direction, and `tin.road.build` takes its section template as inline data.
+    const NOT_FILES: &[&str] = &["array", "arraypath", "blocks.reference.grips", "tin.road.build"];
 
     /// The words of a command's documentation, lower case.
     fn words(doc: &str) -> BTreeSet<String> {

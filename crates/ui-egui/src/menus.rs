@@ -100,6 +100,8 @@ pub const UI_COMMANDS: &[(&str, &str, &[&str], Option<&str>)] = &[
     ("ui.toggle.filetabs", "File Tab", &["Window", "File Tab"], None),
     ("ui.toggle.statusbar", "Status Bar", &["Window", "Status Bar"], None),
     ("ui.toggle.cmdline", "Command Line", &["Window", "Command Line"], Some("Cmd+9")),
+    (crate::road_design::COMMAND, "Road Design...", &["Draw", "Terrain", "Road Design..."], None),
+    (crate::surface_editor::COMMAND, "Surface Editor...", &["Draw", "Terrain", "Surface Editor..."], None),
     (crate::terrain_display::COMMAND, "Terrain Display...", &["View", "Terrain Display..."], None),
     ("ui.toggle.viewcube", "ViewCube", &["View", "ViewCube", "On"], None),
     ("ui.toggle.ucsicon", "UCS Icon", &["View", "UCS Icon", "On"], None),
@@ -163,6 +165,12 @@ fn route_ui_subsystems(app: &mut CadApp, id: &str, params: &Value) -> Option<Res
     }
     if let Some(r) = crate::bedit::route(app, id, params) {
         return Some(r);
+    }
+    if id == crate::road_design::COMMAND {
+        return Some(crate::road_design::open(app));
+    }
+    if id == crate::surface_editor::COMMAND {
+        return Some(crate::surface_editor::open(app));
     }
     if id == crate::terrain_display::COMMAND {
         return Some(crate::terrain_display::open(app));
@@ -735,7 +743,8 @@ pub fn tree(app: &CadApp) -> Vec<(String, Vec<Entry>)> {
         if !menu.is_empty() {
             // The UCS icon is a setting of the drawing: off the menu's reach when none is open.
             let enabled = match *id {
-                crate::terrain_display::COMMAND => crate::terrain_display::available(app),
+                crate::road_design::COMMAND => crate::road_design::available(app),
+                crate::terrain_display::COMMAND | crate::surface_editor::COMMAND => crate::terrain_display::available(app),
                 id if id.starts_with("ui.toggle.ucsicon") => app.session.doc().is_ok(),
                 _ => true,
             };
@@ -998,6 +1007,11 @@ pub fn shortcuts(app: &mut CadApp, ctx: &egui::Context) {
         run_transparent(app, "ui.toggle.quickcalc");
     }
     if ctx.egui_wants_keyboard_input() {
+        if crate::surface_editor::point_pick_active(app)
+            && pairs.iter().any(|(shortcut, id)| id == "osnap" && ctx.input_mut(|input| input.consume_shortcut(shortcut)))
+        {
+            run_transparent(app, "osnap");
+        }
         return;
     }
     // Cmd/Ctrl+C, X and V arrive as clipboard events, not key presses.

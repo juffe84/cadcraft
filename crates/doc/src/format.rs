@@ -22,7 +22,7 @@ impl Format {
     /// The formats a drawing can be read from by name. DXF and DWG are also recognised by content.
     pub const READ: &'static [Format] = &[Format::Dxf, Format::Dwg, Format::Svg, Format::Svgz, Format::Las, Format::Laz, Format::LandXml];
     /// The formats a drawing can be written to.
-    pub const WRITE: &'static [Format] = &[Format::Dxf, Format::Dwg, Format::Dwt, Format::Svg, Format::Png, Format::Pdf];
+    pub const WRITE: &'static [Format] = &[Format::Dxf, Format::Dwg, Format::Dwt, Format::Svg, Format::Png, Format::Pdf, Format::LandXml];
 
     /// The format `path`'s extension names. A name without an extension is DXF; an unknown
     /// extension is `None`.

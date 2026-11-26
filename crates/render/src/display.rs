@@ -99,6 +99,8 @@ pub struct DisplayList {
     pub terrain_legend: Option<crate::TerrainLegend>,
     /// Authored object-snap geometry, independent of line dashes and tessellation.
     pub spatial_snaps: Vec<SpatialSnap>,
+    /// Owner of each authored snap, for tools that target specific CAD entities.
+    pub spatial_snap_handles: Vec<Handle>,
     /// The raster images drawn by [`Kind::Image`] primitives.
     pub images: Vec<DImage>,
     /// Plots ([`build_plot`]): for each primitive, the index in [`Drawing::layers`] of the layer
@@ -257,6 +259,7 @@ pub(crate) fn append(dst: &mut DisplayList, src: DisplayList) {
     }));
     dst.images.extend(src.images);
     dst.spatial_snaps.extend(src.spatial_snaps);
+    dst.spatial_snap_handles.extend(src.spatial_snap_handles);
     dst.verts.extend(src.verts);
     dst.tris.extend(src.tris);
     if let (Some(dst), Some(src)) = (&mut dst.heights, src.heights) {

@@ -1,4 +1,4 @@
-//! CADCraft file formats: DXF/DWG read, SVG/SVGZ, LAS/LAZ and LandXML import, SVG/PNG/PDF export.
+//! CADCraft file formats: DXF/DWG and LandXML read/write, LAS/LAZ import, SVG/PNG/PDF export.
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
 #![forbid(unsafe_code)]
 
@@ -92,7 +92,7 @@ fn ext(name: impl AsRef<Path>) -> String {
 }
 
 /// Read a drawing; the format comes from the content (DXF ASCII/binary, DWG) or the name
-/// (SVG, gzip-compressed SVGZ, LAS/LAZ point clouds, and LandXML terrain).
+/// (SVG, gzip-compressed SVGZ, LAS/LAZ point clouds, and LandXML surfaces and alignments).
 pub fn read(bytes: &[u8], name: impl AsRef<Path>) -> Result<Drawing> {
     read_source(bytes, name.as_ref()).map(|(d, _)| d)
 }
@@ -126,6 +126,11 @@ pub(crate) fn read_source(bytes: &[u8], name: &Path) -> Result<(Drawing, Option<
 /// ([`save_version`]), DXF as ASCII.
 pub fn write(d: &Drawing, name: impl AsRef<Path>) -> Result<Vec<u8>> {
     write_framed(d, name, None)
+}
+
+/// Write LandXML with a millimetre plan grid for survey importers.
+pub fn write_survey_landxml(d: &Drawing) -> Result<Vec<u8>> {
+    landxml::write_survey(d)
 }
 
 fn check_point_cloud_output(d: &Drawing) -> Result<()> {
@@ -212,6 +217,9 @@ pub fn write_framed(d: &Drawing, name: impl AsRef<Path>, window: Option<Bounds2>
     }
     if matches!(format, Some(Format::Dxf | Format::Dwg)) {
         return write_with(d, name, &SaveOptions::default());
+    }
+    if format == Some(Format::LandXml) {
+        return landxml::write(d);
     }
     check_point_cloud_output(d)?;
     if let Some(w) = &window

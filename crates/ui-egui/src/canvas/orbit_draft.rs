@@ -2,7 +2,7 @@
 use std::sync::Arc;
 
 use cadcraft_doc::{
-    Handle,
+    EntityKind, Handle,
     point_cloud::{CloudView, PointCloud},
 };
 use cadcraft_engine::{Session, snap};
@@ -27,9 +27,30 @@ impl DraftPoint {
     }
 }
 
-type CloudLayers<'a> = Option<(&'a Arc<PointCloud>, &'a CloudView)>;
+pub(super) type CloudLayers<'a> = Option<(&'a Arc<PointCloud>, &'a CloudView)>;
 
-fn point_at(session: &Session, frame: &OrbitFrame, model: Option<&Model>, clouds: CloudLayers<'_>, at: Pos2, shift: bool) -> Option<DraftPoint> {
+fn point_at(app: &CadApp, frame: &OrbitFrame, model: Option<&Model>, clouds: CloudLayers<'_>, at: Pos2, shift: bool) -> Option<DraftPoint> {
+    let session = &app.session;
+    if session.running.as_ref().is_some_and(|run| run.id == crate::surface_editor::RESTORE_CROSSED)
+        && let Some(position) = crate::surface_editor::removed_triangles(app)
+            .iter()
+            .filter_map(|&triangle| super::orbit_scene::triangle(frame, at, triangle).map(|(_, p)| p))
+            .max_by(|&a, &b| frame.project(a).1.total_cmp(&frame.project(b).1))
+    {
+        return Some(DraftPoint { position, snap: None });
+    }
+    if session.running.as_ref().is_some_and(|run| run.id == crate::surface_editor::REMOVE_CROSSED)
+        && let Some((_, position)) = model.and_then(|model| {
+            let surface = crate::surface_editor::selected_surface(app);
+            let doc = session.doc().ok()?;
+            model.pick_object_where(frame, at, 0.0, |handle| {
+                doc.model.get(handle).is_some_and(|e| matches!(e.kind, EntityKind::Face3d(_)))
+                    && surface.is_none_or(|surface| surface.members.contains(&handle))
+            })
+        })
+    {
+        return Some(DraftPoint { position, snap: None });
+    }
     let plane = session.orbit_draft_plane();
     let query = Query::new(session);
     if let Some((position, mode)) = model.and_then(|model| query.find(model, frame, at)) {
@@ -37,19 +58,10 @@ fn point_at(session: &Session, frame: &OrbitFrame, model: Option<&Model>, clouds
         return Some(DraftPoint { position: session.project_spatial_snap(position), snap: Some(hit) });
     }
     if plane.cloud_snap
-        && session.settings.point_cloud_snap
-        && session.snap_override().map_or(session.settings.osmode & snap::mode::OFF == 0, |mode| mode & snap::mode::NOD != 0)
-        && let Some((root, snapshot)) = clouds
+        && let Some(position) = cloud_point(session, frame, clouds, at, query, |_| true)
     {
-        let size = session.settings.point_cloud_size;
-        let aperture = query.radius.max(size * 0.5);
-        let removed = removals(session);
-        if let Some(position) = frame
-            .pick_where(layers(snapshot, root), at, 160_000, aperture, size, |p| query.accepts(p) && !removed.iter().any(|region| region.contains(p)))
-        {
-            let hit = snap::SnapHit::cloud_sample(position);
-            return Some(DraftPoint { position: session.project_spatial_snap(position), snap: Some(hit) });
-        }
+        let hit = snap::SnapHit::cloud_sample(position);
+        return Some(DraftPoint { position: session.project_spatial_snap(position), snap: Some(hit) });
     }
     let reference = session.spatial_draft_reference();
     let position = match reference {
@@ -57,6 +69,28 @@ fn point_at(session: &Session, frame: &OrbitFrame, model: Option<&Model>, clouds
         None => frame.on_draft_plane(at, plane.height),
     }?;
     Some(DraftPoint { position: session.constrain_orbit_point(position, shift), snap: None })
+}
+
+pub(super) fn cloud_point(
+    session: &Session,
+    frame: &OrbitFrame,
+    clouds: CloudLayers<'_>,
+    at: Pos2,
+    query: Query,
+    accepts: impl Fn(Vec3) -> bool,
+) -> Option<Vec3> {
+    if !session.settings.point_cloud_snap
+        || !session.snap_override().map_or(session.settings.osmode & snap::mode::OFF == 0, |mode| mode & snap::mode::NOD != 0)
+    {
+        return None;
+    }
+    let (root, snapshot) = clouds?;
+    let size = session.settings.point_cloud_size;
+    let aperture = query.radius.max(size * 0.5);
+    let removed = removals(session);
+    frame.pick_where(layers(snapshot, root), at, 160_000, aperture, size, |p| {
+        query.accepts(p) && accepts(p) && !removed.iter().any(|region| region.contains(p))
+    })
 }
 
 fn point_prompt(session: &Session) -> bool {
@@ -83,11 +117,13 @@ pub(super) fn draw(
     }
     let (steps, hover, shift) = painter.ctx().input(|input| (press::steps(&input.events), input.pointer.hover_pos(), input.modifiers.shift));
     let bar = app.cmd.ime_rect.map(|(bar, _)| bar).filter(|_| app.ui.show_command_line);
-    let orbit_button = app.canvas.orbit_button;
+    let tool_buttons = [app.canvas.orbit_button, app.canvas.terrain_display_button];
+    let editor = crate::surface_editor::window_rect(app);
     let on_canvas = |at: Pos2| {
         frame.rect.contains(at)
             && bar.is_none_or(|bar| !bar.contains(at))
-            && orbit_button.is_none_or(|button| !button.contains(at))
+            && tool_buttons.iter().flatten().all(|button| !button.contains(at))
+            && editor.is_none_or(|editor| !editor.contains(at))
             && painter.ctx().layer_id_at(at) == Some(response.layer_id)
     };
     for step in steps {
@@ -95,7 +131,7 @@ pub(super) fn draw(
             && on_canvas(at)
         {
             if point_prompt(&app.session) {
-                let hit = point_at(&app.session, frame, model, clouds, at, mods.shift);
+                let hit = point_at(app, frame, model, clouds, at, mods.shift);
                 let mode = hit.and_then(|hit| hit.snap).map_or(0, |snap| snap.mode);
                 if mode == 0 && app.session.snap_override().is_some_and(|requested| requested != 0) {
                     app.session.echo(crate::i18n::t("No object snap found."));
@@ -136,7 +172,7 @@ pub(super) fn draw(
         }
         return;
     }
-    let Some(mut hit) = point_at(&app.session, frame, model, clouds, at, shift) else { return };
+    let Some(mut hit) = point_at(app, frame, model, clouds, at, shift) else { return };
     if let Some(f) = crate::cmdline::dyn_frame(app)
         && let Some(e) = crate::dyninput::parse(&app.cmd.buffer, &f)
         && let Some(point) = crate::dyninput::resolve_xyz(&e, &f, hit.position, false)
@@ -175,6 +211,9 @@ fn report(session: &mut Session, result: cadcraft_engine::Result<()>) {
 }
 
 fn preview(session: &Session, painter: &Painter, frame: &OrbitFrame, point: Vec3) {
+    if super::terrain_source::surface_move_preview(session, point, painter, |p| super::point_cloud::project_source(frame, p).map(|(at, _)| at)) {
+        return;
+    }
     let Ok(drawing) = session.doc() else { return };
     let preview = session.preview_3d(point);
     if preview.is_empty() {

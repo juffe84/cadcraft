@@ -1011,6 +1011,10 @@ impl LayerState {
 
 /// Group description identifying a TIN built by CADCraft or imported from terrain data.
 pub const TIN_GROUP_DESCRIPTION: &str = "TIN terrain surface";
+/// A linked terrain group description ends with its persistent source-group identifier.
+pub const LINKED_TIN_PREFIX: &str = "CADCraft linked TIN ";
+/// Layer for the generated height-conflict markers of linked terrains.
+pub const TIN_CONFLICT_LAYER: &str = "TIN-CONFLICTS";
 
 /// A named group of entities (GROUP).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -1019,6 +1023,16 @@ pub struct Group {
     pub description: String,
     pub selectable: bool,
     pub members: Vec<crate::Handle>,
+}
+
+impl Group {
+    pub fn linked_terrain_id(&self) -> Option<&str> {
+        self.description.strip_prefix(LINKED_TIN_PREFIX).filter(|id| id.len() <= 16 && !id.is_empty() && id.bytes().all(|c| c.is_ascii_hexdigit()))
+    }
+
+    pub fn is_terrain_surface(&self) -> bool {
+        self.description == TIN_GROUP_DESCRIPTION || self.linked_terrain_id().is_some() || self.description.starts_with(crate::road::SURFACE_PREFIX)
+    }
 }
 
 /// Shared ownership helper: blocks are cloned on write.

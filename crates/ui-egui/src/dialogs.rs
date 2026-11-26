@@ -35,6 +35,8 @@ pub fn show(app: &mut CadApp, ctx: &egui::Context) {
         "bedit" => crate::bedit::dialog(app, ctx, &mut open),
         "authoring" => crate::bedit::authoring_dialog(app, ctx, &mut open),
         "earthwork" => crate::earthwork::dialog(app, ctx, &mut open),
+        crate::road_design::DIALOG => crate::road_design::dialog(app, ctx, &mut open),
+        crate::surface_editor::DIALOG => crate::surface_editor::dialog(app, ctx, &mut open),
         crate::terrain_display::DIALOG => crate::terrain_display::dialog(app, ctx, &mut open),
         "wblock" => crate::wblock::dialog(app, ctx, &mut open),
         "stylesmanager" => crate::plotstyles::dialog(app, ctx, &mut open),

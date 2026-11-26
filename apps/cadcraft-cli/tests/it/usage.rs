@@ -122,14 +122,14 @@ fn subcommand_help_requests() {
                 "convert --help",
                 &["convert", "--help"],
                 0,
-                Line("Convert a drawing; OUT's extension picks the format (dxf, dwg, dwt, svg, png, pdf)"),
+                Line("Convert a drawing; OUT's extension picks the format (dxf, dwg, dwt, svg, png, pdf, xml)"),
                 Empty,
             ),
             case(
                 "convert -h",
                 &["convert", "-h"],
                 0,
-                Line("Convert a drawing; OUT's extension picks the format (dxf, dwg, dwt, svg, png, pdf)"),
+                Line("Convert a drawing; OUT's extension picks the format (dxf, dwg, dwt, svg, png, pdf, xml)"),
                 Empty,
             ),
             case(

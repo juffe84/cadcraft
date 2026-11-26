@@ -11,3 +11,4 @@ workspace = true
 [dependencies]
 serde = { workspace = true }
 spade = "2.15.1"
+rstar = { version = "0.13", default-features = false }

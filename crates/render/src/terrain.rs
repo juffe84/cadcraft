@@ -2,7 +2,7 @@
 use std::collections::HashSet;
 
 use cadcraft_color::Rgb;
-use cadcraft_doc::{Drawing, EntityKind, Handle, TIN_GROUP_DESCRIPTION};
+use cadcraft_doc::{Drawing, EntityKind, Handle};
 use cadcraft_geom::Vec3;
 
 use crate::{Builder, Ctx, Ink, Options, Vec2};
@@ -61,7 +61,7 @@ impl TerrainDisplay {
             return None;
         }
         let mut display = Self { style, members: HashSet::new(), low: f64::INFINITY, high: f64::NEG_INFINITY };
-        for group in d.groups.iter().filter(|g| g.description == TIN_GROUP_DESCRIPTION) {
+        for group in d.groups.iter().filter(|g| g.is_terrain_surface()) {
             for &handle in &group.members {
                 if opts.cancelled() {
                     return None;
@@ -200,7 +200,7 @@ fn clip(input: &[Vec3], z: f64, above: bool, out: &mut [Vec3; 6]) -> usize {
 mod tests {
     use super::*;
     use crate::{Kind, build};
-    use cadcraft_doc::{Common, Face3d, Group, Space};
+    use cadcraft_doc::{Common, Face3d, Group, Space, TIN_GROUP_DESCRIPTION};
 
     fn face(d: &mut Drawing, [a, b, c]: [Vec3; 3]) -> Handle {
         d.add(&Space::Model, Common::default(), EntityKind::Face3d(Face3d { corners: [a, b, c, c], hidden_edges: 0 })).unwrap()

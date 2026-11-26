@@ -1,7 +1,7 @@
 //! Direct editing of the model-space triangles that make up an existing surface.
 use std::collections::HashSet;
 
-use cadcraft_doc::{Drawing, EntityKind, Face3d, Group, Handle, TIN_GROUP_DESCRIPTION};
+use cadcraft_doc::{Drawing, EntityKind, Face3d, Group, Handle, Line, TIN_GROUP_DESCRIPTION};
 use cadcraft_geom::{Bounds2, Vec2, Vec3, terrain};
 use serde_json::{Value, json};
 
@@ -18,6 +18,8 @@ enum Edit {
     Remove,
     Clip,
     Hole,
+    Swap,
+    Breakline,
 }
 
 impl Edit {
@@ -28,6 +30,8 @@ impl Edit {
             Self::Remove => "tin.removetriangles",
             Self::Clip => "tin.clip",
             Self::Hole => "tin.cuthole",
+            Self::Swap => "tin.swapedge",
+            Self::Breakline => "tin.breakline",
         }
     }
 
@@ -38,6 +42,8 @@ impl Edit {
             Self::Remove => &["Draw", "Terrain", "Edit Surface", "Remove Surface Triangles"],
             Self::Clip => &["Draw", "Terrain", "Edit Surface", "Clip Surface to Boundary"],
             Self::Hole => &["Draw", "Terrain", "Edit Surface", "Cut Hole in Surface"],
+            Self::Swap => &["Draw", "Terrain", "Edit Surface", "Swap Triangle Edge"],
+            Self::Breakline => &["Draw", "Terrain", "Edit Surface", "Apply 3D Breakline"],
         }
     }
 
@@ -47,6 +53,8 @@ impl Edit {
             Self::Move => "{group: terrain group name, at: [x,y], to: [x,y] or [x,y,z]}",
             Self::Remove => "{group: terrain group name, handles: triangle handles}",
             Self::Clip | Self::Hole => "{group: terrain group name, points?: [[x,y]], handle?: closed polyline}",
+            Self::Swap => "{group: terrain group name, handles: two adjacent triangle handles}",
+            Self::Breakline => "{group: terrain group name, points?: [[x,y,z]], handle?: LINE or 3DPOLYLINE}",
         }
     }
 
@@ -57,7 +65,7 @@ impl Edit {
 
 pub(crate) const MOVE_VERTEX: &str = "tin.movevertex";
 
-pub(super) fn specs() -> [CommandSpec; 5] {
+pub(super) fn specs() -> [CommandSpec; 7] {
     let cmd = |edit: Edit, run: Run, factory: Factory| {
         CommandSpec::new(edit.id(), edit.menu()[3], run).menu(edit.menu()).params(edit.params()).enabled(model_space).interactive(factory)
     };
@@ -67,6 +75,8 @@ pub(super) fn specs() -> [CommandSpec; 5] {
         cmd(Edit::Remove, |s, p| run(s, Edit::Remove, p), |_| Ok(Box::new(Editor::new(Edit::Remove)))),
         cmd(Edit::Clip, |s, p| run(s, Edit::Clip, p), |_| Ok(Box::new(Editor::new(Edit::Clip)))),
         cmd(Edit::Hole, |s, p| run(s, Edit::Hole, p), |_| Ok(Box::new(Editor::new(Edit::Hole)))),
+        cmd(Edit::Swap, |s, p| run(s, Edit::Swap, p), |_| Ok(Box::new(Editor::new(Edit::Swap)))),
+        cmd(Edit::Breakline, |s, p| run(s, Edit::Breakline, p), |_| Ok(Box::new(Editor::new(Edit::Breakline)))),
     ]
 }
 
@@ -98,6 +108,9 @@ fn run(s: &mut Session, edit: Edit, p: &Value) -> Result<Value> {
     let d = s.doc()?;
     let name = str_param(p, "group").ok_or_else(|| edit.reject("Specify a terrain group."))?;
     let surface = group(d, edit, name)?;
+    if surface.linked_terrain_id().is_some() {
+        return Err(edit.reject("Edit the source lines or points to update a linked terrain surface."));
+    }
     let handles = surface.members.as_slice();
     let triangles = read_triangles(d, surface, edit)?;
     match edit {
@@ -133,12 +146,65 @@ fn run(s: &mut Session, edit: Edit, p: &Value) -> Result<Value> {
             let n = handles.len();
             replace_triangles(s, edit, handles.to_vec(), retained, n)
         }
+        Edit::Swap => {
+            let selected = targets(s, p)?;
+            let [first, second] = selected.as_slice() else { return Err(edit.reject("Pick two adjacent triangles.")) };
+            let index = |h| handles.iter().position(|id| id == h).ok_or_else(|| edit.reject("Both triangles must belong to the selected surface."));
+            let (a, b) = (index(first)?, index(second)?);
+            let swapped = terrain::swap_diagonal(triangles[a], triangles[b]).map_err(|error| edit.reject(error))?;
+            let mut after = triangles;
+            after[a] = swapped[0];
+            after[b] = swapped[1];
+            check_overlap(edit, &after, &[a, b])?;
+            let count = handles.len();
+            replace_triangles(s, edit, handles.to_vec(), after.into_iter().enumerate().collect(), count)
+        }
+        Edit::Breakline => {
+            let line = breakline(s, edit, p)?;
+            let n = triangles.len();
+            let retained = terrain::imprint_breakline(&triangles, &line, MAX_FACES).map_err(|error| edit.reject(error))?;
+            replace_triangles(s, edit, handles.to_vec(), retained, n)
+        }
         Edit::Clip | Edit::Hole => {
             let outline = outline(s, edit, p)?;
             let n = triangles.len();
             let retained = terrain::clip_surface(&triangles, &outline, matches!(edit, Edit::Clip), MAX_FACES).map_err(|error| edit.reject(error))?;
             replace_triangles(s, edit, handles.to_vec(), retained, n)
         }
+    }
+}
+
+fn breakline(s: &Session, edit: Edit, p: &Value) -> Result<Vec<Vec3>> {
+    if let Some(points) = p.get("points") {
+        let points = points
+            .as_array()
+            .filter(|p| (2..=terrain::MAX_BOUNDARY_POINTS).contains(&p.len()))
+            .ok_or_else(|| edit.reject("A breakline needs 2 to 1,024 XYZ points."))?;
+        return points
+            .iter()
+            .map(|p| {
+                p.as_array()
+                    .filter(|p| p.len() == 3)
+                    .and_then(|_| point3_value(p))
+                    .ok_or_else(|| edit.reject("Enter all three coordinates of each breakline point."))
+            })
+            .collect();
+    }
+    let handles = targets(s, p)?;
+    let [handle] = handles.as_slice() else { return Err(edit.reject("Select one line or 3D polyline.")) };
+    match s.doc()?.model.get(*handle).map(|e| &e.kind) {
+        Some(EntityKind::Line(line)) => Ok(vec![line.a, line.b]),
+        Some(EntityKind::Polyline3d(poly)) if poly.points.len() <= terrain::MAX_BOUNDARY_POINTS => {
+            let mut points = poly.points.clone();
+            if poly.closed
+                && points.first() != points.last()
+                && let Some(&first) = points.first()
+            {
+                points.push(first);
+            }
+            Ok(points)
+        }
+        _ => Err(edit.reject("Select a model-space line or 3D polyline.")),
     }
 }
 
@@ -269,7 +335,7 @@ fn ensure_editable(d: &Drawing, edit: Edit, changed: &HashSet<Handle>) -> Result
         }
     }
     let mut seen = HashSet::new();
-    for group in d.groups.iter().filter(|g| g.description == TIN_GROUP_DESCRIPTION) {
+    for group in d.groups.iter().filter(|g| g.is_terrain_surface()) {
         if group.members.iter().filter(|h| changed.contains(h)).any(|&h| !seen.insert(h)) {
             return Err(edit.reject("A triangle is shared by multiple terrain surfaces."));
         }
@@ -304,7 +370,7 @@ fn replace_triangles(
     ensure_editable(d, edit, &affected)?;
     let count = affected.len();
     if count == 0 {
-        return Ok(json!({ "changed": 0, "triangles": final_count, "message": "The surface already matches the requested boundary." }));
+        return Ok(json!({ "changed": 0, "triangles": final_count, "message": "The surface already matches the requested edit." }));
     }
     // Use a staged drawing so even a late entity error cannot commit part of the trim.
     let mut next = d.clone();
@@ -343,12 +409,13 @@ struct Editor {
     group: Option<String>,
     by_name: bool,
     vertex: Option<Vec3>,
+    neighbors: Vec<Vec3>,
     selection: SelectPhase,
 }
 
 impl Editor {
     fn new(edit: Edit) -> Self {
-        Self { edit, group: None, by_name: false, vertex: None, selection: SelectPhase::default() }
+        Self { edit, group: None, by_name: false, vertex: None, neighbors: Vec::new(), selection: SelectPhase::default() }
     }
 
     fn apply(&self, s: &mut Session, params: Value) -> Result<Step> {
@@ -389,6 +456,8 @@ impl Interactive for Editor {
         }
         match self.edit {
             Edit::Clip | Edit::Hole => Prompt::new("Select a closed boundary polyline", Accept::SELECT),
+            Edit::Breakline => Prompt::new("Select a line or 3D polyline for the breakline", Accept::SELECT),
+            Edit::Swap => Prompt::new("Select two adjacent triangles, then press Enter", Accept::SELECT),
             Edit::Remove => {
                 let mut prompt = self.selection.prompt();
                 prompt.message = if self.selection.removing { "Deselect terrain triangles" } else { "Select terrain triangles to remove" }.into();
@@ -398,6 +467,17 @@ impl Interactive for Editor {
             Edit::Move if self.vertex.is_some() => Prompt::new("Specify the new vertex position", Accept::POINT).base3_opt(self.vertex),
             _ => Prompt::new("Pick a terrain vertex using Endpoint snap", Accept::POINT),
         }
+    }
+
+    fn preview(&self, s: &Session, point: Vec2) -> Vec<EntityKind> {
+        self.preview_3d(s, point.to3(self.vertex.map_or(0.0, |p| p.z)))
+    }
+
+    fn preview_3d(&self, _s: &Session, point: Vec3) -> Vec<EntityKind> {
+        if self.vertex == Some(point) {
+            return Vec::new();
+        }
+        self.neighbors.iter().map(|&b| EntityKind::Line(Line { a: point, b })).collect()
     }
 
     fn input(&mut self, s: &mut Session, input: Input) -> Result<Step> {
@@ -420,7 +500,7 @@ impl Interactive for Editor {
             return Ok(Step::Continue);
         };
         match self.edit {
-            Edit::Remove => {
+            Edit::Remove | Edit::Swap => {
                 if let Input::Pick(hs) = &input {
                     let surface = group(s.doc()?, self.edit, group_name)?;
                     if hs.iter().any(|h| !surface.members.contains(h)) {
@@ -433,9 +513,9 @@ impl Interactive for Editor {
                     SelOutcome::More => Ok(Step::Continue),
                 }
             }
-            Edit::Clip | Edit::Hole => {
+            Edit::Clip | Edit::Hole | Edit::Breakline => {
                 if let Input::Pick(hs) = input {
-                    let [handle] = hs.as_slice() else { return Err(self.edit.reject("Pick exactly one boundary polyline.")) };
+                    let [handle] = hs.as_slice() else { return Err(self.edit.reject("Pick exactly one line object.")) };
                     return self.apply(s, json!({ "group": group_name, "handle": handle.hex() }));
                 }
                 Ok(Step::Continue)
@@ -460,6 +540,11 @@ impl Interactive for Editor {
                     let triangles = read_triangles(s.doc()?, surface, self.edit)?;
                     let radius = if s.state()?.orbit.is_some() { vertex_tolerance(point) } else { s.pixel_size() * s.settings.pickbox.max(1.0) };
                     let from = nearest_vertex(&triangles, point, radius, self.edit)?;
+                    if matches!(self.edit, Edit::Move) {
+                        self.neighbors = triangles.iter().filter(|face| face.contains(&from)).flatten().copied().filter(|&p| p != from).collect();
+                        self.neighbors.sort_unstable_by(|a, b| a.x.total_cmp(&b.x).then(a.y.total_cmp(&b.y)).then(a.z.total_cmp(&b.z)));
+                        self.neighbors.dedup();
+                    }
                     s.echo(format!("Terrain vertex: {:.6}, {:.6}, {:.6}", from.x, from.y, from.z));
                     self.vertex = Some(from);
                 }
@@ -501,6 +586,11 @@ mod tests {
         let mut s = terrain();
         s.start("tin.movevertex").unwrap();
         s.cmdline("5,5").unwrap();
+        let destination = Vec3::new(5.0, 6.0, 2.0);
+        let original = Vec3::new(5.0, 5.0, 2.0);
+        let proposed = s.preview_3d(destination);
+        assert!(proposed.len() > 1);
+        assert!(proposed.iter().all(|e| matches!(&e.kind, EntityKind::Line(line) if line.a == destination && line.b != original)));
         s.cmdline("5,6").unwrap();
         let moved = s.doc().unwrap().clone();
         assert!(read_triangles(&moved, &moved.groups[0], Edit::Move).unwrap().iter().flatten().any(|&p| p == Vec3::new(5.0, 6.0, 2.0)));

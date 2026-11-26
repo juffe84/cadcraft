@@ -1,6 +1,6 @@
 use super::{CadApp, Color32, Pos2, Rect, Shape, SnapCycle, SnapHit, Stroke, Tokens, Vec2, Xf, pos2, snap, vec2};
 
-pub(super) fn draw_snap_marker(p: &egui::Painter, at: Pos2, hit: &SnapHit) {
+pub(crate) fn draw_snap_marker(p: &egui::Painter, at: Pos2, hit: &SnapHit) {
     let t = Tokens::get();
     let s = crate::theme::snap_marker_half();
     let st = Stroke::new(2.0, t.snap);

@@ -202,7 +202,8 @@ pub(crate) fn after_command(s: &mut Session, before: Option<&Arc<Drawing>>) {
         return;
     }
     let d: &Drawing = &st.doc;
-    let stale = d.groups.iter().any(|g| g.members.is_empty() || g.members.iter().any(|h| d.entity(*h).is_none()));
+    let stale =
+        d.groups.iter().any(|g| (g.members.is_empty() && g.linked_terrain_id().is_none()) || g.members.iter().any(|h| d.entity(*h).is_none()));
     if !stale {
         return;
     }
@@ -210,7 +211,7 @@ pub(crate) fn after_command(s: &mut Session, before: Option<&Arc<Drawing>>) {
         .groups
         .iter()
         .map(|g| Group { members: g.members.iter().copied().filter(|h| d.entity(*h).is_some()).collect(), ..g.clone() })
-        .filter(|g| !g.members.is_empty())
+        .filter(|g| !g.members.is_empty() || g.linked_terrain_id().is_some())
         .collect();
     Arc::make_mut(&mut st.doc).groups = groups;
 }

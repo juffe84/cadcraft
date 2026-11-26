@@ -208,11 +208,15 @@ impl Model {
     }
 
     pub fn pick_object(&self, frame: &OrbitFrame, cursor: Pos2, radius: f32) -> Option<(Handle, Vec3)> {
+        self.pick_object_where(frame, cursor, radius, |_| true)
+    }
+
+    pub fn pick_object_where(&self, frame: &OrbitFrame, cursor: Pos2, radius: f32, accepts: impl Fn(Handle) -> bool) -> Option<(Handle, Vec3)> {
         let mut best: Option<(f32, f64, Handle, Vec3)> = None;
         let indices = self.pick_data.primitives.near(frame, cursor, radius).chain(self.pick_data.infinite.iter().copied());
         for index in indices {
             let p = &self.list.prims[index];
-            if p.kind == Kind::Mask {
+            if p.kind == Kind::Mask || !accepts(p.handle) {
                 continue;
             }
             self.visit_prim(p, |geometry| {
@@ -233,8 +237,8 @@ impl Model {
         best.map(|(_, _, handle, point)| (handle, point))
     }
 
-    pub fn snaps_near<'a>(&'a self, frame: &'a OrbitFrame, at: Pos2, radius: f32) -> impl Iterator<Item = SpatialSnap> + 'a {
-        self.pick_data.snaps.near(frame, at, radius).map(|i| self.list.spatial_snaps[i])
+    pub fn snaps_near<'a>(&'a self, frame: &'a OrbitFrame, at: Pos2, radius: f32) -> impl Iterator<Item = (Handle, SpatialSnap)> + 'a {
+        self.pick_data.snaps.near(frame, at, radius).map(|i| (self.list.spatial_snap_handles[i], self.list.spatial_snaps[i]))
     }
 
     pub fn highlight(&self, painter: &Painter, frame: &OrbitFrame, handles: &[Handle], color: Color32, width: f32) {
@@ -313,7 +317,7 @@ pub(super) fn edge(frame: &OrbitFrame, cursor: Pos2, points: [Vec3; 2]) -> Optio
     frame.interpolate(points, [1.0 - f64::from(t), f64::from(t)]).map(|p| (on, p))
 }
 
-fn triangle(frame: &OrbitFrame, cursor: Pos2, points: [Vec3; 3]) -> Option<(f32, Vec3)> {
+pub(super) fn triangle(frame: &OrbitFrame, cursor: Pos2, points: [Vec3; 3]) -> Option<(f32, Vec3)> {
     let [a, b, c] = points.map(|point| frame.project(point).0);
     let (u, v, q) = (b - a, c - a, cursor - a);
     let cross = |a: egui::Vec2, b: egui::Vec2| f64::from(a.x) * f64::from(b.y) - f64::from(a.y) * f64::from(b.x);

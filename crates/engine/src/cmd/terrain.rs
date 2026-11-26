@@ -9,7 +9,11 @@ use crate::{Accept, Input, Interactive, Prompt, Result, Session, Step};
 use super::machines::{SelOutcome, SelectPhase};
 
 mod edit;
+pub(crate) mod linked;
+pub(crate) mod road;
+mod visibility;
 pub(crate) use edit::MOVE_VERTEX;
+pub(crate) use linked::{DRAW_SOURCE, REMOVE_CROSSED, RESTORE_CROSSED};
 
 const BUILD: &str = "tin";
 const CONTOURS: &str = "tin.contours";
@@ -21,7 +25,7 @@ pub fn specs() -> Vec<CommandSpec> {
     let mut commands = vec![
         CommandSpec::new(BUILD, "Build Terrain Surface", build)
             .menu(&["Draw", "Terrain", "Build Terrain Surface"])
-            .params("{points?: [[x,y,z]], handles?: POINT, LINE and 3D polyline handles, breaklines?: [[[x,y,z]]], outer?: [[x,y,z]], holes?: [[[x,y,z]]], name?: group name}")
+            .params("{handles?: POINT, LINE, ARC, 2D and 3D polylines (builds a linked terrain); points?: [[x,y,z]], breaklines?: [[[x,y,z]]], outer?: [[x,y,z]], holes?: [[[x,y,z]]], standalone?: bool, name?: group name}")
             .enabled(model_space)
             .interactive(|_| Ok(Box::new(super::machines::SelectRun::new(BUILD, "TIN")))),
         CommandSpec::new(CONTOURS, "Draw Terrain Contours", contours)
@@ -30,9 +34,10 @@ pub fn specs() -> Vec<CommandSpec> {
             .enabled(model_space)
             .interactive(|_| Ok(Box::new(ContourPrompt::default()))),
         CommandSpec::new("tin.surfaces", "List Terrain Surfaces", list_surfaces)
-            .params("{} -> {surfaces: [triangle group names]}")
+            .params("{editable?: bool, linked?: bool, road?: bool, visibility?: bool} -> {surfaces: [triangle group names], visibility?: {group name: visible}}")
             .enabled(model_space)
             .noundo(),
+        visibility::spec(),
         CommandSpec::new(VOLUMES, "Measure Terrain Earthwork", volumes)
             .menu(&["Draw", "Terrain", "Measure Terrain Earthwork"])
             .params("{existing: terrain group name, design: terrain group name} -> {cut, fill, netFill, overlapArea}")
@@ -41,6 +46,8 @@ pub fn specs() -> Vec<CommandSpec> {
             .noundo(),
     ];
     commands.extend(edit::specs());
+    commands.extend(road::specs());
+    commands.extend(linked::specs());
     commands
 }
 
@@ -143,33 +150,31 @@ fn paths(params: &Value, field: &str) -> Result<Vec<Vec<Vec3>>> {
 }
 
 fn build(s: &mut Session, p: &Value) -> Result<Value> {
+    let explicit_geometry = ["points", "breaklines", "outer", "holes"].iter().any(|key| p.get(key).is_some());
+    if !explicit_geometry && !super::bool_or(p, "standalone", false) {
+        return linked::build_from_sources(s, p, true);
+    }
     let mut samples = p.get("points").map(points).transpose()?.unwrap_or_default();
     let mut breaklines = paths(p, "breaklines")?;
     let outer = p.get("outer").map(points).transpose()?;
     let holes = paths(p, "holes")?;
     let handles = if p.get("points").is_some() && p.get("handles").is_none() && p.get("handle").is_none() { Vec::new() } else { targets(s, p)? };
     let src = s.doc()?;
-    for handle in handles {
-        let entity = src.entity(handle).ok_or_else(|| bad(BUILD, format!("Unknown object {}", handle.hex())))?;
-        match &entity.kind {
-            EntityKind::Point(point) => samples.push(point.p),
-            EntityKind::Line(line) => breaklines.push(vec![line.a, line.b]),
-            EntityKind::Polyline3d(line) => {
-                let mut path = line.points.clone();
-                if line.closed
-                    && let Some(first) = path.first().copied()
-                {
-                    path.push(first);
-                }
-                breaklines.push(path);
-            }
-            _ => return Err(bad(BUILD, "Select points, lines or 3D polylines for the terrain.")),
-        }
-    }
-    let count = samples.len()
+    let mut count = samples.len()
         + breaklines.iter().map(Vec::len).sum::<usize>()
         + outer.as_ref().map_or(0, Vec::len)
         + holes.iter().map(Vec::len).sum::<usize>();
+    for handle in handles {
+        let entity = src.model.get(handle).ok_or_else(|| bad(BUILD, format!("Unknown model-space object {}", handle.hex())))?;
+        if let EntityKind::Point(point) = &entity.kind {
+            samples.push(point.p);
+            count += 1;
+        } else {
+            let path = linked::vertices(entity, MAX_VERTICES.saturating_sub(count))?;
+            count += path.len();
+            breaklines.push(path);
+        }
+    }
     if count > MAX_VERTICES {
         return Err(bad(BUILD, "The terrain exceeds 50,000 input vertices."));
     }
@@ -203,20 +208,30 @@ fn triangle(kind: &EntityKind) -> Option<terrain::Triangle> {
     }
 }
 
-fn list_surfaces(s: &mut Session, _: &Value) -> Result<Value> {
+fn list_surfaces(s: &mut Session, params: &Value) -> Result<Value> {
+    let editable = params.get("editable").and_then(Value::as_bool).unwrap_or(false);
+    let linked = params.get("linked").and_then(Value::as_bool).unwrap_or(false);
+    let road = params.get("road").and_then(Value::as_bool).unwrap_or(false);
     let doc = s.doc()?;
-    let mut names: Vec<_> = doc
+    let mut groups: Vec<_> = doc
         .groups
         .iter()
         .filter(|g| {
-            !g.members.is_empty()
-                && g.members.len() <= MAX_VERTICES * 2
-                && g.members.iter().all(|&h| doc.model.get(h).is_some_and(|entity| triangle(&entity.kind).is_some()))
+            (linked && g.linked_terrain_id().is_some())
+                || (road && !g.members.is_empty() && g.description.starts_with(cadcraft_doc::road::SURFACE_PREFIX))
+                || ((!editable || g.description == cadcraft_doc::TIN_GROUP_DESCRIPTION)
+                    && !g.members.is_empty()
+                    && g.members.len() <= MAX_VERTICES * 2
+                    && g.members.iter().all(|&h| doc.model.get(h).is_some_and(|entity| triangle(&entity.kind).is_some())))
         })
-        .map(|group| group.name.as_str())
         .collect();
-    names.sort_unstable_by_key(|name| name.to_ascii_lowercase());
-    Ok(json!({ "surfaces": names }))
+    groups.sort_unstable_by_key(|group| group.name.to_ascii_lowercase());
+    let mut result = json!({ "surfaces": groups.iter().map(|group| &group.name).collect::<Vec<_>>() });
+    if params["visibility"].as_bool() == Some(true) {
+        result["visibility"] =
+            json!(groups.iter().map(|group| (&group.name, visibility::is_visible(doc, group))).collect::<std::collections::BTreeMap<_, _>>());
+    }
+    Ok(result)
 }
 
 fn faces(s: &Session, p: &Value) -> Result<Vec<terrain::Triangle>> {
@@ -336,6 +351,40 @@ fn volumes(s: &mut Session, p: &Value) -> Result<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normal_terrain_command_samples_a_selected_arc_and_accepts_a_2d_polyline() {
+        use cadcraft_doc::{Arc, LwPolyline};
+        use cadcraft_geom::{PolyVertex, Vec2};
+
+        let mut session = Session::new();
+        let arc = session
+            .add_entity(EntityKind::Arc(Arc { center: Vec3::new(0.0, 0.0, 2.0), radius: 10.0, start: 0.0, end: std::f64::consts::PI }))
+            .unwrap();
+        let line = session
+            .add_entity(EntityKind::LwPolyline(LwPolyline {
+                vertices: vec![PolyVertex::new(Vec2::new(-10.0, -4.0)), PolyVertex::new(Vec2::new(10.0, -4.0))],
+                closed: false,
+                const_width: 0.0,
+                elevation: 2.0,
+                plinegen: false,
+            }))
+            .unwrap();
+        session.set_selection(vec![arc, line]);
+        session.start(BUILD).unwrap();
+
+        let d = session.doc().unwrap();
+        let surface = d.groups.iter().find(|g| g.linked_terrain_id().is_some()).unwrap();
+        let has_arc_interior = surface
+            .members
+            .iter()
+            .filter_map(|&h| d.model.get(h))
+            .filter_map(|e| triangle(&e.kind))
+            .flatten()
+            .any(|p| p.y > 5.0 && (p.xy().len() - 10.0).abs() < 1e-9 && p.z == 2.0);
+        assert!(has_arc_interior, "the surface follows points on the arc rather than a single endpoint chord");
+        assert!(matches!(d.model.get(arc).unwrap().kind, EntityKind::Arc(_)));
+    }
 
     #[test]
     fn builds_from_selected_points_and_accepts_an_interactive_contour_interval() {

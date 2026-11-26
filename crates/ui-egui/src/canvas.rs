@@ -26,10 +26,12 @@ mod orbit_snap;
 mod pick;
 mod point_cloud;
 mod press;
+mod terrain_source;
 mod viewport;
 mod widgets;
 
-use cursor::{draw_crosshair, draw_snap_marker, draw_tracking, effective_point, override_cursor};
+pub(crate) use cursor::draw_snap_marker;
+use cursor::{draw_crosshair, draw_tracking, effective_point, override_cursor};
 use cycle::{CycleList, cycle_badge, cycle_click, cycle_list, over_canvas_menu, shift_space_cycle};
 pub(crate) use draw::{Look, draw_highlight, draw_list};
 
@@ -129,6 +131,7 @@ pub struct CanvasState {
     pub(crate) cloud_rectangle: Option<cloud_selection::Rectangle>,
     orbit_scene: orbit_scene::Scene,
     orbit_button: Option<Rect>,
+    terrain_display_button: Option<Rect>,
     pub(crate) orbit_cursor: Option<orbit_draft::DraftPoint>,
     pub(crate) draft_cursor: Option<cadcraft_geom::Vec3>,
     pub(crate) orbit_view_id: Option<egui::Id>,
@@ -233,8 +236,12 @@ impl CanvasState {
         self.orbit_view_id.or(self.plan_view_id).is_some_and(|id| ctx.memory(|memory| memory.has_focus(id)))
     }
 
-    fn over_orbit_button(&self, at: Pos2) -> bool {
-        self.orbit_button.is_some_and(|rect| rect.contains(at))
+    pub(crate) fn viewport_tools_bottom(&self) -> Option<f32> {
+        self.orbit_button.map(|rect| rect.bottom())
+    }
+
+    fn over_viewport_tools(&self, at: Pos2) -> bool {
+        self.orbit_button.into_iter().chain(self.terrain_display_button).any(|rect| rect.contains(at))
     }
 
     /// The active MSPACE viewport's contents when they are drawn apart from the layout's list
@@ -305,7 +312,11 @@ struct Navigation<'a> {
 fn navigate_canvas(app: &mut CadApp, ui: &mut egui::Ui, nav: &Navigation<'_>) -> Option<(bool, bool)> {
     let p = nav.pointer;
     let inside = p.hover_pos.is_some_and(|at| {
-        nav.rect.contains(at) && !app.canvas.over_orbit_button(at) && ui.ctx().layer_id_at(at) == Some(ui.layer_id()) && nav.response.hovered()
+        nav.rect.contains(at)
+            && !app.canvas.over_viewport_tools(at)
+            && !crate::surface_editor::covers_canvas_point(app, at)
+            && ui.ctx().layer_id_at(at) == Some(ui.layer_id())
+            && nav.response.hovered()
     });
     let on_menu = p.hover_pos.is_some_and(|at| over_canvas_menu(app, at));
     app.session.ctrl_down = p.mods.ctrl;
@@ -332,7 +343,7 @@ fn navigate_canvas(app: &mut CadApp, ui: &mut egui::Ui, nav: &Navigation<'_>) ->
     if p.pressed_primary
         && let Some(at) = p.hover_pos
         && !nav.rect.contains(at)
-        && !app.canvas.over_orbit_button(at)
+        && !app.canvas.over_viewport_tools(at)
         && let Some(i) = nav.tiles.iter().position(|(r, _)| r.contains(at))
     {
         if let Err(e) = app.session.click_tile(i) {
@@ -773,7 +784,7 @@ fn handle_presses(app: &mut CadApp, ui: &egui::Ui, context: &PressContext) -> bo
         match step {
             press::Step::Down(pos, m) => {
                 app.canvas.press = None;
-                if !inside || !rect.contains(pos) || app.canvas.over_orbit_button(pos) || middle_down {
+                if !inside || !rect.contains(pos) || app.canvas.over_viewport_tools(pos) || middle_down {
                     continue;
                 }
                 // A press on the Dynamic Input options menu is the menu's (picked on release);
@@ -857,8 +868,12 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     let t = Tokens::get();
     let model = app.session.state().is_ok_and(|state| state.space == cadcraft_doc::Space::Model && state.block_editor().is_none());
     app.canvas.orbit_button = if model { point_cloud::orbit_button_rect(ui.available_rect_before_wrap()) } else { None };
+    app.canvas.terrain_display_button =
+        app.canvas.orbit_button.filter(|_| crate::terrain_display::available(app)).and_then(|orbit| crate::terrain_display::button_rect(ui, orbit));
     if model {
+        crate::surface_editor::refresh_overlay(app);
         point_cloud::navigation_bar(app, ui);
+        crate::surface_editor::toolbar(app, ui);
     }
     if model && app.session.state().is_ok_and(|state| state.orbit.is_some()) {
         app.canvas.plan_view_id = None;
@@ -868,7 +883,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         if app.ui.show_command_line {
             crate::cmdline::show(app, ui, full);
         }
-        point_cloud::show_orbit_button(app, ui);
+        point_cloud::show_viewport_tools(app, ui);
         return;
     }
     app.canvas.cloud_orbit_focus = None;
@@ -936,10 +951,22 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         app.canvas.cloud_rectangle = None;
         false
     };
+    // Only a click owned by the canvas may place terrain points. The modeless editor
+    // reads its buttons after the canvas and can overlap the previous frame's hover layer.
+    let terrain_click = resp.clicked_by(egui::PointerButton::Primary);
+    let terrain_path = app.session.running.as_ref().is_some_and(|run| {
+        use crate::surface_editor::{DRAW_SOURCE, REMOVE_CROSSED, RESTORE_CROSSED};
+        matches!(run.id.as_str(), DRAW_SOURCE | REMOVE_CROSSED | RESTORE_CROSSED)
+    });
+    let source_pick = model && crate::surface_editor::picking_source(app);
+    if source_pick {
+        let at = hover_pos.filter(|_| inside && !on_menu && !middle_down);
+        terrain_source::plan(app, &xf, at, terrain_click, &painter);
+    }
     let Some(hatch_dialog) = handle_double_click(
         app,
         DoubleClickContext {
-            inside: inside && !cloud_select,
+            inside: inside && !cloud_select && !source_pick,
             double: dbl_primary,
             hover: hover_pos,
             xf,
@@ -968,7 +995,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     }
     let idle_double = dbl_primary && app.session.running.is_none();
     let grip_clicks = !hatch_dialog && !idle_double;
-    let click_used = cloud_select || handle_presses(app, ui, &PressContext { rect, xf, inside, middle_down, mods, grip_clicks });
+    let click_used = source_pick || cloud_select || handle_presses(app, ui, &PressContext { rect, xf, inside, middle_down, mods, grip_clicks });
 
     let (raw_world, dyn_frame) = update_canvas_cursor(app, ui, &xf, inside, hover_pos);
 
@@ -995,6 +1022,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
     // Clicks the presses above left alone: on grips, and during ZOOM Realtime.
     if inside
         && pressed_primary
+        && (!terrain_path || terrain_click)
         && !click_used
         && !middle_down
         && !cycled
@@ -1065,7 +1093,7 @@ pub fn show(app: &mut CadApp, ui: &mut egui::Ui) {
         raw_world,
     });
     cloud_selection::draw(app, &painter, &resp, rect);
-    point_cloud::show_orbit_button(app, ui);
+    point_cloud::show_viewport_tools(app, ui);
 }
 
 /// Put the cursor at `raw` (world, `None` off the canvas): snaps, ortho and polar, a locked
@@ -1340,6 +1368,10 @@ fn paint_canvas(frame: CanvasPaint<'_>) {
     }
     // Rubber band preview of the active command.
     // `xf` is the space being edited: paper space, or model space inside the active viewport.
+    let terrain_preview = app
+        .canvas
+        .draft_cursor
+        .is_some_and(|point| terrain_source::surface_move_preview(&app.session, point, painter, |p| Some(xf.to_screen(p.xy()))));
     let drag = match (app.canvas.cursor, app.canvas.gpu.is_some()) {
         (Some(c), true) => app.session.drag(c),
         _ => None,
@@ -1352,7 +1384,7 @@ fn paint_canvas(frame: CanvasPaint<'_>) {
             let list = rebuilt_preview(&st.doc, extra.iter(), scale);
             draw_list(painter, &xf, &list, bg, false);
         }
-    } else if let (Some(c), true) = (app.canvas.cursor, app.session.prompting()) {
+    } else if let (Some(c), true) = (app.canvas.cursor, app.session.prompting() && !terrain_preview) {
         let ents = app.session.preview(c);
         if !ents.is_empty()
             && let Ok(st) = app.session.state()
@@ -1378,6 +1410,8 @@ fn paint_canvas(frame: CanvasPaint<'_>) {
             painter.add(Shape::line(pts, st));
         }
     }
+    crate::road_design::paint_preview(app, painter, |p| Some(xf.to_screen(p.xy())));
+    crate::surface_editor::paint_sources(app, painter, |p| Some(xf.to_screen(p.xy())));
     paint_pointer_overlay(
         &mut CanvasPaint {
             app,

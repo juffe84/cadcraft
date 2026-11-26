@@ -413,6 +413,18 @@ pub fn grip_actions(kind: &EntityKind, index: usize) -> Vec<GripAction> {
     }
 }
 
+/// Remove an authored 2D polyline vertex, reconnecting the adjacent vertices with a straight edge.
+pub(crate) fn remove_polyline_vertex(polyline: &mut LwPolyline, index: usize) -> Option<()> {
+    if polyline.vertices.len() <= 2 || index >= polyline.vertices.len() {
+        return None;
+    }
+    polyline.vertices.remove(index);
+    if let Some(previous) = index.checked_sub(1).or_else(|| polyline.closed.then(|| polyline.vertices.len() - 1)) {
+        polyline.vertices[previous].bulge = 0.0;
+    }
+    Some(())
+}
+
 /// The object after the multifunctional `action` on grip `index`, with the picked point `to`
 /// (Add Vertex: the new vertex; Convert to Arc: a point on the arc; Lengthen: the new end,
 /// projected onto the object; Radius: a point on the new circle) or the typed `value` (Lengthen:
@@ -440,14 +452,7 @@ pub fn grip_action(kind: &EntityKind, index: usize, action: GripAction, to: Opti
         }
         (EntityKind::LwPolyline(p), GripAction::RemoveVertex) => {
             let PolyGrip::Vertex(i) = poly_grip(p, index)? else { return None };
-            if p.vertices.len() <= 2 || i >= p.vertices.len() {
-                return None;
-            }
-            p.vertices.remove(i);
-            // The segment into the removed vertex now runs to the next one: straight.
-            let n = p.vertices.len();
-            let prev = if i == 0 { if p.closed { n - 1 } else { return Some(k) } } else { i - 1 };
-            p.vertices.get_mut(prev)?.bulge = 0.0;
+            remove_polyline_vertex(p, i)?;
         }
         (EntityKind::LwPolyline(p), GripAction::ToArc) => {
             let PolyGrip::Mid(i) = poly_grip(p, index)? else { return None };

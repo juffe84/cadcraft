@@ -359,6 +359,10 @@ pub(super) fn run_set(s: &mut Session, p: &Value) -> Result<Value> {
                 EntityKind::MText(t) => mtext(t, &c, &mut used),
                 EntityKind::MLeader(m) => mleader(m, &c, &mut used),
                 EntityKind::LwPolyline(pl) => {
+                    if let Some(z) = c.num("elevation") {
+                        pl.elevation = z;
+                        used.insert("elevation");
+                    }
                     if let Some(x) = c.num("width").filter(|x| *x >= 0.0) {
                         pl.const_width = x;
                         used.insert("width");
@@ -366,6 +370,12 @@ pub(super) fn run_set(s: &mut Session, p: &Value) -> Result<Value> {
                     if let Some(closed) = p.get("closed").and_then(Value::as_bool) {
                         pl.closed = closed;
                         used.insert("closed");
+                    }
+                }
+                EntityKind::Polyline3d(pl) => {
+                    if let Some(dz) = c.num("heightOffset") {
+                        pl.points.iter_mut().for_each(|point| point.z += dz);
+                        used.insert("heightOffset");
                     }
                 }
                 EntityKind::Insert(i) => insert(i, &c, &mut used),
@@ -452,6 +462,12 @@ fn line(l: &mut Line, c: &Call<'_>, used: &mut Used<'_>) {
         set_xy(&mut l.b, v);
         used.insert("end");
     }
+    for (field, z) in [("startZ", &mut l.a.z), ("endZ", &mut l.b.z)] {
+        if let Some(value) = c.num(field) {
+            *z = value;
+            used.insert(field);
+        }
+    }
     // Length / angle keep the start point and move the end point.
     let (a, b) = (l.a.xy(), l.b.xy());
     let length = c.num("length").filter(|x| *x > 0.0 && *x < 1e15);
@@ -496,6 +512,10 @@ fn circle(ci: &mut Circle, c: &Call<'_>, used: &mut Used<'_>) {
 }
 
 fn arc(a: &mut Arc, c: &Call<'_>, used: &mut Used<'_>) {
+    if let Some(z) = c.num("centerZ") {
+        a.center.z = z;
+        used.insert("centerZ");
+    }
     if let Some(v) = c.p.get("center") {
         set_xy(&mut a.center, v);
         used.insert("center");

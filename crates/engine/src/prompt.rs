@@ -309,6 +309,8 @@ pub enum Input {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Step {
     Continue,
+    /// Record the current edit as its own undo step, then keep prompting.
+    Checkpoint,
     Done,
     Cancel,
 }

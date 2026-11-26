@@ -1,4 +1,5 @@
 //! Object snaps measured in screen pixels and returned as world XYZ.
+use cadcraft_doc::Handle;
 use cadcraft_engine::{Session, snap::mode};
 use cadcraft_geom::Vec3;
 use cadcraft_render::SpatialSnap;
@@ -32,6 +33,23 @@ impl Query {
     }
 
     pub fn find(self, model: &Model, frame: &OrbitFrame, at: Pos2) -> Option<(Vec3, u32)> {
+        self.find_where(model, frame, at, |_| true, |_| true)
+    }
+
+    pub fn for_source(mut self, base: Vec3) -> Self {
+        self.base = Some(base);
+        self.height = None;
+        self
+    }
+
+    pub fn find_where(
+        self,
+        model: &Model,
+        frame: &OrbitFrame,
+        at: Pos2,
+        owner: impl Fn(Handle) -> bool,
+        position: impl Fn(Vec3) -> bool,
+    ) -> Option<(Vec3, u32)> {
         const SUPPORTED: u32 = mode::END | mode::MID | mode::CEN | mode::QUA | mode::NOD | mode::INS | mode::NEA | mode::PER | mode::INT;
         if self.mode & SUPPORTED == 0 {
             return None;
@@ -43,7 +61,7 @@ impl Query {
             }
             let (projected, depth) = frame.project(point);
             let distance = at.distance(projected);
-            if !(distance <= self.radius && frame.camera.weight(depth) > 0.01) {
+            if !(distance <= self.radius && frame.camera.weight(depth) > 0.01 && position(point)) {
                 return;
             }
             let bias = if matches!(mode, mode::END | mode::INT) { self.radius * 0.15 } else { 0.0 };
@@ -53,7 +71,7 @@ impl Query {
             }
         };
         let mut nearby = Vec::new();
-        for snap in model.snaps_near(frame, at, self.radius) {
+        for (_, snap) in model.snaps_near(frame, at, self.radius).filter(|&(handle, _)| owner(handle)) {
             match snap {
                 SpatialSnap::End(point) => offer(point, mode::END),
                 SpatialSnap::Mid(point) => offer(point, mode::MID),

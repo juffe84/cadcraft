@@ -28,6 +28,7 @@ pub(crate) fn snaps(builder: &mut Builder, ctx: &Ctx, e: &Entity) {
     let mut add = |snap: SpatialSnap| {
         if snap.positions().iter().all(|p| p.is_finite()) && (!builder.snaps_only || builder.charge(1)) {
             builder.list.spatial_snaps.push(snap);
+            builder.list.spatial_snap_handles.push(e.handle);
         }
     };
     let line = |a, b| Segment { ends: [world(a), world(b)], range: [0.0, 1.0] };
@@ -118,14 +119,16 @@ pub(crate) fn draw(b: &mut Builder, ctx: &Ctx, e: &Entity, color: Ink, lw: f32, 
             }
             path(b, ctx, color, lw, &points, thickness, fill);
         }
-        EntityKind::Face3d(face) => draw_face(b, ctx, color, lw, face),
+        EntityKind::Face3d(face) => draw_face(b, ctx, color, lw, face, b.opts.fill),
         EntityKind::PolyfaceMesh(mesh) => {
+            // Keep conflict markers legible while the model is in wireframe.
+            let fill_faces = b.opts.fill || (b.opts.spatial && e.common.layer.eq_ignore_ascii_case(cadcraft_doc::TIN_CONFLICT_LAYER));
             for face in &mesh.faces {
                 if !b.expand() {
                     break;
                 }
                 if let Some(face) = mesh.face3d(face) {
-                    draw_face(b, ctx, color, lw, &face);
+                    draw_face(b, ctx, color, lw, &face, fill_faces);
                 }
             }
         }
@@ -208,12 +211,12 @@ fn path(b: &mut Builder, ctx: &Ctx, color: Ink, lw: f32, points: &[Vec3], thickn
     }
 }
 
-fn draw_face(b: &mut Builder, ctx: &Ctx, color: Ink, lw: f32, face: &cadcraft_doc::Face3d) {
+fn draw_face(b: &mut Builder, ctx: &Ctx, color: Ink, lw: f32, face: &cadcraft_doc::Face3d, fill: bool) {
     let [a, c, d, f] = face.corners;
     if super::terrain::draw(b, ctx, color, lw, face) {
         return;
     }
-    if b.opts.fill {
+    if fill {
         b.tris3(ctx, color, &[a, c, d, a, d, f]);
     }
     for (a, c) in face.visible_edges() {

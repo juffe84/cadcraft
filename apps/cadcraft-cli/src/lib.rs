@@ -49,6 +49,7 @@ fn install_io() {
     cadcraft_engine::cmd::file::set_point_cloud_reader(|file, step, progress| {
         cadcraft_io::point_cloud::read_with_overview_progress(file, step, None, progress).map_err(|e| e.to_string())
     });
+    cadcraft_engine::cmd::file::set_survey_landxml_writer(|d| cadcraft_io::write_survey_landxml(d).map_err(|e| e.to_string()));
     cadcraft_engine::cmd::file::set_io(cadcraft_engine::cmd::file::IoHooks {
         read: |b, name| cadcraft_io::read(b, name).map_err(|e| e.to_string()),
         write: |d, name| cadcraft_io::write(d, name).map_err(|e| e.to_string()),

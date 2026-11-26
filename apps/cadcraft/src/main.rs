@@ -179,6 +179,7 @@ pub fn install_io() {
         };
         cadcraft_io::point_cloud::read_with_overview_progress(file, step, cache.as_deref(), progress).map_err(|e| e.to_string())
     });
+    cadcraft_engine::cmd::file::set_survey_landxml_writer(|d| cadcraft_io::write_survey_landxml(d).map_err(|e| e.to_string()));
     cadcraft_engine::cmd::file::set_io(cadcraft_engine::cmd::file::IoHooks {
         read: |b, name| cadcraft_io::read(b, name).map_err(|e| e.to_string()),
         write: |d, name| cadcraft_io::write(d, name).map_err(|e| e.to_string()),
@@ -212,6 +213,7 @@ fn services() -> Services {
         pick_pgp: Some(Box::new(|dir: Option<&str>| {
             file_dialog(&Pick::Pgp(dir.unwrap_or_default().into())).pick_file().map(|p| p.to_string_lossy().to_string())
         })),
+        pick_road_instructions: Some(Box::new(|| file_dialog(&Pick::RoadInstructions).pick_file().map(|p| p.to_string_lossy().to_string()))),
     }
 }
 
@@ -223,11 +225,20 @@ fn filters(pick: &Pick) -> Vec<(&'static str, Vec<&'static str>)> {
             (i18n::t("Drawings (DWG, DXF)"), vec!["dwg", "dxf", "dwt"]),
             (i18n::t("SVG drawings (SVG, SVGZ)"), vec!["svg", "svgz"]),
             (i18n::t("Point clouds (LAS, LAZ)"), vec!["las", "laz"]),
-            (i18n::t("LandXML terrain (XML, LANDXML)"), vec!["xml", "landxml"]),
+            (i18n::t("LandXML (XML, LANDXML)"), vec!["xml", "landxml"]),
             (i18n::t("All files"), vec!["*"]),
         ],
         Pick::Save(name) if name.to_ascii_lowercase().ends_with(".laz") => vec![(i18n::t("Point cloud (LAZ)"), vec!["laz"])],
-        Pick::Save(name) => filters_for_save(name).iter().map(|(label, ext)| (i18n::t(label), vec![*ext])).collect(),
+        Pick::RoadInstructions => vec![(i18n::t("Road instructions (JSON)"), vec!["json"]), (i18n::t("All files"), vec!["*"])],
+        Pick::Save(name) if name.ends_with(".road.json") => vec![(i18n::t("Road instructions (JSON)"), vec!["json"])],
+        Pick::Save(name) if cadcraft_io::Format::from_path(name) == Some(cadcraft_io::Format::LandXml) => {
+            vec![(i18n::t("LandXML (XML, LANDXML)"), vec!["xml", "landxml"])]
+        }
+        Pick::Save(name) => filters_for_save(name)
+            .iter()
+            .map(|(label, ext)| (i18n::t(label), vec![*ext]))
+            .chain(std::iter::once((i18n::t("LandXML (XML, LANDXML)"), vec!["xml", "landxml"])))
+            .collect(),
         Pick::Lisp(_) => vec![(i18n::t("AutoLISP (LSP)"), vec!["lsp"]), (i18n::t("All files"), vec!["*"])],
         Pick::Pgp(_) => vec![(i18n::t("Alias files (PGP)"), vec!["pgp"])],
     }

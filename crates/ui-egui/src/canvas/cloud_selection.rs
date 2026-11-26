@@ -34,12 +34,12 @@ pub(super) fn input(app: &mut CadApp, response: &Response, viewport: Rect, camer
         return true;
     }
     let command_bar = app.cmd.ime_rect.map(|(rect, _)| rect).filter(|_| app.ui.show_command_line);
-    let orbit_button = app.canvas.orbit_button;
+    let tool_buttons = [app.canvas.orbit_button, app.canvas.terrain_display_button];
     let hit = |at: Pos2| {
         can_start
             && viewport.contains(at)
             && command_bar.is_none_or(|bar| !bar.contains(at))
-            && orbit_button.is_none_or(|button| !button.contains(at))
+            && tool_buttons.iter().flatten().all(|button| !button.contains(at))
             && ctx.layer_id_at(at) == Some(response.layer_id)
     };
     for event in ctx.input(|input| press::steps(&input.events)) {

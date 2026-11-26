@@ -25,7 +25,8 @@ pub fn specs() -> Vec<CommandSpec> {
 }
 
 /// The commands whose object prompts pick single members, not whole groups.
-const MEMBER_PICKS: &[&str] = &["groupedit", "-group", "tin.elevation", "tin.movevertex", "tin.removetriangles", "tin.clip", "tin.cuthole"];
+const MEMBER_PICKS: &[&str] =
+    &["groupedit", "-group", "tin.elevation", "tin.movevertex", "tin.removetriangles", "tin.clip", "tin.cuthole", "tin.swapedge", "tin.breakline"];
 
 /// `hs` plus the other members of the selectable groups they belong to (in the space being
 /// edited, visible, and inside an MSPACE viewport not on a layer frozen in it), when PICKSTYLE

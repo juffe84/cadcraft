@@ -248,7 +248,7 @@ impl Clip<'_> {
 }
 
 fn clip_snaps(dst: &mut DisplayList, src: &DisplayList, clip: &Clip) {
-    for &snap in &src.spatial_snaps {
+    for (&snap, &handle) in src.spatial_snaps.iter().zip(&src.spatial_snap_handles) {
         let [a, b] = snap.positions().map(|p| p.xy());
         if let SpatialSnap::Segment { ends, range } = snap
             && a != b
@@ -258,10 +258,12 @@ fn clip_snaps(dst: &mut DisplayList, src: &DisplayList, clip: &Clip) {
             for piece in clip.line_pieces(&[a, b]) {
                 if let Some((first, last)) = piece.first().zip(piece.last()) {
                     dst.spatial_snaps.push(SpatialSnap::Segment { ends, range: [parameter(*first), parameter(*last)] });
+                    dst.spatial_snap_handles.push(handle);
                 }
             }
         } else if clip.contains(a) {
             dst.spatial_snaps.push(snap);
+            dst.spatial_snap_handles.push(handle);
         }
     }
 }

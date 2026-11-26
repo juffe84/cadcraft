@@ -18,6 +18,25 @@ fn drawing_stem(app: &CadApp) -> String {
     std::path::Path::new(title).file_stem().map(|s| s.to_string_lossy().into_owned()).filter(|s| !s.is_empty()).unwrap_or_else(|| "Drawing".into())
 }
 
+pub(crate) fn export_terrain(app: &mut CadApp, group: String, unit: Option<i64>, survey: bool) -> Result<Value, String> {
+    let suffix = if survey { "terrain-survey" } else { "terrain" };
+    let name = format!("{}-{suffix}.xml", drawing_stem(app));
+    app.pick_then(Pick::Save(name), move |app, mut path| {
+        if std::path::Path::new(&path).extension().is_none() {
+            path.push_str(".xml");
+        }
+        if cadcraft_doc::Format::from_path(&path) != Some(cadcraft_doc::Format::LandXml) {
+            return Err(crate::i18n::t("Use an XML or LANDXML extension for the terrain export.").into());
+        }
+        let result = app.run("export", json!({"path": path, "group": group, "unit": unit, "surveyCompatibility": survey}));
+        if result.is_ok() {
+            app.set_status(crate::i18n::t("Exported the terrain to LandXML."));
+        }
+        result
+    })
+    .unwrap_or_else(|| no_picker(app, "EXPORT", r#"export {"path":"terrain.xml","group":"Surface"}"#))
+}
+
 /// Handle a typed or menu-invoked file exchange command (`id` may be an alias).
 pub fn route(app: &mut CadApp, id: &str) -> Result<Value, String> {
     let stem = drawing_stem(app);

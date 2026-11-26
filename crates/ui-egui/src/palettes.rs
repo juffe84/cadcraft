@@ -1113,6 +1113,7 @@ pub(crate) fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
                         set = Some(json!({ "handles": ids, "start": [l.a.x, f] }));
                     }
                 });
+                num(ui, "Start Z", "startZ", len(l.a.z), &mut set, &mut bad, ids);
                 prop_row(ui, "End X", |ui| {
                     if let Some(f) = number(edit_field(ui, ui.scope_id().with(("ex", ids)), len(l.b.x)), &mut bad) {
                         set = Some(json!({ "handles": ids, "end": [f, l.b.y] }));
@@ -1123,6 +1124,7 @@ pub(crate) fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
                         set = Some(json!({ "handles": ids, "end": [l.b.x, f] }));
                     }
                 });
+                num(ui, "End Z", "endZ", len(l.b.z), &mut set, &mut bad, ids);
                 let dlt = l.b.xy() - l.a.xy();
                 prop_row(ui, "Delta X", |ui| read_only(ui, &len(dlt.x)));
                 prop_row(ui, "Delta Y", |ui| read_only(ui, &len(dlt.y)));
@@ -1149,6 +1151,7 @@ pub(crate) fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
                 }
             }
             EntityKind::Arc(a) => {
+                num(ui, "Center Z", "centerZ", len(a.center.z), &mut set, &mut bad, ids);
                 num(ui, "Radius", "radius", len(a.radius), &mut set, &mut bad, ids);
                 num(ui, "Start angle", "startAngle", real(a.start.to_degrees()), &mut set, &mut bad, ids);
                 num(ui, "End angle", "endAngle", real(a.end.to_degrees()), &mut set, &mut bad, ids);
@@ -1165,6 +1168,7 @@ pub(crate) fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
                 }
             }
             EntityKind::LwPolyline(pl) => {
+                num(ui, "Elevation", "elevation", len(pl.elevation), &mut set, &mut bad, ids);
                 num(ui, "Global width", "width", len(pl.const_width), &mut set, &mut bad, ids);
                 let g = cadcraft_geom::Polyline { vertices: pl.vertices.clone(), closed: pl.closed };
                 prop_row(ui, "Length", |ui| read_only(ui, &len(g.len())));
@@ -1178,6 +1182,9 @@ pub(crate) fn properties_section(app: &mut CadApp, ui: &mut egui::Ui) {
                         set = Some(json!({ "handles": ids, "closed": c }));
                     }
                 });
+            }
+            EntityKind::Polyline3d(_) => {
+                num(ui, "Height Offset", "heightOffset", len(0.0), &mut set, &mut bad, ids);
             }
             EntityKind::Hatch(hh) => {
                 prop_row(ui, "Pattern", |ui| {
